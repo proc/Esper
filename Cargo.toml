@@ -1,0 +1,25 @@
+[package]
+name = "esper"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A UCI chess engine using Stockfish's NNUE network"
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["embed"]
+# Embed the network file in the binary so the engine is a single standalone file.
+embed = []
+# Disable hand-written SIMD and use the portable code paths (for testing).
+portable = []
+# List the SPSA tuning parameters as UCI options (see src/tune.rs).
+tune = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
