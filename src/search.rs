@@ -38,15 +38,15 @@ const KILLER_ORDERING: bool = true;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
 const SF_RFP: bool = true;
 const SF_RAZOR: bool = true;
-const SF_NMP: bool = false;
+const SF_NMP: bool = true;
 const SF_FUTILITY: bool = true;
 const SF_QSEARCH: bool = true;
 // Further Stockfish-derived techniques.
 const SF_EVAL_SCALE: bool = true;
 const SF_CORRECTION: bool = true;
-const SF_SINGULAR: bool = false;
-const SF_LMR_EXTEND: bool = false;
-const SF_TT_CUTOFF: bool = false;
+const SF_SINGULAR: bool = true;
+const SF_LMR_EXTEND: bool = true;
+const SF_TT_CUTOFF: bool = true;
 const SF_SMALL_PROBCUT: bool = true;
 const SF_CAPTURE_PRUNE: bool = true;
 const SF_SEEK_MATE: bool = false;
@@ -1097,14 +1097,17 @@ impl Searcher {
     /// Before a deep hash cutoff, check that the position after the hash move
     /// agrees: its own entry must not contradict the cutoff. This guards against
     /// scores carried over from transpositions with a different history.
-    fn tt_cutoff_confirmed(&self, pos: &Position, tt_move: Move, tt_score: i32, beta: i32, depth: i32) -> bool {
+    fn tt_cutoff_confirmed(&self, pos: &Position, tt_move: Move, tt_score: i32, beta: i32, depth: i32, ply: usize) -> bool {
         if depth < 7 || tt_move.is_none() || tt_score.abs() >= MATE_BOUND || !pos.is_legal(tt_move) {
             return true;
         }
         let next = pos.make(tt_move);
         match self.tt.probe(next.key) {
             None => true,
-            Some(t) => (tt_score >= beta) == (-t.score >= beta),
+            Some(t) => {
+                let s = score_from_tt(t.score, ply + 1);
+                (tt_score >= beta) == (-s >= beta)
+            }
         }
     }
 
@@ -1430,7 +1433,7 @@ impl Searcher {
                 && tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
                 && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
                 && pos.rule50 < if SF_TT_CUTOFF { 96 } else { 90 }
-                && (!SF_TT_CUTOFF || self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth))
+                && (!SF_TT_CUTOFF || self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth, ply))
             {
                 // Reward the hash move for causing a cutoff again.
                 if tt_score >= beta && !tt_move.is_none() {
@@ -1573,7 +1576,7 @@ impl Searcher {
 
             // Razoring
             if SF_RAZOR {
-                if !cut_node && !self.seek_mate && eval < alpha - tune::T_RazorMargin.get() * depth {
+                if !self.seek_mate && eval < alpha - 485 - 280 * depth * depth {
                     return self.qsearch(ply, alpha, beta);
                 }
             } else if depth <= 3 && static_eval + 150 + 125 * depth <= alpha {
@@ -1629,10 +1632,11 @@ impl Searcher {
             }
 
             // ProbCut: a capture that beats beta by a margin at reduced depth
-            let pc_beta = beta + 200;
+            let pc_beta = beta + 200 - 48 * improving as i32;
             if cut_node
                 && depth >= 5
                 && beta.abs() < MATE_BOUND
+                && (tt_move.is_none() || tt_move.is_noisy())
                 && !(tt_depth >= depth - 3 && tt_score != NONE && tt_score < pc_beta)
             {
                 let see_margin = (pc_beta - static_eval) * 100 / NORMALIZE_PAWN;
@@ -1863,7 +1867,14 @@ impl Searcher {
                             + 81 * tt_pv as i32
                             - corr_adj
                             - 43 * deep;
-                        ext = 1 + (v < s_beta - double) as i32 + (v < s_beta - triple) as i32;
+                        if !pv_node && self.ss[ply].double_ext <= 8 {
+                            ext = 1 + (v < s_beta - double) as i32 + (v < s_beta - triple) as i32;
+                            if ext >= 2 {
+                                self.ss[ply].double_ext += 1;
+                            }
+                        } else {
+                            ext = 1;
+                        }
                     } else if v >= beta && v.abs() < MATE_BOUND {
                         // Multi-cut: other moves beat beta too.
                         hist_update(&mut self.tt_move_hist, -421 - 110 * depth, 8192);
@@ -1964,9 +1975,9 @@ impl Searcher {
                 }
                 let r_plies = (r + 512) >> 10;
                 let d = if SF_LMR_EXTEND {
-                    // A negative reduction may extend a little, but not deep in the tree.
-                    let cap = if (ply as i32) < 2 * self.root_depth { 2 } else { 0 };
-                    (new_depth + (-r_plies).min(cap)).max(1) + pv_node as i32
+                    // A negative reduction may extend by 1 ply near the root.
+                    let cap = if (ply as i32) < 2 * self.root_depth { 1 } else { 0 };
+                    (new_depth + (-r_plies).min(cap)).max(1)
                 } else {
                     (new_depth - r_plies.max(0)).clamp(1, new_depth.max(1))
                 };

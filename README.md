@@ -1,132 +1,221 @@
 # Esper
 
-A UCI chess engine written in Rust, evaluating positions with Stockfish's
-`nn-bddd9d57eb87.nnue` network.
+Esper is a UCI chess engine written in Rust. It evaluates positions with
+Stockfish's `nn-bddd9d57eb87.nnue` network and has a Stockfish-style search with
+Lazy SMP, Syzygy tablebase support, and NEON, AVX2 and AVX-512 code paths.
 
-## Build
+## Quick start
 
 ```bash
 cargo build --release
 ```
 
-The binary is `target/release/esper`. The network is embedded in the executable
-by default, so the single file is all a GUI needs. `.cargo/config.toml` builds for
-the host CPU (`target-cpu=native`); remove that for a portable binary.
+```bash
+./target/release/esper bench
+```
 
-- `--no-default-features` leaves the network out; the engine then loads
-  `nn-bddd9d57eb87.nnue` from the working directory or from next to the executable.
-- `--features portable` disables the hand-written SIMD paths (testing aid).
+The binary is `target/release/esper`. The network is embedded in it, so that one
+file is all a GUI (Cute Chess, Arena, Banksia, En Croissant…) needs. Add it as a
+UCI engine; standard chess only, Chess960 is not supported.
 
-SIMD is chosen at compile time from the enabled CPU features (`build.rs`):
+## Building
+
+| Command | Result |
+|---|---|
+| `cargo build --release` | Optimised build for this machine, network embedded |
+| `cargo build --release --no-default-features` | Network left out; loaded from `nn-bddd9d57eb87.nnue` in the working directory or next to the binary |
+| `cargo build --release --features portable` | Hand-written SIMD disabled (for checking the SIMD paths) |
+| `cargo build --release --features tune` | Search parameters exposed as `T_*` UCI options for SPSA |
+
+Building needs Rust (2021 edition) and a C compiler, since `build.rs` compiles the
+vendored Fathom tablebase prober. The release profile uses fat LTO, one codegen
+unit and `panic = "abort"`.
+
+`.cargo/config.toml` sets `-C target-cpu=native`, so the binary is tuned for, and
+may only run on, the CPU it was built on. For a binary to copy elsewhere, remove
+that line or choose a level such as `x86-64-v3` (AVX2) or `x86-64-v4` (AVX-512).
+
+### SIMD
+
+`build.rs` picks the SIMD path from the CPU features enabled at compile time:
 
 | Target | Path |
 |---|---|
-| aarch64 | NEON, plus dot-product instructions where available |
-| x86-64 with AVX-512F+BW | AVX-512, using VNNI if enabled (compiled but never run by the author) |
+| aarch64 (Apple silicon, Graviton…) | NEON, with the dot-product instructions where available |
+| x86-64 with AVX-512F and BW | AVX-512, with VNNI when enabled (compiles, but has not been run by the author) |
 | x86-64 with AVX2 | AVX2 |
-| anything else | portable loops |
+| anything else | Portable loops |
 
-On x86 that means building with `-C target-cpu=native` (the default here) or an
-explicit level such as `x86-64-v3` / `x86-64-v4`; a plain baseline x86-64 build
-gets the portable path.
+All paths produce identical evaluations. A baseline `x86-64` build with no
+`target-cpu` gets the portable path.
 
 ## Command line
 
-`esper -t N` (or `--threads N`) starts with N search threads; a `Threads` option
-sent over UCI overrides it. Any other arguments are run as one command, e.g.
-`esper -t 4 bench`.
+```bash
+esper -t 8
+```
+
+`-t N` (or `--threads N`) starts the engine with N search threads, and becomes the
+default the `Threads` option reports. A `setoption name Threads` from the GUI
+overrides it. Any other arguments are run as a single command, after which the
+engine exits:
+
+```bash
+esper -t 4 bench
+```
 
 ## UCI options
 
-| Option | Default | |
+| Option | Default | Meaning |
 |---|---|---|
 | `Hash` | 16 | Transposition table size in MB |
-| `Threads` | 1 | Search threads (lazy SMP) |
+| `Threads` | 1 (or `-t N`) | Search threads (Lazy SMP) |
 | `MultiPV` | 1 | Number of principal variations reported |
-| `Move Overhead` | 25 | Milliseconds reserved per move for GUI / network lag |
-| `Ponder` | false | Pondering is supported (`go ponder` / `ponderhit`) |
-| `EvalFile` | `<embedded>` | Path of another network with the same architecture |
-| `SyzygyPath` | `<empty>` | Directories with Syzygy tables, separated by `:` (`;` on Windows) |
+| `Move Overhead` | 25 | Milliseconds held back per move for GUI and network lag |
+| `Ponder` | false | Pondering is supported through `go ponder` and `ponderhit` |
+| `UCI_ShowWDL` | false | Adds `wdl` win/draw/loss figures to `info` lines |
+| `EvalFile` | `<embedded>` | Path to another network with the same architecture |
+| `SyzygyPath` | `<empty>` | Syzygy table directories, separated by `:` (`;` on Windows) |
 | `SyzygyProbeDepth` | 1 | Minimum remaining depth for probing inside the search |
-| `Syzygy50MoveRule` | true | Count wins and losses that the 50-move rule draws as draws |
+| `Syzygy50MoveRule` | true | Treat wins and losses that the 50-move rule would draw as draws |
 | `SyzygyProbeLimit` | 7 | Only probe positions with at most this many pieces |
-| `Clear Hash` | | Clears the hash table and history tables |
+| `Clear Hash` | | Clears the hash table and the history tables |
 
-Extra commands: `d` (show board), `eval`, `perft N` / `go perft N`, `bench [depth]`,
-`selftest [games]` (checks incremental NNUE updates against full refreshes) and
-`evalfile <fens.txt>` (raw network output per FEN). `wac [ms]` runs the 300-position
-"Win at Chess" tactical suite (`suites/wac.epd`, built into the binary) at `ms`
-milliseconds per position (default 1000) and reports how many were solved;
-`epd <file> [ms]` does the same for any EPD file with `bm` / `am` operations.
-Standard chess only; Chess960 castling is not supported.
+`go` understands `wtime`, `btime`, `winc`, `binc`, `movestogo`, `depth`, `nodes`,
+`movetime`, `infinite`, `ponder` and `searchmoves`.
 
-## Layout
+## Extra commands
 
-| File | |
+These are typed at the engine prompt (or given on the command line).
+
+| Command | What it does |
 |---|---|
-| `src/bitboard.rs` | Attack tables, magic bitboards |
-| `src/position.rs` | Board state, copy-make, legality, SEE, FEN, Zobrist keys |
-| `src/movegen.rs` | Staged pseudo-legal generation, perft |
-| `src/nnue.rs` | Network loading and inference |
-| `src/tt.rs` | Lock-free transposition table |
-| `src/search.rs` | Iterative deepening PVS, move ordering, pruning, time management |
-| `src/tb.rs` | Syzygy tablebase probing (bindings to Fathom) |
-| `src/uci.rs` | Protocol front end |
-| `third_party/fathom/` | Vendored Fathom probing library (C, MIT), built by `build.rs` |
+| `d` | Prints the board, FEN and key |
+| `eval` | Prints the network's evaluation of the current position |
+| `perft N` | Counts leaf nodes to depth N (`go perft N` works too) |
+| `perftbench` | Runs the standard perft positions, checks the counts and reports speed |
+| `bench [depth]` | Searches a fixed set of positions (default depth 13) and prints nodes and NPS |
+| `smpbench [depth] [threads]` | Times the same search at 1, 2, 4… threads and reports the speed-up |
+| `evalbench [n]` | Measures NNUE evaluation throughput |
+| `wac [ms]` | Runs the 300 "Win at Chess" positions (built in from `suites/wac.epd`) at `ms` per position, default 1000, and reports the number solved |
+| `epd <file> [ms]` | The same for any EPD file with `bm` or `am` operations |
+| `tbprobe` | Shows the tablebase WDL and root DTZ result for the current position |
+| `selftest [games]` | Plays random games and checks incremental NNUE updates against full refreshes |
+| `evalfile <fens.txt>` | Prints the raw network output for each FEN in a file |
+
+## How it works
+
+### Board and move generation
+
+Bitboards with hard-coded magic numbers for sliding pieces (checked at start-up),
+copy-make positions, and pseudo-legal generation that produces only evasions when
+in check. Zobrist keys are kept for the whole position, the pawns, each side's
+non-pawn pieces and the minor pieces, the last three feeding the correction
+histories. Perft matches the published counts for the standard test positions.
 
 ### Evaluation
 
 The network (file version `0x6A448AFA`) has a 1024-wide feature transformer with
-int8 weights fed by three feature sets: king-bucketed piece-squares in three
-material blocks (K32H3), piece-attacks-piece threats (FullThreats) and pawn pairs
-(PP_3Wide). It is followed by a 1024 → 32 → 32 → 1 head, one of up to 192 chosen
-by material configuration. Esper reproduces Stockfish's raw output for it exactly.
+int8 weights fed by three feature sets:
 
-Accumulators are updated lazily and incrementally. Each ply registers which
-feature rows change (found by diffing the position with its parent, so make-move
-carries no NNUE bookkeeping) and prefetches them; the arithmetic only happens if
-that node is actually evaluated. Piece-square sums are refreshed through a
-per-king-square cache, threat sums only when a king crosses the centre files.
-The row updates, the feature transform, the sparse first layer and the small
-dense layers have NEON, AVX2 and AVX-512 implementations; all produce identical
-output.
+- king-bucketed piece-squares in three material blocks (K32H3),
+- piece-attacks-piece threats (FullThreats, 59,808 features),
+- pawn pairs (PP_3Wide).
+
+A 1024 → 32 → 32 → 1 head follows, one of up to 192, chosen by material. Esper
+reproduces Stockfish's raw output for this network exactly.
+
+Accumulators are updated lazily and incrementally. Each ply records which feature
+rows change, found by comparing the position with its parent, so making a move
+does no NNUE work, and prefetches those rows. The arithmetic runs only if the node
+is actually evaluated. Piece-square sums are refreshed through a per-king-square
+cache; threat sums are refreshed only when a king crosses the centre files.
+
+The raw score is then scaled as Stockfish does: blended with the correction
+histories, adjusted for optimism and material, and damped as the 50-move counter
+rises.
 
 ### Search
 
-Aspiration windows, principal variation search, transposition table cutoffs,
-null-move pruning with verification, reverse futility pruning, razoring, ProbCut,
-internal iterative reductions, late move reductions and pruning, futility, history
-and SEE pruning, singular extensions with multi-cut, quiescence search, and
-killer / butterfly / capture / continuation histories plus pawn and non-pawn
-correction histories.
+Iterative deepening with aspiration windows and principal variation search,
+following Stockfish closely:
+
+- **Move ordering**: a staged move picker (hash move, good captures, quiets,
+  bad captures) with butterfly, low-ply, capture, continuation (1, 2, 3, 4 and 6
+  plies back) and pawn histories, updated where Stockfish updates them.
+- **Pruning**: reverse futility pruning, razoring, null-move pruning with
+  verification, ProbCut and its hash-entry variant, futility, history and SEE
+  pruning of quiet moves and captures, late move pruning, and quiescence search
+  with futility and SEE pruning.
+- **Reductions and extensions**: late move reductions (with re-search extension),
+  internal iterative reductions, and singular extensions of up to three plies with
+  negative extensions.
+- **Correction histories** keyed by pawns, non-pawns, minor pieces and the
+  continuation, which adjust the static evaluation from search results.
+- **Transposition table**: lock-free, four entries per 64-byte bucket, shared by
+  all threads.
+
+`src/search.rs` begins with a block of constants that switch individual features
+on or off (for example `MULTI_CUT`, `SF_NMP`, `SF_SEEK_MATE`), so each one can be
+measured by playing a build with it against a build without.
+
+### Lazy SMP
+
+Helper threads search the same tree from a persistent thread pool, sharing only
+the transposition table. When the search ends, the reported move comes from a
+vote among the threads, weighted by depth and score.
+
+### Time management
+
+Following Stockfish, each move gets an optimum and a maximum time from the clock,
+increment and `movestogo`. The search stops early or runs longer depending on how
+stable the best move is, whether the score is falling, and what share of the nodes
+went to the best move. Some of this state carries over from move to move.
 
 ### Tablebases
 
 With `SyzygyPath` set, a won or lost root position within the tables is played
-directly from the distance-to-zero tables, and a drawn one is searched over the
-moves that hold the draw. Inside the search, positions within the tables (no
-castling rights, half-move clock zero) are resolved by a win/draw/loss probe;
-tablebase wins score just below mates and are reported as `cp 20000` minus the
-distance. `info` lines carry `tbhits`. Building needs a C compiler for Fathom.
+straight from the distance-to-zero tables, and a drawn one is searched over only
+the moves that keep the draw. Inside the search, positions within the tables (no
+castling rights, half-move clock at zero) are resolved by a win/draw/loss probe.
+Tablebase wins score just below mates and are reported as `cp 20000` minus the
+distance. `info` lines include `tbhits`.
+
+## Source layout
+
+| Path | Contents |
+|---|---|
+| `src/main.rs` | Start-up and command-line arguments |
+| `src/bitboard.rs` | Attack tables and magic bitboards |
+| `src/position.rs` | Board state, copy-make, legality, SEE, FEN and Zobrist keys |
+| `src/movegen.rs` | Move generation, SAN, perft |
+| `src/nnue.rs` | Network loading and inference, with SIMD paths |
+| `src/tt.rs` | Transposition table |
+| `src/search.rs` | Search, move ordering, histories, time management, Lazy SMP |
+| `src/tb.rs` | Syzygy probing (bindings to Fathom) |
+| `src/tune.rs` | Tunable search parameters |
+| `src/uci.rs` | UCI front end and the extra commands |
+| `suites/wac.epd` | Win at Chess test suite |
+| `tools/` | SPRT and SPSA scripts |
+| `third_party/fathom/` | Vendored Fathom tablebase prober (C, MIT) |
 
 ## Testing and tuning
 
-`tools/sprt.py` plays one build against another with a sequential test (paired
-openings, pentanomial SPRT) and stops as soon as the change is shown better or
-worse:
+`tools/sprt.py` plays one build against another using paired openings and a
+pentanomial sequential probability ratio test, and stops once the change is shown
+better or worse:
 
 ```bash
 python3 -I tools/sprt.py --new ./esper-new --base ./esper --tc 8+0.08 --concurrency 4 --elo0 0 --elo1 5
 ```
 
-`tools/spsa.py` tunes the search parameters in `src/tune.rs`. They are listed
-as UCI options (names starting with `T_`) only in builds with
-`cargo build --release --features tune`. Both scripts need python-chess and
-are adapted from the devilfish project.
+`tools/spsa.py` tunes the parameters defined in `src/tune.rs`. They appear as UCI
+options (names starting with `T_`) only in builds made with `--features tune`.
+Both scripts need python-chess and are adapted from the devilfish project.
 
 ## License
 
 GPL-3.0-or-later. The evaluation code implements the network format defined by
 [Stockfish](https://github.com/official-stockfish/Stockfish) (GPL-3.0), and the
-network file itself comes from the Stockfish project. `third_party/fathom` is
-MIT-licensed (see the headers of its files).
+network file comes from the Stockfish project. `third_party/fathom` is MIT
+licensed (see the headers of its files).
