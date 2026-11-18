@@ -443,41 +443,60 @@ impl Picker {
         let us = pos.stm;
         let them = us ^ 1;
         let occ = pos.occ();
+        let detailed = self.depth > 1;
 
         // Squares attacked by enemy pieces of lesser value than the mover.
         let mut lesser = [0u64; 8];
-        let pawns = pos.pieces(them, PAWN);
-        let pawn_att = if them == WHITE {
-            ((pawns & !FILE_A) << 7) | ((pawns & !FILE_H) << 9)
-        } else {
-            ((pawns & !FILE_A) >> 9) | ((pawns & !FILE_H) >> 7)
-        };
-        let (mut minor_att, mut rook_att) = (0u64, 0u64);
-        let mut b = pos.pieces(them, KNIGHT);
-        while b != 0 {
-            minor_att |= knight_attacks(pop_lsb(&mut b));
-        }
-        let mut b = pos.pieces(them, BISHOP);
-        while b != 0 {
-            minor_att |= bishop_attacks(pop_lsb(&mut b), occ);
-        }
-        let mut b = pos.pieces(them, ROOK);
-        while b != 0 {
-            rook_att |= rook_attacks(pop_lsb(&mut b), occ);
-        }
-        lesser[KNIGHT] = pawn_att;
-        lesser[BISHOP] = pawn_att;
-        lesser[ROOK] = pawn_att | minor_att;
-        lesser[QUEEN] = lesser[ROOK] | rook_att;
-
-        // Squares from which each piece type would give check.
-        let ksq = pos.king_sq(them);
         let mut checks = [0u64; 8];
-        checks[PAWN] = pawn_attacks(them, ksq);
-        checks[KNIGHT] = knight_attacks(ksq);
-        checks[BISHOP] = bishop_attacks(ksq, occ);
-        checks[ROOK] = rook_attacks(ksq, occ);
-        checks[QUEEN] = checks[BISHOP] | checks[ROOK];
+        if detailed {
+            let pawns = pos.pieces(them, PAWN);
+            let pawn_att = if them == WHITE {
+                ((pawns & !FILE_A) << 7) | ((pawns & !FILE_H) << 9)
+            } else {
+                ((pawns & !FILE_A) >> 9) | ((pawns & !FILE_H) >> 7)
+            };
+            let (mut minor_att, mut rook_att) = (0u64, 0u64);
+            let mut b = pos.pieces(them, KNIGHT);
+            while b != 0 {
+                minor_att |= knight_attacks(pop_lsb(&mut b));
+            }
+            let mut b = pos.pieces(them, BISHOP);
+            while b != 0 {
+                minor_att |= bishop_attacks(pop_lsb(&mut b), occ);
+            }
+            let mut b = pos.pieces(them, ROOK);
+            while b != 0 {
+                rook_att |= rook_attacks(pop_lsb(&mut b), occ);
+            }
+            lesser[KNIGHT] = pawn_att;
+            lesser[BISHOP] = pawn_att;
+            lesser[ROOK] = pawn_att | minor_att;
+            lesser[QUEEN] = lesser[ROOK] | rook_att;
+
+            // Squares from which each piece type would give check.
+            let ksq = pos.king_sq(them);
+            checks[PAWN] = pawn_attacks(them, ksq);
+            checks[KNIGHT] = knight_attacks(ksq);
+            checks[BISHOP] = bishop_attacks(ksq, occ);
+            checks[ROOK] = rook_attacks(ksq, occ);
+            checks[QUEEN] = checks[BISHOP] | checks[ROOK];
+        }
+
+        let cont_slice = |back: usize| -> Option<&[i16]> {
+            if ply >= back {
+                let c = s.ss[ply - back].cont;
+                if c != NO_CONT {
+                    let base = c * 1024;
+                    return Some(&s.cont_hist[base..base + 1024]);
+                }
+            }
+            None
+        };
+        let c1 = cont_slice(1);
+        let c2 = cont_slice(2);
+        let c3 = cont_slice(3);
+        let c4 = cont_slice(4);
+        let c6 = cont_slice(6);
 
         let pawn_base = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024;
         let killers = s.ss[ply].killers;
@@ -500,20 +519,24 @@ impl Picker {
             let pc = pos.board[from] as usize;
             let pt = pc & 7;
             let idx = pc * 64 + to;
-            let hist = 2 * s.butterfly[us][m.from_to()] as i32 + s.cont_score(ply, 1, idx) + s.cont_score(ply, 2, idx);
+            let h1 = c1.map_or(0, |t| t[idx] as i32);
+            let h2 = c2.map_or(0, |t| t[idx] as i32);
+            let hist = 2 * s.butterfly[us][m.from_to()] as i32 + h1 + h2;
             let mut v = hist
                 + 2 * s.pawn_hist[pawn_base + idx] as i32
-                + s.cont_score(ply, 3, idx)
-                + s.cont_score(ply, 4, idx)
-                + s.cont_score(ply, 6, idx);
-            // Bonus for escaping an attack by a lesser piece, penalty for walking into one.
-            let threat = (lesser[pt] & bit(from) != 0) as i32 - (lesser[pt] & bit(to) != 0) as i32;
-            v += PIECE_VALUE[pt] * 20 * threat;
+                + c3.map_or(0, |t| t[idx] as i32)
+                + c4.map_or(0, |t| t[idx] as i32)
+                + c6.map_or(0, |t| t[idx] as i32);
+            if detailed {
+                // Bonus for escaping an attack by a lesser piece, penalty for walking into one.
+                let threat = (lesser[pt] & bit(from) != 0) as i32 - (lesser[pt] & bit(to) != 0) as i32;
+                v += PIECE_VALUE[pt] * 20 * threat;
+                if checks[pt] & bit(to) != 0 && pos.see_ge(m, -36) {
+                    v += 16384;
+                }
+            }
             if ply < LOW_PLY_SIZE {
                 v += 8 * s.low_ply_hist[ply][m.from_to()] as i32 / (1 + ply as i32);
-            }
-            if checks[pt] & bit(to) != 0 && pos.see_ge(m, -36) {
-                v += 16384;
             }
             self.buf[at + i].write(Ext { m, v, hist });
         }
@@ -1101,8 +1124,8 @@ impl Searcher {
         if depth < 7 || tt_move.is_none() || tt_score.abs() >= MATE_BOUND || !pos.is_legal(tt_move) {
             return true;
         }
-        let next = pos.make(tt_move);
-        match self.tt.probe(next.key) {
+        let next_key = pos.key_after(tt_move);
+        match self.tt.probe(next_key) {
             None => true,
             Some(t) => {
                 let s = score_from_tt(t.score, ply + 1);
@@ -1318,12 +1341,14 @@ impl Searcher {
                         best = best.max(fut);
                         continue;
                     }
-                    if !pos.see_ge(m, (alpha - futility_base) * 100 / NORMALIZE_PAWN) {
-                        best = best.max(alpha.min(futility_base));
+                    let see_thresh = (alpha - futility_base) * 100 / NORMALIZE_PAWN;
+                    if !pos.see_ge(m, see_thresh.max(-36)) {
+                        if see_thresh >= -36 || !pos.see_ge(m, see_thresh) {
+                            best = best.max(alpha.min(futility_base));
+                        }
                         continue;
                     }
-                }
-                if !pos.see_ge(m, -36) {
+                } else if !pos.see_ge(m, -36) {
                     continue;
                 }
             } else if best > -MATE_BOUND {

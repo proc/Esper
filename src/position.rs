@@ -383,6 +383,39 @@ impl Position {
         p
     }
 
+    /// Zobrist key of the position after playing `m`, without updating check/pin info.
+    #[inline]
+    pub fn key_after(&self, m: Move) -> u64 {
+        let flag = m.flag();
+        if flag == FLAG_EP || flag == FLAG_KCASTLE || flag == FLAG_QCASTLE || m.is_promo() {
+            return self.make(m).key;
+        }
+        let us = self.stm;
+        let them = us ^ 1;
+        let (from, to) = (m.from(), m.to());
+        let pc = self.board[from] as usize;
+        let mut k = self.key ^ ZOBRIST.side;
+        if self.ep != NO_SQ {
+            k ^= ZOBRIST.ep[(self.ep & 7) as usize];
+        }
+        k ^= ZOBRIST.psq[pc][from] ^ ZOBRIST.psq[pc][to];
+        if m.is_capture() {
+            let cap = self.board[to] as usize;
+            k ^= ZOBRIST.psq[cap][to];
+        }
+        if piece_type(pc as u8) == PAWN && flag == FLAG_DOUBLE {
+            let epsq = (from + to) / 2;
+            if pawn_attacks(us, epsq) & self.pieces(them, PAWN) != 0 {
+                k ^= ZOBRIST.ep[epsq & 7];
+            }
+        }
+        let rights = self.castling & CASTLE_MASK[from] & CASTLE_MASK[to];
+        if rights != self.castling {
+            k ^= ZOBRIST.castling[self.castling as usize] ^ ZOBRIST.castling[rights as usize];
+        }
+        k
+    }
+
     pub fn make_null(&self) -> Position {
         let mut p = *self;
         p.key ^= ZOBRIST.side;
