@@ -34,7 +34,9 @@
  * implementation. To do this supply a macro or function definition
  * here:
  */
- #define TB_CUSTOM_POP_COUNT(x) (__builtin_popcountll(x))
+#ifndef _MSC_VER
+#define TB_CUSTOM_POP_COUNT(x) (__builtin_popcountll(x))
+#endif
 
 /*
  * Define TB_CUSTOM_LSB to override the internal lsb
@@ -42,7 +44,9 @@
  * here:
  */
 
+#ifndef _MSC_VER
 #define TB_CUSTOM_LSB(x) (__builtin_ctzll((x)))
+#endif
 
 /*
  * Define TB_NO_STDINT if you do not want to use <stdint.h> or it is not
