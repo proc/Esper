@@ -30,6 +30,11 @@ import chess.engine
 ALPHA, GAMMA = 0.602, 0.101
 
 
+
+def ply_of(board):
+    """Half-moves since the start of the game (Board.ply() needs python-chess 1.0+)."""
+    return 2 * (board.fullmove_number - 1) + (board.turn == chess.BLACK)
+
 def uci_tunables(engine_path):
     """Read the engine's tunable options (name -> (default, min, max)).
 
@@ -75,7 +80,7 @@ def play_game(engine_path, fen, white_opts, black_opts, movetime):
             cfg.update(opts)
             e.configure(cfg)
         b = chess.Board(fen)
-        while not b.is_game_over(claim_draw=True) and b.ply() < 300:
+        while not b.is_game_over(claim_draw=True) and ply_of(b) < 300:
             r = es[0 if b.turn else 1].play(b, chess.engine.Limit(time=movetime))
             b.push(r.move)
         return {"1-0": 1.0, "0-1": 0.0}.get(b.result(claim_draw=True), 0.5)

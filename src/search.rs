@@ -3,13 +3,14 @@
 //! singular extensions, futility / SEE / history pruning, ...).
 
 use crate::bitboard::*;
+use crate::cuckoo;
 use crate::movegen::*;
 use crate::nnue::{Network, NnueState};
 use crate::position::*;
 use crate::tb::{self, TbConfig};
 use crate::tune;
 use crate::tt::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -38,7 +39,7 @@ const KILLER_ORDERING: bool = true;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
 const SF_RFP: bool = true;
 const SF_RAZOR: bool = true;
-const SF_NMP: bool = true;
+const SF_NMP: bool = false;
 const SF_FUTILITY: bool = true;
 const SF_QSEARCH: bool = true;
 // Further Stockfish-derived techniques.
@@ -54,6 +55,26 @@ const SF_SHUFFLING: bool = true;
 const SF_TIME: bool = true;
 /// Range of the Stockfish-style correction history entries.
 const SF_CORR_LIMIT: i32 = 1024;
+/// Share the continuation, pawn and correction histories between threads.
+const SHARED_HISTORY: bool = true;
+// Second round of Stockfish ports (each can be switched off on its own).
+/// Raise alpha to a draw when the side to move can repeat a position next move.
+const SF_UPCOMING_REP: bool = true;
+/// Adjust depth by the parent's reduction and how the evaluation moved.
+const SF_HINDSIGHT: bool = true;
+/// Stockfish's reduction formula, history-based pruning depth and full-depth reductions.
+const SF_LMR2: bool = true;
+/// Razor only at expected all-nodes, with a margin linear in depth.
+const SF_RAZOR2: bool = true;
+/// Internal iterative reduction only at PV and cut nodes, off the previous PV.
+const SF_IIR2: bool = true;
+/// Accept a hash entry one ply shallower when it is an upper bound at or below beta.
+const SF_TT_DEPTH: bool = true;
+/// Store the static evaluation in the hash table on a miss; inherit it in check.
+const SF_EVAL_STORE: bool = true;
+/// Small items: opponent-worsening in reverse futility, `improving` when above
+/// beta, extending the hash move into PV leaves, parent stat score in bonuses.
+const SF_SMALL2: bool = true;
 /// Reverse futility pruning applies up to this remaining depth.
 const RFP_MAX_DEPTH: i32 = 8;
 const RFP_SKIP_TT_PV: bool = false;
@@ -152,6 +173,12 @@ struct Stack {
     move_count: i32,
     tt_hit: bool,
     cutoff_cnt: i32,
+    /// Depth taken off this ply's current move by LMR (read by the child).
+    reduction: i32,
+    /// History score of this ply's current move (Stockfish's statScore).
+    stat_score: i32,
+    /// This node lies on the previous iteration's principal variation.
+    follow_pv: bool,
 }
 
 struct LmrTable([[i32; 64]; 64]);
@@ -169,11 +196,39 @@ fn lmr_table() -> &'static LmrTable {
     })
 }
 
+/// Stockfish's reduction table: `reductions[i] = 2872 / 128 * ln(i)`.
+fn sf_reductions() -> &'static [i32; 256] {
+    static T: std::sync::OnceLock<[i32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0; 256];
+        for (i, v) in t.iter_mut().enumerate().skip(1) {
+            *v = (2872.0 / 128.0 * (i as f64).ln()) as i32;
+        }
+        t
+    })
+}
+
+/// Base reduction in 1024ths of a ply.
+#[inline(always)]
+fn sf_reduction(improving: bool, depth: i32, move_count: i32) -> i32 {
+    let t = sf_reductions();
+    let scale = t[depth.clamp(0, 255) as usize] * t[move_count.clamp(0, 255) as usize];
+    scale + !improving as i32 * scale * 197 / 512 + 948
+}
+
+/// Divisor turning history into plies of pruning depth.
+#[inline(always)]
+fn lmr_divisor(depth: i32) -> i32 {
+    let d = depth.min(16);
+    3000 + 7 * (d - 8) * (d - 8)
+}
+
 pub struct Searcher {
     pub id: usize,
     pub threads: usize,
     pub tt: Arc<TT>,
     pub shared: Arc<Shared>,
+    lmr: &'static LmrTable,
     nnue: NnueState,
     pos: Vec<Position>,
     ss: Vec<Stack>,
@@ -183,16 +238,12 @@ pub struct Searcher {
     // history heuristics
     butterfly: Box<[[i16; 4096]; 2]>,
     capture_hist: Box<[[[i16; 8]; 64]; 16]>,
-    cont_hist: Vec<i16>,
-    /// Indexed by pawn structure, piece and destination.
-    pawn_hist: Vec<i16>,
+    /// Continuation, pawn and correction histories (shared between threads).
+    hist: Arc<SharedHist>,
     /// Butterfly-style history for the first few plies of the current search.
     low_ply_hist: Box<[[i16; 4096]; LOW_PLY_SIZE]>,
     /// Quiet move that last refuted a given (piece, to-square) move.
     counter: Vec<Move>,
-    pawn_corr: Box<[[i16; CORR_SIZE]; 2]>,
-    /// Correction by knight and bishop placement.
-    minor_corr: Box<[[i16; CORR_SIZE]; 2]>,
     /// Correction by move pairs: (move k plies back, previous move), k = 2, 4, 6.
     cont_corr: Vec<i16>,
     /// How often the hash move turned out best at non-PV nodes.
@@ -207,7 +258,6 @@ pub struct Searcher {
     prev_time_reduction: f64,
     prev_avg_score: i32,
     prev_best_score: i32,
-    nonpawn_corr: Box<[[[i16; CORR_SIZE]; 2]; 2]>,
     // search state
     pub nodes: u64,
     tb_hits: u64,
@@ -259,6 +309,73 @@ fn hist_update(h: &mut i16, bonus: i32, limit: i32) {
     let b = bonus.clamp(-limit, limit);
     let v = *h as i32;
     *h = (v + b - v * b.abs() / limit) as i16;
+}
+
+/// `hist_update` on a table shared between threads. Racing updates may be lost,
+/// which costs nothing measurable; relaxed atomics compile to plain loads and stores.
+#[inline(always)]
+fn hist_update_at(h: &AtomicI16, bonus: i32, limit: i32) {
+    let mut v = h.load(Relaxed);
+    hist_update(&mut v, bonus, limit);
+    h.store(v, Relaxed);
+}
+
+#[inline(always)]
+fn ld(h: &AtomicI16) -> i32 {
+    h.load(Relaxed) as i32
+}
+
+fn atomic_table(len: usize, fill: i16) -> Box<[AtomicI16]> {
+    (0..len).map(|_| AtomicI16::new(fill)).collect()
+}
+
+/// The tables Stockfish shares between all search threads: the continuation and
+/// pawn histories and the pawn, minor-piece and non-pawn correction histories.
+/// With `SHARED_HISTORY` off each thread gets its own copy.
+pub struct SharedHist {
+    cont_hist: Box<[AtomicI16]>,
+    /// Indexed by pawn structure, piece and destination.
+    pawn_hist: Box<[AtomicI16]>,
+    /// `[stm][key]`
+    pawn_corr: Box<[AtomicI16]>,
+    /// Correction by knight and bishop placement, `[stm][key]`.
+    minor_corr: Box<[AtomicI16]>,
+    /// `[color][stm][key]`
+    nonpawn_corr: Box<[AtomicI16]>,
+}
+
+impl SharedHist {
+    pub fn new() -> SharedHist {
+        SharedHist {
+            cont_hist: atomic_table(1024 * 1024, -586),
+            pawn_hist: atomic_table(PAWN_HIST_SIZE * 1024, 5),
+            pawn_corr: atomic_table(2 * CORR_SIZE, 0),
+            minor_corr: atomic_table(2 * CORR_SIZE, 0),
+            nonpawn_corr: atomic_table(4 * CORR_SIZE, 0),
+        }
+    }
+
+    fn clear(&self) {
+        let fill = |t: &[AtomicI16], v: i16| t.iter().for_each(|e| e.store(v, Relaxed));
+        fill(&self.cont_hist, -586);
+        fill(&self.pawn_hist, 5);
+        fill(&self.pawn_corr, 0);
+        fill(&self.minor_corr, 0);
+        fill(&self.nonpawn_corr, 0);
+    }
+
+    #[inline(always)]
+    fn pawn_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
+        &self.pawn_corr[stm * CORR_SIZE + key as usize % CORR_SIZE]
+    }
+    #[inline(always)]
+    fn minor_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
+        &self.minor_corr[stm * CORR_SIZE + key as usize % CORR_SIZE]
+    }
+    #[inline(always)]
+    fn nonpawn_corr(&self, color: usize, stm: usize, key: u64) -> &AtomicI16 {
+        &self.nonpawn_corr[(color * 2 + stm) * CORR_SIZE + key as usize % CORR_SIZE]
+    }
 }
 
 #[inline(always)]
@@ -489,12 +606,12 @@ impl Picker {
             checks[QUEEN] = checks[BISHOP] | checks[ROOK];
         }
 
-        let cont_slice = |back: usize| -> Option<&[i16]> {
+        let cont_slice = |back: usize| -> Option<&[AtomicI16]> {
             if ply >= back {
                 let c = s.ss[ply - back].cont;
                 if c != NO_CONT {
                     let base = c * 1024;
-                    return Some(&s.cont_hist[base..base + 1024]);
+                    return Some(&s.hist.cont_hist[base..base + 1024]);
                 }
             }
             None
@@ -523,17 +640,22 @@ impl Picker {
                 continue;
             }
             let (from, to) = (m.from(), m.to());
-            let pc = pos.board[from] as usize;
+            let pc = unsafe { *pos.board.get_unchecked(from) } as usize;
             let pt = pc & 7;
             let idx = pc * 64 + to;
-            let h1 = c1.map_or(0, |t| t[idx] as i32);
-            let h2 = c2.map_or(0, |t| t[idx] as i32);
-            let hist = 2 * s.butterfly[us][m.from_to()] as i32 + h1 + h2;
-            let mut v = hist
-                + 2 * s.pawn_hist[pawn_base + idx] as i32
-                + c3.map_or(0, |t| t[idx] as i32)
-                + c4.map_or(0, |t| t[idx] as i32)
-                + c6.map_or(0, |t| t[idx] as i32);
+            let (h1, h2, h3, h4, h6, bf, ph) = unsafe {
+                (
+                    c1.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    c2.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    c3.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    c4.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    c6.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    *s.butterfly.get_unchecked(us).get_unchecked(m.from_to()) as i32,
+                    ld(s.hist.pawn_hist.get_unchecked(pawn_base + idx)),
+                )
+            };
+            let hist = 2 * bf + h1 + h2;
+            let mut v = hist + 2 * ph + h3 + h4 + h6;
             if detailed {
                 // Bonus for escaping an attack by a lesser piece, penalty for walking into one.
                 let threat = (lesser[pt] & bit(from) != 0) as i32 - (lesser[pt] & bit(to) != 0) as i32;
@@ -735,12 +857,20 @@ struct Line {
 }
 
 impl Searcher {
-    pub fn new(id: usize, threads: usize, net: Arc<Network>, tt: Arc<TT>, shared: Arc<Shared>) -> Box<Searcher> {
+    pub fn new(
+        id: usize,
+        threads: usize,
+        net: Arc<Network>,
+        tt: Arc<TT>,
+        shared: Arc<Shared>,
+        hist: Arc<SharedHist>,
+    ) -> Box<Searcher> {
         Box::new(Searcher {
             id,
             threads,
             tt,
             shared,
+            lmr: lmr_table(),
             nnue: NnueState::new(net, MAX_PLY + 8),
             pos: vec![Position::empty(); MAX_PLY + 8],
             ss: vec![
@@ -753,7 +883,10 @@ impl Searcher {
                     double_ext: 0,
                     move_count: 0,
                     tt_hit: false,
-                    cutoff_cnt: 0
+                    cutoff_cnt: 0,
+                    reduction: 0,
+                    stat_score: 0,
+                    follow_pv: false,
                 };
                 MAX_PLY + 8
             ],
@@ -762,12 +895,9 @@ impl Searcher {
             pv_len: [0; MAX_PLY + 2],
             butterfly: vec![[-5i16; 4096]; 2].into_boxed_slice().try_into().unwrap(),
             capture_hist: vec![[[-742i16; 8]; 64]; 16].into_boxed_slice().try_into().unwrap(),
-            cont_hist: vec![-586; 1024 * 1024],
-            pawn_hist: vec![5; PAWN_HIST_SIZE * 1024],
+            hist,
             low_ply_hist: vec![[102i16; 4096]; LOW_PLY_SIZE].into_boxed_slice().try_into().unwrap(),
             counter: vec![Move::NONE; 1024],
-            pawn_corr: vec![[0i16; CORR_SIZE]; 2].into_boxed_slice().try_into().unwrap(),
-            minor_corr: vec![[0i16; CORR_SIZE]; 2].into_boxed_slice().try_into().unwrap(),
             cont_corr: vec![0; 1024 * 1024],
             tt_move_hist: 0,
             optimism: [0; 2],
@@ -776,7 +906,6 @@ impl Searcher {
             prev_time_reduction: 0.85,
             prev_avg_score: NONE,
             prev_best_score: NONE,
-            nonpawn_corr: vec![[[0i16; CORR_SIZE]; 2]; 2].into_boxed_slice().try_into().unwrap(),
             nodes: 0,
             tb_hits: 0,
             tb: TbConfig::DEFAULT,
@@ -809,17 +938,16 @@ impl Searcher {
     pub fn clear(&mut self) {
         self.butterfly.iter_mut().for_each(|a| a.fill(-5));
         self.capture_hist.iter_mut().flatten().for_each(|a| a.fill(-742));
-        self.cont_hist.fill(-586);
-        self.pawn_hist.fill(5);
+        // Shared tables are cleared once, by the main thread.
+        if self.id == 0 || !SHARED_HISTORY {
+            self.hist.clear();
+        }
         self.counter.fill(Move::NONE);
-        self.pawn_corr.iter_mut().for_each(|a| a.fill(0));
-        self.minor_corr.iter_mut().for_each(|a| a.fill(0));
         self.cont_corr.fill(0);
         self.tt_move_hist = 0;
         self.prev_time_reduction = 0.85;
         self.prev_avg_score = NONE;
         self.prev_best_score = NONE;
-        self.nonpawn_corr.iter_mut().flatten().for_each(|a| a.fill(0));
     }
 
     /// Static evaluation of `pos` (not in check), for the `eval` command.
@@ -957,11 +1085,11 @@ impl Searcher {
     fn correction_raw(&self, ply: usize) -> i32 {
         let pos = &self.pos[ply];
         let stm = pos.stm;
-        let i = |k: u64| (k as usize) % CORR_SIZE;
-        let pcv = self.pawn_corr[stm][i(pos.pawn_key)] as i32;
-        let micv = self.minor_corr[stm][i(pos.minor_key)] as i32;
-        let wnp = self.nonpawn_corr[WHITE][stm][i(pos.nonpawn_key[WHITE])] as i32;
-        let bnp = self.nonpawn_corr[BLACK][stm][i(pos.nonpawn_key[BLACK])] as i32;
+        let h = &*self.hist;
+        let pcv = ld(h.pawn_corr(stm, pos.pawn_key));
+        let micv = ld(h.minor_corr(stm, pos.minor_key));
+        let wnp = ld(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
+        let bnp = ld(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
         let cont = |back: usize| -> i32 {
             if ply >= back && self.ss[ply - back].cont != NO_CONT && self.ss[ply - 1].cont != NO_CONT {
                 self.cont_corr[self.ss[ply - back].cont * 1024 + self.ss[ply - 1].cont] as i32
@@ -981,11 +1109,11 @@ impl Searcher {
     fn update_correction_sf(&mut self, ply: usize, bonus: i32) {
         let pos = self.pos[ply];
         let stm = pos.stm;
-        let i = |k: u64| (k as usize) % CORR_SIZE;
-        hist_update(&mut self.pawn_corr[stm][i(pos.pawn_key)], bonus, SF_CORR_LIMIT);
-        hist_update(&mut self.minor_corr[stm][i(pos.minor_key)], bonus * 150 / 128, SF_CORR_LIMIT);
-        hist_update(&mut self.nonpawn_corr[WHITE][stm][i(pos.nonpawn_key[WHITE])], bonus * 186 / 128, SF_CORR_LIMIT);
-        hist_update(&mut self.nonpawn_corr[BLACK][stm][i(pos.nonpawn_key[BLACK])], bonus * 186 / 128, SF_CORR_LIMIT);
+        let h = &*self.hist;
+        hist_update_at(h.pawn_corr(stm, pos.pawn_key), bonus, SF_CORR_LIMIT);
+        hist_update_at(h.minor_corr(stm, pos.minor_key), bonus * 150 / 128, SF_CORR_LIMIT);
+        hist_update_at(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]), bonus * 186 / 128, SF_CORR_LIMIT);
+        hist_update_at(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]), bonus * 186 / 128, SF_CORR_LIMIT);
         if ply >= 1 && self.ss[ply - 1].cont != NO_CONT {
             let to = self.ss[ply - 1].cont;
             for (back, w) in [(2usize, 130), (4, 70), (6, 35)] {
@@ -1010,9 +1138,10 @@ impl Searcher {
     #[inline]
     fn correction(&self, pos: &Position) -> i32 {
         let stm = pos.stm;
-        let p = self.pawn_corr[stm][(pos.pawn_key as usize) % CORR_SIZE] as i32;
-        let w = self.nonpawn_corr[WHITE][stm][(pos.nonpawn_key[WHITE] as usize) % CORR_SIZE] as i32;
-        let b = self.nonpawn_corr[BLACK][stm][(pos.nonpawn_key[BLACK] as usize) % CORR_SIZE] as i32;
+        let h = &*self.hist;
+        let p = ld(h.pawn_corr(stm, pos.pawn_key));
+        let w = ld(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
+        let b = ld(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
         (2 * p + w + b) / 512
     }
 
@@ -1020,12 +1149,14 @@ impl Searcher {
         let stm = pos.stm;
         let w = (depth + 1).min(16);
         let target = diff.clamp(-CORR_LIMIT / 256, CORR_LIMIT / 256) * 256;
-        let upd = |e: &mut i16| {
-            *e = ((*e as i32 * (256 - w) + target * w) / 256).clamp(-CORR_LIMIT, CORR_LIMIT) as i16;
+        let upd = |e: &AtomicI16| {
+            let v = ((ld(e) * (256 - w) + target * w) / 256).clamp(-CORR_LIMIT, CORR_LIMIT) as i16;
+            e.store(v, Relaxed);
         };
-        upd(&mut self.pawn_corr[stm][(pos.pawn_key as usize) % CORR_SIZE]);
-        upd(&mut self.nonpawn_corr[WHITE][stm][(pos.nonpawn_key[WHITE] as usize) % CORR_SIZE]);
-        upd(&mut self.nonpawn_corr[BLACK][stm][(pos.nonpawn_key[BLACK] as usize) % CORR_SIZE]);
+        let h = &*self.hist;
+        upd(h.pawn_corr(stm, pos.pawn_key));
+        upd(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
+        upd(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
     }
 
     #[inline(always)]
@@ -1033,7 +1164,7 @@ impl Searcher {
         if ply >= back {
             let c = self.ss[ply - back].cont;
             if c != NO_CONT {
-                return self.cont_hist[c * 1024 + idx] as i32;
+                return ld(&self.hist.cont_hist[c * 1024 + idx]);
             }
         }
         0
@@ -1060,12 +1191,12 @@ impl Searcher {
             if ply >= back {
                 let c = self.ss[ply - back].cont;
                 if c != NO_CONT {
-                    let e = &mut self.cont_hist[c * 1024 + idx];
-                    if *e > 0 {
+                    let e = &self.hist.cont_hist[c * 1024 + idx];
+                    if ld(e) > 0 {
                         positive += 1;
                     }
                     let b = bonus * weight * CONSISTENCY[positive] / 65536 + 73 * (back < 2) as i32;
-                    hist_update(e, b, CONT_HIST_LIMIT);
+                    hist_update_at(e, b, CONT_HIST_LIMIT);
                 }
             }
         }
@@ -1080,7 +1211,7 @@ impl Searcher {
         self.update_cont(ply, pos.in_check(), idx, bonus * 750 / 1024);
         let pawn_idx = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + idx;
         let scale = if bonus > -4 { 1104 } else { 459 };
-        hist_update(&mut self.pawn_hist[pawn_idx], bonus * scale / 1024, PAWN_HIST_LIMIT);
+        hist_update_at(&self.hist.pawn_hist[pawn_idx], bonus * scale / 1024, PAWN_HIST_LIMIT);
     }
 
     /// The stored refutation of the opponent's last move, if any.
@@ -1154,12 +1285,10 @@ impl Searcher {
         in_check: bool,
         gives_check: bool,
         capt_hist: i32,
-        lmr: &LmrTable,
+        lmr_depth: i32,
     ) -> bool {
         let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
         if !gives_check && !in_check {
-            let base = (lmr.0[depth.min(63) as usize][1] + 512) >> 10;
-            let lmr_depth = (depth - 1 - base).max(0);
             if lmr_depth < 8 {
                 let fut = static_eval
                     + tune::T_CapFutBase.get()
@@ -1278,12 +1407,18 @@ impl Searcher {
         if ply >= MAX_PLY {
             return if in_check { 0 } else { self.evaluate(ply) };
         }
+        if SF_UPCOMING_REP && alpha < 0 && cuckoo::upcoming_repetition(&pos, &self.keys, ply) {
+            alpha = self.draw_score();
+            if alpha >= beta {
+                return alpha;
+            }
+        }
 
         let tte = self.tt.probe(pos.key);
         let mut tt_move = Move::NONE;
         let mut tt_pv = pv_node;
         if let Some(t) = tte {
-            let s = score_from_tt(t.score, ply);
+            let s = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply) };
             if !pv_node && draw != DrawState::NearRep && t.bound & (if s >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0 {
                 return s;
             }
@@ -1444,7 +1579,21 @@ impl Searcher {
             if alpha >= beta {
                 return alpha;
             }
+            // The side to move can repeat a position: a draw is the least it gets.
+            if SF_UPCOMING_REP && alpha < 0 && cuckoo::upcoming_repetition(&pos, &self.keys, ply) {
+                alpha = self.draw_score();
+                if alpha >= beta {
+                    return alpha;
+                }
+            }
         }
+        let all_node = !pv_node && !cut_node;
+        let prior_reduction = if ply > 0 { std::mem::take(&mut self.ss[ply - 1].reduction) } else { 0 };
+        self.ss[ply].stat_score = 0;
+        self.ss[ply].follow_pv = root
+            || (self.ss[ply - 1].follow_pv
+                && ply - 1 < self.best_pv.len()
+                && self.ss[ply - 1].mv == self.best_pv[ply - 1]);
 
         let excluded = self.ss[ply].excluded;
         // Check extension
@@ -1466,37 +1615,92 @@ impl Searcher {
         let mut tt_bound = 0;
         let mut tt_pv = pv_node;
         if let Some(t) = tte {
-            tt_score = score_from_tt(t.score, ply);
+            tt_score = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply) };
             tt_depth = t.depth;
             tt_bound = t.bound;
             tt_pv |= t.pv;
             if pos.is_pseudo_legal(t.mv) {
                 tt_move = t.mv;
             }
-            if !pv_node
-                && !near_rep
-                && tt_depth >= depth
-                && tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
-                && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
-                && pos.rule50 < if SF_TT_CUTOFF { 96 } else { 90 }
-                && (!SF_TT_CUTOFF || self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth, ply))
+        }
+
+        // Static evaluation
+        let raw_eval;
+        let static_eval;
+        let mut eval;
+        if in_check {
+            raw_eval = NONE;
+            // Stockfish carries the evaluation from two plies back through a check.
+            static_eval = if SF_EVAL_STORE && ply >= 2 { self.ss[ply - 2].static_eval } else { NONE };
+            eval = static_eval;
+        } else if !excluded.is_none() {
+            raw_eval = NONE;
+            static_eval = self.ss[ply].static_eval;
+            eval = static_eval;
+        } else {
+            raw_eval = match tte {
+                Some(t) if t.eval != NONE => t.eval,
+                _ => self.evaluate(ply),
+            };
+            // Save the evaluation for the next visit even if nothing else gets stored.
+            if SF_EVAL_STORE && tte.is_none() {
+                self.tt.store(pos.key, Move::NONE, NONE, raw_eval, 0, 0, tt_pv);
+            }
+            static_eval = (raw_eval + self.correction_at(ply)).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
+            eval = static_eval;
+            if tte.is_some()
+                && tt_score.abs() < MATE_BOUND
+                && tt_bound & (if tt_score > eval { BOUND_LOWER } else { BOUND_UPPER }) != 0
             {
-                // Reward the hash move for causing a cutoff again.
-                if tt_score >= beta && !tt_move.is_none() {
-                    if !tt_move.is_noisy() {
-                        self.update_quiet(ply, &pos, tt_move, 131 * depth);
-                    }
-                    // The opponent's early quiet move ran into a known refutation.
-                    if ply >= 1 {
-                        let prev = self.ss[ply - 1];
-                        if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.move_count < 5 {
-                            let prev_in_check = self.pos[ply - 1].in_check();
-                            self.update_cont(ply - 1, prev_in_check, prev.cont, -2210);
-                        }
+                eval = tt_score;
+            }
+        }
+        self.ss[ply].static_eval = static_eval;
+
+        // Hindsight: a big reduction of the previous move that the evaluation
+        // does not support is partly given back; a quiet position loses a ply.
+        let opponent_worsening = static_eval != NONE
+            && ply >= 1
+            && self.ss[ply - 1].static_eval != NONE
+            && static_eval > -self.ss[ply - 1].static_eval;
+        if SF_HINDSIGHT && excluded.is_none() {
+            if prior_reduction >= 3 && !opponent_worsening {
+                depth += 1;
+            }
+            if prior_reduction >= 2
+                && depth >= 2
+                && static_eval != NONE
+                && self.ss[ply - 1].static_eval != NONE
+                && static_eval + self.ss[ply - 1].static_eval > 166
+            {
+                depth -= 1;
+            }
+        }
+
+        if !pv_node
+            && !near_rep
+            && tt_score != NONE
+            && if SF_TT_DEPTH { tt_depth > depth - (tt_score <= beta) as i32 } else { tt_depth >= depth }
+            && tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
+            && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
+            && pos.rule50 < if SF_TT_CUTOFF { 96 } else { 90 }
+            && (!SF_TT_CUTOFF || self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth, ply))
+        {
+            // Reward the hash move for causing a cutoff again.
+            if tt_score >= beta && !tt_move.is_none() {
+                if !tt_move.is_noisy() {
+                    self.update_quiet(ply, &pos, tt_move, 131 * depth);
+                }
+                // The opponent's early quiet move ran into a known refutation.
+                if ply >= 1 {
+                    let prev = self.ss[ply - 1];
+                    if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.move_count < 5 {
+                        let prev_in_check = self.pos[ply - 1].in_check();
+                        self.update_cont(ply - 1, prev_in_check, prev.cont, -2210);
                     }
                 }
-                return tt_score;
             }
+            return tt_score;
         }
 
         // Tablebase probe: an exact win/draw/loss verdict replaces searching.
@@ -1535,48 +1739,21 @@ impl Searcher {
             }
         }
 
-        // Static evaluation
-        let raw_eval;
-        let static_eval;
-        let mut eval;
-        if in_check {
-            raw_eval = NONE;
-            static_eval = NONE;
-            eval = NONE;
-        } else if !excluded.is_none() {
-            raw_eval = NONE;
-            static_eval = self.ss[ply].static_eval;
-            eval = static_eval;
-        } else {
-            raw_eval = match tte {
-                Some(t) if t.eval != NONE => t.eval,
-                _ => self.evaluate(ply),
-            };
-            static_eval = (raw_eval + self.correction_at(ply)).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
-            eval = static_eval;
-            if tte.is_some()
-                && tt_score.abs() < MATE_BOUND
-                && tt_bound & (if tt_score > eval { BOUND_LOWER } else { BOUND_UPPER }) != 0
-            {
-                eval = tt_score;
-            }
-        }
-        self.ss[ply].static_eval = static_eval;
 
         // The change in static evaluation caused by the opponent's last quiet move
         // says something about that move's quality.
         if !in_check && excluded.is_none() && ply >= 1 {
             let prev = self.ss[ply - 1];
-            if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.static_eval != NONE {
+            if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.static_eval != NONE && !self.pos[ply - 1].in_check() {
                 let diff = (-(prev.static_eval + static_eval)).clamp(-189, 194) + 60;
                 hist_update(&mut self.butterfly[pos.stm ^ 1][prev.mv.from_to()], diff * 11, MAIN_HIST_LIMIT);
                 if tte.is_none() && prev.cont / 64 & 7 != PAWN && !prev.mv.is_promo() {
                     let i = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + prev.cont;
-                    hist_update(&mut self.pawn_hist[i], diff * 13, PAWN_HIST_LIMIT);
+                    hist_update_at(&self.hist.pawn_hist[i], diff * 13, PAWN_HIST_LIMIT);
                 }
             }
         }
-        let improving = !in_check && {
+        let mut improving = !in_check && {
             if ply >= 2 && self.ss[ply - 2].static_eval != NONE {
                 static_eval > self.ss[ply - 2].static_eval
             } else if ply >= 4 && self.ss[ply - 4].static_eval != NONE {
@@ -1606,7 +1783,13 @@ impl Searcher {
                     && beta > -MATE_BOUND
                 {
                     let mult = (45 + 4 * depth).min(85) - 20 * tte.is_none() as i32;
-                    let margin = mult * depth - tune::T_RfpImproving.get() * improving as i32 * mult / 1024;
+                    let margin = if SF_SMALL2 {
+                        mult * depth
+                            - (tune::T_RfpImproving.get() * improving as i32 + 335 * opponent_worsening as i32) * mult / 1024
+                            + self.correction_raw(ply).abs() / 198435
+                    } else {
+                        mult * depth - tune::T_RfpImproving.get() * improving as i32 * mult / 1024
+                    };
                     if eval - margin >= beta {
                         return (661 * beta + 363 * eval) / 1024;
                     }
@@ -1622,7 +1805,12 @@ impl Searcher {
 
             // Razoring
             if SF_RAZOR {
-                if !self.seek_mate && eval < alpha - 485 - 280 * depth * depth {
+                let razor = if SF_RAZOR2 {
+                    all_node && eval < alpha - 342 * depth
+                } else {
+                    eval < alpha - 485 - 280 * depth * depth
+                };
+                if !self.seek_mate && razor {
                     return self.qsearch(ply, alpha, beta);
                 }
             } else if depth <= 3 && static_eval + 150 + 125 * depth <= alpha {
@@ -1675,6 +1863,10 @@ impl Searcher {
                         return v;
                     }
                 }
+            }
+
+            if SF_SMALL2 {
+                improving |= static_eval >= beta;
             }
 
             // ProbCut: a capture that beats beta by a margin at reduced depth
@@ -1743,7 +1935,11 @@ impl Searcher {
         }
 
         // Internal iterative reduction
-        if (depth >= 4 && tt_move.is_none()) || (cut_node && depth >= 6 && tt_depth + 4 <= depth) {
+        if SF_IIR2 {
+            if !self.ss[ply].follow_pv && !all_node && depth >= 6 && tt_move.is_none() {
+                depth -= 1;
+            }
+        } else if (depth >= 4 && tt_move.is_none()) || (cut_node && depth >= 6 && tt_depth + 4 <= depth) {
             depth -= 1;
         }
 
@@ -1762,7 +1958,7 @@ impl Searcher {
             }
         }
 
-        let lmr = lmr_table();
+        let lmr = self.lmr;
         let mut picker = Picker::new(tt_move, false, depth);
         let mut best = tb_floor;
         let mut best_move = Move::NONE;
@@ -1802,7 +1998,7 @@ impl Searcher {
                 && !in_check
                 && best > -MATE_BOUND
                 && pos.has_non_pawn_material(pos.stm)
-                && move_count > (3 + depth * depth) / (2 - improving as i32)
+                && move_count + SF_LMR2 as i32 > (3 + depth * depth) / (2 - improving as i32)
             {
                 skip_quiets = true;
                 continue;
@@ -1823,9 +2019,56 @@ impl Searcher {
             let is_counter = quiet && !is_killer && m == self.counter_move(ply);
             let gives_check = pos.gives_check(m);
 
+            // Stockfish's reduction, in 1024ths of a ply, and the depth the move
+            // would be searched at, used by the pruning below.
+            let mut r_sf = 0;
+            let mut lmr_depth_sf = 0;
+            if SF_LMR2 {
+                r_sf = sf_reduction(improving, depth, move_count);
+                if pv_node {
+                    r_sf -= 512;
+                }
+                if tt_pv {
+                    r_sf += 929;
+                }
+                lmr_depth_sf = depth - 1 - r_sf / 1024;
+            }
+
             // Move-loop pruning
             if !root && best > -MATE_BOUND && pos.has_non_pawn_material(pos.stm) {
-                if quiet {
+                if SF_LMR2 && quiet && !gives_check {
+                    if !self.ss[ply].follow_pv || !pv_node {
+                        let idx = pos.board[m.from()] as usize * 64 + m.to();
+                        let pawn_idx = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + idx;
+                        let mut history = self.cont_score(ply, 1, idx)
+                            + self.cont_score(ply, 2, idx)
+                            + ld(&self.hist.pawn_hist[pawn_idx]);
+                        // Continuation-history pruning
+                        if history < -4136 * depth {
+                            continue;
+                        }
+                        history += 69 * self.butterfly[pos.stm][m.from_to()] as i32 / 32;
+                        let mut lmr_depth = lmr_depth_sf + history / lmr_divisor(depth);
+                        // Futility pruning: parent node
+                        let fut = static_eval
+                            + tune::T_FutMult.get() * lmr_depth
+                            + tune::T_FutAboveAlpha.get() * (static_eval > alpha) as i32
+                            + tune::T_FutBase.get();
+                        if !in_check && lmr_depth < 12 && fut <= alpha {
+                            if best <= fut && best.abs() < MATE_BOUND && fut < MATE_BOUND {
+                                best = fut;
+                            }
+                            continue;
+                        }
+                        lmr_depth = lmr_depth.max(0);
+                        // SEE pruning (Stockfish's margin is in units of 208 per pawn)
+                        if !pos.see_ge(m, -23 * lmr_depth * lmr_depth * 100 / 208) {
+                            continue;
+                        }
+                    }
+                } else if SF_LMR2 && quiet {
+                    // Checking quiets get the capture-style exchange test below.
+                } else if quiet {
                     let protected = is_killer || is_counter;
                     let base = (lmr.0[depth.min(63) as usize][(move_count as usize).min(63)] + 512) >> 10;
                     let lmr_depth =
@@ -1863,7 +2106,12 @@ impl Searcher {
                         continue;
                     }
                 } else if SF_CAPTURE_PRUNE {
-                    if self.prune_capture(&pos, m, depth, static_eval, alpha, in_check, gives_check, hist, lmr) {
+                    let lmr_depth = if SF_LMR2 {
+                        lmr_depth_sf
+                    } else {
+                        (depth - 1 - ((lmr.0[depth.min(63) as usize][1] + 512) >> 10)).max(0)
+                    };
+                    if self.prune_capture(&pos, m, depth, static_eval, alpha, in_check, gives_check, hist, lmr_depth) {
                         continue;
                     }
                 } else if !good_capture && !pos.see_ge(m, -90 * depth) {
@@ -1966,90 +2214,175 @@ impl Searcher {
             }
 
             self.ss[ply].move_count = move_count;
+            // Stockfish's statScore: how well this move has done before.
+            let stat_score = if !quiet {
+                let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
+                873 * PIECE_VALUE[victim] / 128 + hist
+            } else {
+                let idx = pos.board[m.from()] as usize * 64 + m.to();
+                (2252 * self.butterfly[pos.stm][m.from_to()] as i32
+                    + 1126 * self.cont_score(ply, 1, idx)
+                    + 1093 * self.cont_score(ply, 2, idx))
+                    / 1024
+            };
+            self.ss[ply].stat_score = stat_score;
             self.make(ply, m);
             debug_assert_eq!(gives_check, self.pos[ply + 1].checkers != 0);
-            let new_depth = depth - 1 + ext;
+            let mut new_depth = depth - 1 + ext;
             let nodes_before = self.nodes;
             let mut score;
 
-            // Late move reductions: quiets from the second/third move on, captures from the fourth.
-            let do_lmr = if quiet {
-                depth >= 2 && moves_searched >= 1 + pv_node as i32
-            } else {
-                depth >= 3 && moves_searched >= 3 + pv_node as i32
-            };
-            if do_lmr {
-                let base = lmr.0[depth.min(63) as usize][(move_count as usize).min(63)];
-                let mut r;
-                if quiet {
-                    r = base;
-                    r += if pv_node { -1024 } else { 1024 };
-                    r += if improving { -1024 } else { 1024 };
-                    r += if tt_pv { -512 } else { 1024 };
-                    if !in_check && static_eval + 150 <= alpha {
-                        r += 1024;
-                    }
-                    if cut_node {
-                        r += if tt_move.is_none() { 1024 } else { 1536 };
-                    }
-                    if !tt_move.is_none() && tt_move.is_noisy() {
-                        r += 1024;
-                    }
-                    if self.ss[ply + 1].cutoff_cnt > 3 {
-                        r += 1024;
-                    }
-                    if is_killer {
-                        r -= 2048;
-                    } else if is_counter {
-                        r -= 1024;
-                    }
-                    r -= ((hist - QUIET_HIST_CENTRE) * 1024 / QUIET_HIST_STEP).clamp(-2048, 2560);
-                } else {
-                    r = base / 2;
-                    r += if tt_pv { -512 } else { 1024 };
-                    if cut_node {
-                        r += 1024;
-                    }
-                    r -= ((hist - CAPTURE_HIST_CENTRE) * 1024 / CAPTURE_HIST_STEP).clamp(-1024, 1536);
-                    if !good_capture && !pos.see_ge(m, 0) {
-                        r += 1024;
-                    }
+            if SF_LMR2 {
+                let mut r = r_sf;
+                // Fewer reductions for positions that have been on a PV.
+                if tt_pv {
+                    r -= 3023
+                        + pv_node as i32 * 1004
+                        + (tt_score != NONE && tt_score > alpha) as i32 * 885
+                        + (tt_depth >= depth) as i32 * (816 + cut_node as i32 * 940);
                 }
-                if in_check {
-                    r -= 1024;
+                r += 697;
+                r -= move_count * 65;
+                r -= self.correction_raw(ply).abs() / 26310;
+                if cut_node {
+                    r += 4026 + 933 * tt_move.is_none() as i32;
                 }
-                if gives_check {
-                    r -= 1024;
+                if tt_move.is_noisy() {
+                    r += 1079;
                 }
-                // When looking for a mate, reduce checks less and other moves more.
+                let cutoffs = self.ss[ply + 1].cutoff_cnt;
+                if cutoffs > 1 {
+                    r += 264 + 1095 * (cutoffs > 2) as i32 + 1138 * all_node as i32;
+                } else if m == tt_move {
+                    r -= 2179;
+                }
+                r -= stat_score * 439 / 4096;
+                if quiet && alpha.abs() < MATE_BOUND {
+                    r += 3 * (alpha - eval).clamp(-64, 96);
+                }
+                if all_node {
+                    r += r * 276 / (256 * depth + 268);
+                }
                 if SF_SEEK_MATE && self.seek_mate && r > 0 {
                     r += (if gives_check { -r } else { r }) / 4;
                 }
-                let r_plies = (r + 512) >> 10;
-                let d = if SF_LMR_EXTEND {
-                    // A negative reduction may extend by 1 ply near the root.
-                    let cap = if (ply as i32) < 2 * self.root_depth { 1 } else { 0 };
-                    (new_depth + (-r_plies).min(cap)).max(1)
+                if depth >= 2 && move_count > 1 {
+                    // A negative reduction may extend, but not deep in the tree.
+                    let cap = if (ply as i32) < 2 * self.root_depth { 2 } else { 0 };
+                    let d = (new_depth + (-r / 1024).min(cap)).max(1) + pv_node as i32;
+                    self.ss[ply].reduction = new_depth - d;
+                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
+                    self.ss[ply].reduction = 0;
+                    if score > alpha {
+                        // Re-searching deeper restores the full depth; deep in the tree that
+                        // can chain ply after ply down long shuffling lines, so it is
+                        // bounded like the extensions.
+                        let deeper = d < new_depth && score > best + 53 && (ply as i32) < 2 * self.root_depth;
+                        let shallower = score < best + 8;
+                        new_depth += deeper as i32 - shallower as i32;
+                        if new_depth > d {
+                            score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
+                        }
+                        // The move did better than its late position suggested.
+                        let idx = pos.board[m.from()] as usize * 64 + m.to();
+                        self.update_cont(ply, in_check, idx, 1334);
+                    }
+                } else if !pv_node || move_count > 1 {
+                    // No LMR here, but a very large reduction still costs a ply or two.
+                    if tt_move.is_none() {
+                        r += 1127;
+                    }
+                    let d = new_depth - (r > 5234) as i32 - (r > 5487 && new_depth > 2) as i32;
+                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, !cut_node);
                 } else {
-                    (new_depth - r_plies.max(0)).clamp(1, new_depth.max(1))
-                };
-                score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
-                // A reduced search that fails high is repeated at adjusted full depth.
-                if score > alpha && d < new_depth {
-                    let do_deeper = score > best + 50 + 2 * new_depth;
-                    let do_shallower = score < best + new_depth;
-                    let re_depth = (new_depth + do_deeper as i32 - do_shallower as i32).max(1);
-                    score = -self.search(ply + 1, -alpha - 1, -alpha, re_depth, !cut_node);
-                    // The move did better than its late position suggested.
-                    let idx = pos.board[m.from()] as usize * 64 + m.to();
-                    self.update_cont(ply, in_check, idx, 1334);
+                    score = alpha + 1;
                 }
-            } else if !pv_node || move_count > 1 {
-                score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
             } else {
-                score = alpha + 1;
+                // Late move reductions: quiets from the second/third move on, captures from the fourth.
+                let do_lmr = if quiet {
+                    depth >= 2 && moves_searched >= 1 + pv_node as i32
+                } else {
+                    depth >= 3 && moves_searched >= 3 + pv_node as i32
+                };
+                if do_lmr {
+                    let base = lmr.0[depth.min(63) as usize][(move_count as usize).min(63)];
+                    let mut r;
+                    if quiet {
+                        r = base;
+                        r += if pv_node { -1024 } else { 1024 };
+                        r += if improving { -1024 } else { 1024 };
+                        r += if tt_pv { -512 } else { 1024 };
+                        if !in_check && static_eval + 150 <= alpha {
+                            r += 1024;
+                        }
+                        if cut_node {
+                            r += if tt_move.is_none() { 1024 } else { 1536 };
+                        }
+                        if !tt_move.is_none() && tt_move.is_noisy() {
+                            r += 1024;
+                        }
+                        if self.ss[ply + 1].cutoff_cnt > 3 {
+                            r += 1024;
+                        }
+                        if is_killer {
+                            r -= 2048;
+                        } else if is_counter {
+                            r -= 1024;
+                        }
+                        r -= ((hist - QUIET_HIST_CENTRE) * 1024 / QUIET_HIST_STEP).clamp(-2048, 2560);
+                    } else {
+                        r = base / 2;
+                        r += if tt_pv { -512 } else { 1024 };
+                        if cut_node {
+                            r += 1024;
+                        }
+                        r -= ((hist - CAPTURE_HIST_CENTRE) * 1024 / CAPTURE_HIST_STEP).clamp(-1024, 1536);
+                        if !good_capture && !pos.see_ge(m, 0) {
+                            r += 1024;
+                        }
+                    }
+                    if in_check {
+                        r -= 1024;
+                    }
+                    if gives_check {
+                        r -= 1024;
+                    }
+                    // When looking for a mate, reduce checks less and other moves more.
+                    if SF_SEEK_MATE && self.seek_mate && r > 0 {
+                        r += (if gives_check { -r } else { r }) / 4;
+                    }
+                    let r_plies = (r + 512) >> 10;
+                    let d = if SF_LMR_EXTEND {
+                        // A negative reduction may extend by 1 ply near the root.
+                        let cap = if (ply as i32) < 2 * self.root_depth { 1 } else { 0 };
+                        (new_depth + (-r_plies).min(cap)).max(1)
+                    } else {
+                        (new_depth - r_plies.max(0)).clamp(1, new_depth.max(1))
+                    };
+                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
+                    // A reduced search that fails high is repeated at adjusted full depth.
+                    if score > alpha && d < new_depth {
+                        let do_deeper = score > best + 50 + 2 * new_depth;
+                        let do_shallower = score < best + new_depth;
+                        let re_depth = (new_depth + do_deeper as i32 - do_shallower as i32).max(1);
+                        score = -self.search(ply + 1, -alpha - 1, -alpha, re_depth, !cut_node);
+                        // The move did better than its late position suggested.
+                        let idx = pos.board[m.from()] as usize * 64 + m.to();
+                        self.update_cont(ply, in_check, idx, 1334);
+                    }
+                } else if !pv_node || move_count > 1 {
+                    score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
+                } else {
+                    score = alpha + 1;
+                }
             }
             if pv_node && (move_count == 1 || (score > alpha && (root || score < beta))) {
+                if SF_SMALL2
+                    && m == tt_move
+                    && ((tt_score != NONE && tt_score.abs() >= MATE_BOUND && tt_depth > 0) || tt_depth > 1)
+                {
+                    new_depth = new_depth.max(1);
+                }
                 score = -self.search(ply + 1, -beta, -alpha, new_depth, false);
             }
             self.unmake();
@@ -2075,7 +2408,7 @@ impl Searcher {
                         self.pv_len[ply] = n + 1;
                     }
                     if score >= beta {
-                        self.ss[ply].cutoff_cnt += 1;
+                        self.ss[ply].cutoff_cnt += (!SF_LMR2 || ext < 2 || pv_node) as i32;
                         break;
                     }
                     alpha = score;
@@ -2106,7 +2439,8 @@ impl Searcher {
 
         if best >= beta {
             // The more moves had to be tried first, the more the refutation is worth.
-            let mut bonus = stat_bonus(depth) + 364 * (best_move == tt_move) as i32;
+            let prev_stat = if SF_SMALL2 && ply >= 1 { self.ss[ply - 1].stat_score } else { 0 };
+            let mut bonus = stat_bonus(depth) + 364 * (best_move == tt_move) as i32 + prev_stat / 28;
             bonus += bonus * (n_quiets + n_noisies) as i32 / 256;
             let malus = stat_malus(depth);
             if !best_move.is_noisy() {
@@ -2148,6 +2482,9 @@ impl Searcher {
             if prev.cont != NO_CONT && !prev.mv.is_capture() {
                 let prev_in_check = self.pos[ply - 1].in_check();
                 let mut scale = -241 + (59 * depth).min(420) + 186 * (prev.move_count > 9) as i32;
+                if SF_SMALL2 {
+                    scale -= prev.stat_score / 98;
+                }
                 scale += 142 * (!in_check && best <= static_eval - 106) as i32;
                 scale += 159 * (!prev_in_check && prev.static_eval != NONE && best <= -prev.static_eval - 68) as i32;
                 let scaled = (150 * depth - 85).min(1337) * scale.max(0);
@@ -2155,7 +2492,7 @@ impl Searcher {
                 hist_update(&mut self.butterfly[pos.stm ^ 1][prev.mv.from_to()], scaled * 215 / 32768, MAIN_HIST_LIMIT);
                 if prev.cont / 64 & 7 != PAWN && !prev.mv.is_promo() {
                     let i = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + prev.cont;
-                    hist_update(&mut self.pawn_hist[i], scaled * 324 / 8192, PAWN_HIST_LIMIT);
+                    hist_update_at(&self.hist.pawn_hist[i], scaled * 324 / 8192, PAWN_HIST_LIMIT);
                 }
             } else if prev.cont != NO_CONT {
                 // A capture: credit it in the capture history.
@@ -2538,7 +2875,9 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(threads: usize, net: Arc<Network>, tt: Arc<TT>, shared: Arc<Shared>) -> ThreadPool {
-        let main = Searcher::new(0, threads, net.clone(), tt.clone(), shared.clone());
+        let hist = Arc::new(SharedHist::new());
+        let thread_hist = |id: usize| if SHARED_HISTORY || id == 0 { hist.clone() } else { Arc::new(SharedHist::new()) };
+        let main = Searcher::new(0, threads, net.clone(), tt.clone(), shared.clone(), thread_hist(0));
         let mut helpers = Vec::with_capacity(threads.saturating_sub(1));
         for id in 1..threads {
             let state = Arc::new((
@@ -2551,10 +2890,11 @@ impl ThreadPool {
             let net = net.clone();
             let tt = tt.clone();
             let shared = shared.clone();
+            let hist = thread_hist(id);
             let join = std::thread::Builder::new()
-                .stack_size(32 * 1024 * 1024)
+                .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
-                    let mut searcher = Searcher::new(id, threads, net, tt, shared);
+                    let mut searcher = Searcher::new(id, threads, net, tt, shared, hist);
                     let mut last_gen = 0;
                     loop {
                         let job = {

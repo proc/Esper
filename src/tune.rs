@@ -20,7 +20,14 @@ impl Param {
     }
     #[inline(always)]
     pub fn get(&self) -> i32 {
-        self.value.load(Relaxed)
+        #[cfg(feature = "tune")]
+        {
+            self.value.load(Relaxed)
+        }
+        #[cfg(not(feature = "tune"))]
+        {
+            self.default
+        }
     }
     pub fn set(&self, v: i32) {
         self.value.store(v.clamp(self.min, self.max), Relaxed);

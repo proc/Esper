@@ -144,6 +144,9 @@ fn fill_magics(dirs: &[(i32, i32); 4], magics: &[u64; 64], out: &mut [Magic; 64]
         // Enumerate all subsets of the mask (carry-rippler).
         let mut sub = 0u64;
         loop {
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            let idx = offset + unsafe { std::arch::x86_64::_pext_u64(sub, mask) } as usize;
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             let idx = offset + (sub.wrapping_mul(magic) >> shift) as usize;
             let att = slide(sq, sub, dirs);
             assert!(attacks[idx] == 0 || attacks[idx] == att, "bad magic");
@@ -222,13 +225,21 @@ pub fn king_attacks(sq: usize) -> u64 {
 pub fn rook_attacks(sq: usize, occ: u64) -> u64 {
     let t = tables();
     let m = &t.rook[sq];
-    unsafe { *t.attacks.get_unchecked(m.offset + ((occ & m.mask).wrapping_mul(m.magic) >> m.shift) as usize) }
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let idx = m.offset + unsafe { std::arch::x86_64::_pext_u64(occ, m.mask) } as usize;
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let idx = m.offset + ((occ & m.mask).wrapping_mul(m.magic) >> m.shift) as usize;
+    unsafe { *t.attacks.get_unchecked(idx) }
 }
 #[inline(always)]
 pub fn bishop_attacks(sq: usize, occ: u64) -> u64 {
     let t = tables();
     let m = &t.bishop[sq];
-    unsafe { *t.attacks.get_unchecked(m.offset + ((occ & m.mask).wrapping_mul(m.magic) >> m.shift) as usize) }
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let idx = m.offset + unsafe { std::arch::x86_64::_pext_u64(occ, m.mask) } as usize;
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let idx = m.offset + ((occ & m.mask).wrapping_mul(m.magic) >> m.shift) as usize;
+    unsafe { *t.attacks.get_unchecked(idx) }
 }
 #[inline(always)]
 pub fn between(a: usize, b: usize) -> u64 {

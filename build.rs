@@ -11,6 +11,13 @@ fn main() {
         .warnings(false)
         .compile("fathom");
 
+    // Give esper.exe the Esper logo (esper.ico, rendered from esper.svg) as its icon.
+    println!("cargo:rerun-if-changed=esper.rc");
+    println!("cargo:rerun-if-changed=esper.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_resource::compile("esper.rc", embed_resource::NONE).manifest_optional().unwrap();
+    }
+
     // SIMD selection is a compile-time decision based on the enabled target
     // features (e.g. from `-C target-cpu=native`).
     const FLAGS: [&str; 7] =

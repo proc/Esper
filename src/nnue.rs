@@ -492,16 +492,16 @@ fn psq_diff<const N: usize>(
 /// All piece-attacks-piece relations of a position in a perspective-independent
 /// encoding (`from << 14 | to << 8 | attacker << 4 | attacked`), sorted ascending.
 #[inline(never)]
-fn gen_threats(pos: &Position, out: &mut [u32; MAX_THREATS]) -> usize {
+fn gen_threats_masked(pos: &Position, mask: u64, out: &mut [u32; MAX_THREATS]) -> usize {
     let occ = pos.occ();
     let pawn_targets = pos.by_type[KNIGHT] | pos.by_type[ROOK];
     let slider_targets = pos.by_type[PAWN] | pos.by_type[KNIGHT] | pos.by_type[BISHOP] | pos.by_type[ROOK];
     let queen_targets = slider_targets | pos.by_type[QUEEN];
-    let mut pieces = occ & !pos.by_type[KING];
+    let mut pieces = occ & !pos.by_type[KING] & mask;
     let mut n = 0;
     while pieces != 0 {
         let from = pop_lsb(&mut pieces);
-        let pc = pos.board[from];
+        let pc = unsafe { *pos.board.get_unchecked(from) };
         let mut att = match piece_type(pc) {
             PAWN => pawn_attacks(piece_color(pc), from) & pawn_targets,
             KNIGHT => knight_attacks(from) & queen_targets,
@@ -512,12 +512,19 @@ fn gen_threats(pos: &Position, out: &mut [u32; MAX_THREATS]) -> usize {
         while att != 0 {
             let to = pop_lsb(&mut att);
             if n < MAX_THREATS {
-                out[n] = ((from as u32) << 14) | ((to as u32) << 8) | ((pc as u32) << 4) | pos.board[to] as u32;
+                out[n] = ((from as u32) << 14)
+                    | ((to as u32) << 8)
+                    | ((pc as u32) << 4)
+                    | unsafe { *pos.board.get_unchecked(to) } as u32;
                 n += 1;
             }
         }
     }
     n
+}
+
+fn gen_threats(pos: &Position, out: &mut [u32; MAX_THREATS]) -> usize {
+    gen_threats_masked(pos, !0u64, out)
 }
 
 impl ThreatLuts {
@@ -906,36 +913,59 @@ impl NnueState {
             let (prev, cur) = (&mut lo[j - 1], &mut hi[0]);
             if !cur.tp_diff_ok {
                 let (p0, p1) = (&stack[j - 1], &stack[j]);
-                if !prev.threats_ok {
-                    prev.n_threats = gen_threats(p0, &mut prev.threats);
-                    prev.threats_ok = true;
+                let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
+                for pt in PAWN..=KING {
+                    changed |= p0.by_type[pt] ^ p1.by_type[pt];
                 }
-                if !cur.threats_ok {
-                    cur.n_threats = gen_threats(p1, &mut cur.threats);
-                    cur.threats_ok = true;
-                }
-                let (a, b) = (&prev.threats[..prev.n_threats], &cur.threats[..cur.n_threats]);
                 let mut added = IdxList::<MAX_THREATS>::new();
                 let mut removed = IdxList::<MAX_THREATS>::new();
-                let (mut i, mut m) = (0, 0);
-                while i < a.len() && m < b.len() {
-                    let (x, y) = (a[i], b[m]);
-                    if x == y {
-                        i += 1;
-                        m += 1;
-                    } else if x < y {
-                        removed.push(x);
-                        i += 1;
-                    } else {
-                        added.push(y);
-                        m += 1;
+                if changed != 0 {
+                    let occ0 = p0.occ();
+                    let occ1 = p1.occ();
+                    let wp = p0.pieces(WHITE, PAWN) | p1.pieces(WHITE, PAWN);
+                    let bp = p0.pieces(BLACK, PAWN) | p1.pieces(BLACK, PAWN);
+                    let kn = p0.by_type[KNIGHT] | p1.by_type[KNIGHT];
+                    let diag0 = p0.by_type[BISHOP] | p0.by_type[QUEEN];
+                    let diag1 = p1.by_type[BISHOP] | p1.by_type[QUEEN];
+                    let ortho0 = p0.by_type[ROOK] | p0.by_type[QUEEN];
+                    let ortho1 = p1.by_type[ROOK] | p1.by_type[QUEEN];
+                    let mut affected = changed;
+                    let mut c = changed;
+                    while c != 0 {
+                        let sq = pop_lsb(&mut c);
+                        affected |= (pawn_attacks(BLACK, sq) & wp)
+                            | (pawn_attacks(WHITE, sq) & bp)
+                            | (knight_attacks(sq) & kn)
+                            | (bishop_attacks(sq, occ0) & diag0)
+                            | (bishop_attacks(sq, occ1) & diag1)
+                            | (rook_attacks(sq, occ0) & ortho0)
+                            | (rook_attacks(sq, occ1) & ortho1);
                     }
-                }
-                for &x in &a[i..] {
-                    removed.push(x);
-                }
-                for &y in &b[m..] {
-                    added.push(y);
+                    let mut old_t = [0u32; MAX_THREATS];
+                    let mut new_t = [0u32; MAX_THREATS];
+                    let n_old = gen_threats_masked(p0, affected, &mut old_t);
+                    let n_new = gen_threats_masked(p1, affected, &mut new_t);
+                    let (a, b) = (&old_t[..n_old], &new_t[..n_new]);
+                    let (mut i, mut m) = (0, 0);
+                    while i < a.len() && m < b.len() {
+                        let (x, y) = (a[i], b[m]);
+                        if x == y {
+                            i += 1;
+                            m += 1;
+                        } else if x < y {
+                            removed.push(x);
+                            i += 1;
+                        } else {
+                            added.push(y);
+                            m += 1;
+                        }
+                    }
+                    for &x in &a[i..] {
+                        removed.push(x);
+                    }
+                    for &y in &b[m..] {
+                        added.push(y);
+                    }
                 }
                 let (w0, b0) = (p0.pieces(WHITE, PAWN), p0.pieces(BLACK, PAWN));
                 let (w1, b1) = (p1.pieces(WHITE, PAWN), p1.pieces(BLACK, PAWN));

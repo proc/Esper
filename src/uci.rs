@@ -9,14 +9,14 @@ use crate::tb::{self, TbConfig};
 use crate::tt::TT;
 use std::io::BufRead;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 const NAME: &str = concat!("Esper ", env!("CARGO_PKG_VERSION"));
 /// The "Win at Chess" tactical test suite (300 positions).
 const WAC_EPD: &str = include_str!("../suites/wac.epd");
-const SEARCH_STACK: usize = 64 * 1024 * 1024;
+const SEARCH_STACK: usize = 16 * 1024 * 1024;
 const BENCH_FENS: [&str; 12] = [
     START_FEN,
     "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -32,12 +32,38 @@ const BENCH_FENS: [&str; 12] = [
     "4rrk1/pp1n1pp1/q5p1/P1pP4/2n3P1/7P/1P3PB1/R1BQ1RK1 w - - 3 22",
 ];
 
+struct SearchTask {
+    pool: ThreadPool,
+    pos: Position,
+    keys: Vec<u64>,
+    limits: Limits,
+    multipv: usize,
+    overhead: u64,
+    tb_cfg: TbConfig,
+    show_wdl: bool,
+    silent: bool,
+    shared: Arc<Shared>,
+    root_tb: Option<tb::RootResult>,
+}
+
+enum CoordCmd {
+    Run(Box<SearchTask>),
+    Quit,
+}
+
+struct CoordState {
+    cmd: Option<CoordCmd>,
+    result: Option<ThreadPool>,
+    busy: bool,
+}
+
 pub struct Engine {
     net: Arc<Network>,
     tt: Arc<TT>,
     shared: Arc<Shared>,
     pool: Option<ThreadPool>,
-    handle: Option<JoinHandle<ThreadPool>>,
+    coord: Arc<(Mutex<CoordState>, Condvar)>,
+    coord_thread: Option<JoinHandle<()>>,
     pos: Position,
     keys: Vec<u64>,
     threads: usize,
@@ -82,12 +108,93 @@ impl Engine {
         let tt = Arc::new(TT::new(16));
         let shared = Arc::new(Shared::new());
         let pos = Position::startpos();
+        let coord = Arc::new((Mutex::new(CoordState { cmd: None, result: None, busy: false }), Condvar::new()));
+        let coord_bg = coord.clone();
+        let coord_thread = std::thread::Builder::new()
+            .stack_size(SEARCH_STACK)
+            .spawn(move || loop {
+                let cmd = {
+                    let (lock, cv) = &*coord_bg;
+                    let mut guard = lock.lock().unwrap();
+                    while guard.cmd.is_none() {
+                        guard = cv.wait(guard).unwrap();
+                    }
+                    guard.cmd.take().unwrap()
+                };
+                match cmd {
+                    CoordCmd::Quit => break,
+                    CoordCmd::Run(task) => {
+                        let SearchTask {
+                            mut pool,
+                            pos,
+                            keys,
+                            limits,
+                            multipv,
+                            overhead,
+                            tb_cfg,
+                            show_wdl,
+                            silent,
+                            shared,
+                            root_tb,
+                        } = *task;
+                        let hold = limits.infinite;
+                        if let Some(r) = root_tb {
+                            let outcome = tb::outcome(r.wdl, &tb_cfg);
+                            let score = match outcome {
+                                1 => search::TB_CP - r.dtz as i32,
+                                -1 => -search::TB_CP + r.dtz as i32,
+                                _ => 0,
+                            };
+                            let wdl_str = if show_wdl {
+                                match outcome {
+                                    1 => " wdl 1000 0 0",
+                                    -1 => " wdl 0 0 1000",
+                                    _ => " wdl 0 1000 0",
+                                }
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "info depth 1 seldepth 1 multipv 1 score cp {score}{wdl_str} nodes 0 nps 0 tbhits 1 time 0 pv {}",
+                                r.mv.to_uci()
+                            );
+                            while (shared.pondering.0.load(Relaxed) || hold) && !shared.stop.0.load(Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            println!("bestmove {}", r.mv.to_uci());
+                        } else {
+                            let (best, ponder, _) =
+                                pool.run(&pos, &keys, &limits, multipv, overhead, tb_cfg, silent, show_wdl, &shared);
+                            if !silent {
+                                if best.is_none() {
+                                    println!(
+                                        "info depth 0 score {}",
+                                        if pool.main.in_check_root() { "mate 0" } else { "cp 0" }
+                                    );
+                                    println!("bestmove 0000");
+                                } else if ponder.is_none() {
+                                    println!("bestmove {}", best.to_uci());
+                                } else {
+                                    println!("bestmove {} ponder {}", best.to_uci(), ponder.to_uci());
+                                }
+                            }
+                        }
+                        let (lock, cv) = &*coord_bg;
+                        let mut guard = lock.lock().unwrap();
+                        guard.result = Some(pool);
+                        guard.busy = false;
+                        cv.notify_all();
+                    }
+                }
+            })
+            .expect("failed to spawn search coordinator thread");
         let mut e = Engine {
             net,
             tt,
             shared,
             pool: None,
-            handle: None,
+            coord,
+            coord_thread: Some(coord_thread),
             keys: vec![pos.key],
             pos,
             threads: 1,
@@ -122,8 +229,13 @@ impl Engine {
 
     /// Block until a running search has finished and handed its state back.
     fn wait(&mut self) {
-        if let Some(h) = self.handle.take() {
-            self.pool = Some(h.join().expect("search thread panicked"));
+        let (lock, cv) = &*self.coord;
+        let mut guard = lock.lock().unwrap();
+        while guard.busy {
+            guard = cv.wait(guard).unwrap();
+        }
+        if let Some(pool) = guard.result.take() {
+            self.pool = Some(pool);
         }
     }
 
@@ -287,60 +399,24 @@ impl Engine {
         }
         self.shared.stop.0.store(false, Relaxed);
         self.shared.pondering.0.store(limits.ponder, Relaxed);
-        let mut pool = self.pool.take().unwrap();
-        let pos = self.pos;
-        let keys = self.keys.clone();
-        let multipv = self.multipv;
-        let overhead = self.overhead;
-        let shared = self.shared.clone();
-        let tb_cfg = self.tb;
-        let show_wdl = self.show_wdl;
-        let hold = limits.infinite;
-        let handle = std::thread::Builder::new()
-            .stack_size(SEARCH_STACK)
-            .spawn(move || {
-                if let Some(r) = root_tb {
-                    let outcome = tb::outcome(r.wdl, &tb_cfg);
-                    let score = match outcome {
-                        1 => search::TB_CP - r.dtz as i32,
-                        -1 => -search::TB_CP + r.dtz as i32,
-                        _ => 0,
-                    };
-                    let wdl_str = if show_wdl {
-                        match outcome {
-                            1 => " wdl 1000 0 0",
-                            -1 => " wdl 0 0 1000",
-                            _ => " wdl 0 1000 0",
-                        }
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "info depth 1 seldepth 1 multipv 1 score cp {score}{wdl_str} nodes 0 nps 0 tbhits 1 time 0 pv {}",
-                        r.mv.to_uci()
-                    );
-                    while (shared.pondering.0.load(Relaxed) || hold) && !shared.stop.0.load(Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    println!("bestmove {}", r.mv.to_uci());
-                    return pool;
-                }
-                let (best, ponder, _) =
-                    pool.run(&pos, &keys, &limits, multipv, overhead, tb_cfg, silent, show_wdl, &shared);
-                if !silent {
-                    if best.is_none() {
-                        println!("info depth 0 score {}", if pool.main.in_check_root() { "mate 0" } else { "cp 0" });
-                        println!("bestmove 0000");
-                    } else if ponder.is_none() {
-                        println!("bestmove {}", best.to_uci());
-                    } else {
-                        println!("bestmove {} ponder {}", best.to_uci(), ponder.to_uci());
-                    }
-                }
-                pool
-            })
-            .expect("failed to spawn search thread");
-        self.handle = Some(handle);
+        let task = Box::new(SearchTask {
+            pool: self.pool.take().unwrap(),
+            pos: self.pos,
+            keys: self.keys.clone(),
+            limits,
+            multipv: self.multipv,
+            overhead: self.overhead,
+            tb_cfg: self.tb,
+            show_wdl: self.show_wdl,
+            silent,
+            shared: self.shared.clone(),
+            root_tb,
+        });
+        let (lock, cv) = &*self.coord;
+        let mut guard = lock.lock().unwrap();
+        guard.busy = true;
+        guard.cmd = Some(CoordCmd::Run(task));
+        cv.notify_all();
     }
 
     fn perft(&mut self, depth: u32) {
@@ -846,5 +922,20 @@ impl Engine {
         }
         // stdin closed: let a running search finish, then exit.
         self.wait();
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.stop();
+        {
+            let (lock, cv) = &*self.coord;
+            let mut guard = lock.lock().unwrap();
+            guard.cmd = Some(CoordCmd::Quit);
+            cv.notify_all();
+        }
+        if let Some(h) = self.coord_thread.take() {
+            let _ = h.join();
+        }
     }
 }

@@ -1,4 +1,8 @@
-# Esper
+<p align="center">
+  <img src="esper.svg" alt="Esper logo" width="200" />
+</p>
+
+<h1 align="center">Esper</h1>
 
 Esper is a UCI chess engine written in Rust. It evaluates positions with
 Stockfish's `nn-bddd9d57eb87.nnue` network and has a Stockfish-style search with
@@ -15,7 +19,7 @@ cargo build --release
 ```
 
 The binary is `target/release/esper`. The network is embedded in it, so that one
-file is all a GUI (Cute Chess, Arena, Banksia, En Croissant…) needs. Add it as a
+file is all a GUI (Ponder) needs. Add it as a
 UCI engine; standard chess only, Chess960 is not supported.
 
 ## Building
@@ -153,22 +157,27 @@ following Stockfish closely:
   verification, ProbCut and its hash-entry variant, futility, history and SEE
   pruning of quiet moves and captures, late move pruning, and quiescence search
   with futility and SEE pruning.
-- **Reductions and extensions**: late move reductions (with re-search extension),
-  internal iterative reductions, and singular extensions of up to three plies with
-  negative extensions.
+- **Reductions and extensions**: Stockfish's late move reduction formula (history,
+  PV, cut-node and correction terms, extending by up to two plies near the root),
+  hindsight depth adjustment from the parent's reduction and the change in
+  evaluation, internal iterative reductions, and singular extensions of up to
+  three plies with negative extensions.
+- **Repetitions**: cuckoo tables detect when the side to move can repeat a position
+  with its next move, so a draw is known to be available before it is played.
 - **Correction histories** keyed by pawns, non-pawns, minor pieces and the
   continuation, which adjust the static evaluation from search results.
 - **Transposition table**: lock-free, four entries per 64-byte bucket, shared by
   all threads.
 
 `src/search.rs` begins with a block of constants that switch individual features
-on or off (for example `MULTI_CUT`, `SF_NMP`, `SF_SEEK_MATE`), so each one can be
+on or off (for example `MULTI_CUT`, `SF_NMP`, `SF_LMR2`, `SHARED_HISTORY`), so each one can be
 measured by playing a build with it against a build without.
 
 ### Lazy SMP
 
-Helper threads search the same tree from a persistent thread pool, sharing only
-the transposition table. When the search ends, the reported move comes from a
+Helper threads search the same tree from a persistent thread pool, sharing the
+transposition table and, as Stockfish does, the continuation, pawn and correction
+histories. When the search ends, the reported move comes from a
 vote among the threads, weighted by depth and score.
 
 ### Time management
@@ -230,6 +239,7 @@ distance. `info` lines include `tbhits`.
 | `src/uci.rs` | UCI front end and the extra commands |
 | `suites/wac.epd` | Win at Chess test suite |
 | `tools/` | SPRT and SPSA scripts |
+| `esper.svg`, `esper.ico`, `esper.rc` | Logo, and the Windows icon made from it (built into `esper.exe` by `build.rs`) |
 | `third_party/fathom/` | Vendored Fathom tablebase prober (C, MIT) |
 
 ## Testing and tuning

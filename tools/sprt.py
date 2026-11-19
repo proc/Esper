@@ -52,6 +52,24 @@ BASE_OPTIONS = {"Threads": 1, "Hash": 16}
 
 # ---------------------------------------------------------------- statistics
 
+
+
+def end_reason(board):
+    """Why the game is over (Board.outcome() needs python-chess 1.0+)."""
+    if board.is_checkmate():
+        return "checkmate"
+    if board.is_stalemate():
+        return "stalemate"
+    if board.is_insufficient_material():
+        return "insufficient_material"
+    if board.can_claim_fifty_moves() or board.is_seventyfive_moves():
+        return "fifty_moves"
+    return "threefold_repetition"
+
+def ply_of(board):
+    """Half-moves since the start of the game (Board.ply() needs python-chess 1.0+)."""
+    return 2 * (board.fullmove_number - 1) + (board.turn == chess.BLACK)
+
 def expected_score(elo):
     return 1.0 / (1.0 + 10.0 ** (-elo / 400.0))
 
@@ -153,8 +171,8 @@ def play_game(fen, white, black, base_s, inc_s, max_plies=400):
     while True:
         if board.is_game_over(claim_draw=True):
             r = board.result(claim_draw=True)
-            return {"1-0": 1.0, "0-1": 0.0}.get(r, 0.5), board.outcome(claim_draw=True).termination.name.lower()
-        if board.ply() >= max_plies:
+            return {"1-0": 1.0, "0-1": 0.0}.get(r, 0.5), end_reason(board)
+        if ply_of(board) >= max_plies:
             return 0.5, "max plies"
         side = board.turn
         limit = chess.engine.Limit(white_clock=clocks[chess.WHITE], black_clock=clocks[chess.BLACK],
@@ -181,7 +199,7 @@ def play_game(fen, white, black, base_s, inc_s, max_plies=400):
             if big[chess.WHITE] >= 4 and big[chess.BLACK] >= 4:
                 white_cp = score.white().score(mate_score=100000)
                 return (1.0 if white_cp > 0 else 0.0), "adjudicated win"
-            level = level + 1 if abs(cp) <= 10 and board.ply() >= 80 else 0
+            level = level + 1 if abs(cp) <= 10 and ply_of(board) >= 80 else 0
             if level >= 10:
                 return 0.5, "adjudicated draw"
         board.push(res.move)
@@ -344,9 +362,14 @@ def main():
     if args.report > 0:
         threading.Thread(target=reporter, daemon=True).start()
     with ThreadPoolExecutor(args.concurrency) as ex:
-        for _ in range(args.concurrency):
-            ex.submit(worker)
+        futures = [ex.submit(worker) for _ in range(args.concurrency)]
     finished.set()
+    # A worker that died (engine failed to start, crashed...) must not pass silently.
+    errors = [f.exception() for f in futures if f.exception()]
+    if errors and not sum(wdl):
+        sys.exit(f"match failed: {errors[0]!r}")
+    for e in errors:
+        print(f"WARNING: a worker stopped: {e!r}", file=sys.stderr)
 
     elo, err = elo_estimate(penta)
     games = sum(wdl)

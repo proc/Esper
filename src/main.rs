@@ -2,6 +2,7 @@
 
 mod bitboard;
 mod book;
+mod cuckoo;
 mod movegen;
 mod nnue;
 mod polyglot_keys;
@@ -14,6 +15,7 @@ mod uci;
 
 fn main() {
     bitboard::init();
+    cuckoo::init();
     let net = match uci::load_default_network() {
         Ok(n) => n,
         Err(e) => {
