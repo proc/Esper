@@ -3,13 +3,16 @@
 fn main() {
     println!("cargo:rerun-if-changed=third_party/fathom");
     println!("cargo:rerun-if-changed=build.rs");
-    cc::Build::new()
-        .file("third_party/fathom/tbprobe.c")
-        .include("third_party/fathom")
-        .opt_level(3)
-        .flag_if_supported("-std=gnu11")
-        .warnings(false)
-        .compile("fathom");
+    let mut fathom = cc::Build::new();
+    fathom.file("third_party/fathom/tbprobe.c").include("third_party/fathom").opt_level(3).warnings(false);
+    if fathom.get_compiler().is_like_msvc() {
+        // Fathom uses <stdatomic.h>, which MSVC only provides in C11 mode with
+        // its (still "experimental") C11 atomics enabled.
+        fathom.flag("/std:c11").flag("/experimental:c11atomics");
+    } else {
+        fathom.flag_if_supported("-std=gnu11");
+    }
+    fathom.compile("fathom");
 
     // Give esper.exe the Esper logo (esper.ico, rendered from esper.svg) as its icon.
     println!("cargo:rerun-if-changed=esper.rc");
