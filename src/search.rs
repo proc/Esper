@@ -120,6 +120,8 @@ pub struct Limits {
     pub infinite: bool,
     pub ponder: bool,
     pub searchmoves: Vec<Move>,
+    /// When the `go` command arrived; the clock runs from here.
+    pub received: Option<Instant>,
 }
 
 #[repr(align(128))]
@@ -997,7 +999,7 @@ impl Searcher {
             s.tt_hit = false;
             s.cutoff_cnt = 0;
         }
-        self.start = Instant::now();
+        self.start = limits.received.unwrap_or_else(Instant::now);
         self.soft_ms = u64::MAX;
         self.hard_ms = u64::MAX;
         let us = root.stm;
@@ -1024,7 +1026,13 @@ impl Searcher {
                 ),
             };
             let soft = opt_scale * time_left;
-            let hard = (0.851 * t - move_overhead).min(max_scale * soft);
+            let mut hard = (0.851 * t - move_overhead).min(max_scale * soft);
+            // Short of time, keep a wider reserve: the engine, GUI and OS can all
+            // stall for a few milliseconds, and losing on time costs the game.
+            if t < 1000.0 {
+                hard = hard.min(0.5 * t - move_overhead);
+            }
+            hard = hard.min(t - 2.0 * move_overhead);
             self.hard_ms = (hard.max(1.0)) as u64;
             self.soft_ms = (soft.max(1.0) as u64).min(self.hard_ms);
         }
@@ -1624,6 +1632,9 @@ impl Searcher {
             }
         }
 
+        // Correction value, computed once per node as Stockfish does.
+        let corr_raw = if SF_CORRECTION { self.correction_raw(ply) } else { 0 };
+
         // Static evaluation
         let raw_eval;
         let static_eval;
@@ -1646,7 +1657,8 @@ impl Searcher {
             if SF_EVAL_STORE && tte.is_none() {
                 self.tt.store(pos.key, Move::NONE, NONE, raw_eval, 0, 0, tt_pv);
             }
-            static_eval = (raw_eval + self.correction_at(ply)).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
+            let corr = if SF_CORRECTION { corr_raw / 131072 } else { self.correction(&self.pos[ply]) };
+            static_eval = (raw_eval + corr).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
             eval = static_eval;
             if tte.is_some()
                 && tt_score.abs() < MATE_BOUND
@@ -1786,7 +1798,7 @@ impl Searcher {
                     let margin = if SF_SMALL2 {
                         mult * depth
                             - (tune::T_RfpImproving.get() * improving as i32 + 335 * opponent_worsening as i32) * mult / 1024
-                            + self.correction_raw(ply).abs() / 198435
+                            + corr_raw.abs() / 198435
                     } else {
                         mult * depth - tune::T_RfpImproving.get() * improving as i32 * mult / 1024
                     };
@@ -2150,7 +2162,7 @@ impl Searcher {
                     }
                     let tt_capture = tt_move.is_noisy();
                     if v < s_beta {
-                        let corr_adj = if SF_CORRECTION { self.correction_raw(ply).abs() / 198368 } else { 0 };
+                        let corr_adj = corr_raw.abs() / 198368;
                         let deep = (ply as i32 > self.root_depth) as i32;
                         let double = tune::T_DoubleExtMargin.get() + 204 * pv_node as i32
                             - 152 * !tt_capture as i32
@@ -2243,7 +2255,7 @@ impl Searcher {
                 }
                 r += 697;
                 r -= move_count * 65;
-                r -= self.correction_raw(ply).abs() / 26310;
+                r -= corr_raw.abs() / 26310;
                 if cut_node {
                     r += 4026 + 933 * tt_move.is_none() as i32;
                 }

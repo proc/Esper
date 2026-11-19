@@ -159,7 +159,7 @@ class Player:
             pass
 
 
-def play_game(fen, white, black, base_s, inc_s, max_plies=400):
+def play_game(fen, white, black, base_s, inc_s, max_plies=400, nodes=None):
     """Returns (result for white: 1, 0.5 or 0; reason)."""
     board = chess.Board(fen)
     clocks = {chess.WHITE: base_s, chess.BLACK: base_s}
@@ -175,8 +175,11 @@ def play_game(fen, white, black, base_s, inc_s, max_plies=400):
         if ply_of(board) >= max_plies:
             return 0.5, "max plies"
         side = board.turn
-        limit = chess.engine.Limit(white_clock=clocks[chess.WHITE], black_clock=clocks[chess.BLACK],
-                                   white_inc=inc_s, black_inc=inc_s)
+        if nodes:
+            limit = chess.engine.Limit(nodes=nodes)
+        else:
+            limit = chess.engine.Limit(white_clock=clocks[chess.WHITE], black_clock=clocks[chess.BLACK],
+                                       white_inc=inc_s, black_inc=inc_s)
         t0 = time.monotonic()
         try:
             res = players[side].engine.play(board, limit, info=chess.engine.INFO_SCORE)
@@ -185,7 +188,7 @@ def play_game(fen, white, black, base_s, inc_s, max_plies=400):
             return (0.0 if side == chess.WHITE else 1.0), f"engine error: {e}"
         used = time.monotonic() - t0
         clocks[side] -= used
-        if clocks[side] < 0:
+        if clocks[side] < 0 and not nodes:
             return (0.0 if side == chess.WHITE else 1.0), "time forfeit"
         clocks[side] += inc_s
         if res.move is None or res.move not in board.legal_moves:
@@ -212,6 +215,7 @@ def main():
     ap.add_argument("--new", required=True, help="engine under test")
     ap.add_argument("--base", required=True, help="reference engine")
     ap.add_argument("--tc", default="8+0.08", help="base+increment in seconds (default 8+0.08)")
+    ap.add_argument("--nodes", type=int, help="search this many nodes per move instead of using a clock")
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--elo0", type=float, default=0.0)
     ap.add_argument("--elo1", type=float, default=5.0)
@@ -260,7 +264,7 @@ def main():
     stop = threading.Event()
     next_pair = [0]
     done = set()          # pair indices already played (pairs finish out of order)
-    signature = {"new": os.path.abspath(args.new), "base": os.path.abspath(args.base), "tc": args.tc,
+    signature = {"new": os.path.abspath(args.new), "base": os.path.abspath(args.base), "tc": args.tc, "nodes": args.nodes,
                  "elo0": args.elo0, "elo1": args.elo1, "new_opts": new_opts, "base_opts": base_opts,
                  "openings": len(openings), "seed": args.seed}
     if args.state and os.path.exists(args.state):
@@ -314,7 +318,7 @@ def main():
             with lock:
                 print(status(), flush=True)
 
-    print(f"new {args.new}\nbase {args.base}\ntc {args.tc}, {len(openings)} openings, "
+    print(f"new {args.new}\nbase {args.base}\n{f"nodes {args.nodes}" if args.nodes else f"tc {args.tc}"}, {len(openings)} openings, "
           f"SPRT elo0={args.elo0} elo1={args.elo1} alpha={args.alpha} beta={args.beta} "
           f"bounds [{lower:.2f}, {upper:.2f}]", flush=True)
 
@@ -332,8 +336,13 @@ def main():
                     if sum(wdl) >= args.max_games or 2 * i >= 2 * len(openings) * 50:
                         return
                 fen = openings[i % len(openings)]
-                r1, why1 = play_game(fen, new, base, base_s, inc_s)          # new as white
-                r2, why2 = play_game(fen, base, new, base_s, inc_s)          # new as black
+                r1, why1 = play_game(fen, new, base, base_s, inc_s, nodes=args.nodes)          # new as white
+                r2, why2 = play_game(fen, base, new, base_s, inc_s, nodes=args.nodes)          # new as black
+                # Say which engine lost on time or broke down.
+                if why1.startswith(("time forfeit", "engine error", "illegal")):
+                    why1 += " (new)" if r1 == 0.0 else " (base)"
+                if why2.startswith(("time forfeit", "engine error", "illegal")):
+                    why2 += " (new)" if r2 == 1.0 else " (base)"
                 s1, s2 = r1, 1.0 - r2
                 with lock:
                     if stop.is_set():
@@ -377,7 +386,7 @@ def main():
           f"elo {elo:+.1f} +/- {err:.1f}  LLR {llr(penta, args.elo0, args.elo1):+.2f}")
     print("result: " + (verdict[0] or "inconclusive (game limit reached)"))
     print("terminations: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
-    forfeits = reasons.get("time forfeit", 0)
+    forfeits = sum(v for k, v in reasons.items() if k.startswith("time forfeit"))
     if forfeits:
         print(f"WARNING: {forfeits} games lost on time", file=sys.stderr)
 

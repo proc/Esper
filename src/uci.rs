@@ -293,7 +293,7 @@ impl Engine {
             let depth = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
             return self.perft(depth);
         }
-        let mut limits = Limits::default();
+        let mut limits = Limits { received: Some(Instant::now()), ..Limits::default() };
         let mut i = 0;
         let num = |i: usize| args.get(i + 1).and_then(|s| s.parse::<i64>().ok()).map(|v| v.max(0) as u64);
         while i < args.len() {

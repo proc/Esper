@@ -429,6 +429,13 @@ impl<const N: usize> IdxList<N> {
         self.n += cond as usize;
     }
     #[inline(always)]
+    fn swap_remove(&mut self, i: usize) {
+        debug_assert!(i < self.n);
+        let last = self.as_slice()[self.n - 1];
+        self.n -= 1;
+        self.v[i].write(last);
+    }
+    #[inline(always)]
     fn as_slice(&self) -> &[u32] {
         // SAFETY: the first `n` elements have been written.
         unsafe { std::slice::from_raw_parts(self.v.as_ptr() as *const u32, self.n) }
@@ -525,6 +532,150 @@ fn gen_threats_masked(pos: &Position, mask: u64, out: &mut [u32; MAX_THREATS]) -
 
 fn gen_threats(pos: &Position, out: &mut [u32; MAX_THREATS]) -> usize {
     gen_threats_masked(pos, !0u64, out)
+}
+
+/// The board as seen by the threat features: what stands where.
+#[derive(Clone, Copy)]
+struct ThreatBoard {
+    board: [u8; 64],
+    by_type: [u64; 7],
+    by_color: [u64; 2],
+    occ: u64,
+}
+
+impl ThreatBoard {
+    #[inline(always)]
+    fn new(pos: &Position) -> ThreatBoard {
+        ThreatBoard { board: pos.board, by_type: pos.by_type, by_color: pos.by_color, occ: pos.occ() }
+    }
+
+    #[inline(always)]
+    fn toggle(&mut self, sq: usize, pc: u8) {
+        let b = bit(sq);
+        self.by_type[piece_type(pc)] ^= b;
+        self.by_color[piece_color(pc)] ^= b;
+        self.occ ^= b;
+        self.board[sq] = if self.board[sq] == 0 { pc } else { 0 };
+    }
+
+    /// Piece types a piece of type `pt` can threaten (kings are never involved).
+    #[inline(always)]
+    fn targets(&self, pt: usize) -> u64 {
+        let t = &self.by_type;
+        match pt {
+            PAWN => t[KNIGHT] | t[ROOK],
+            BISHOP | ROOK => t[PAWN] | t[KNIGHT] | t[BISHOP] | t[ROOK],
+            KNIGHT | QUEEN => t[PAWN] | t[KNIGHT] | t[BISHOP] | t[ROOK] | t[QUEEN],
+            _ => 0,
+        }
+    }
+}
+
+#[inline(always)]
+fn piece_attacks(pc: u8, sq: usize, occ: u64) -> u64 {
+    match piece_type(pc) {
+        PAWN => pawn_attacks(piece_color(pc), sq),
+        KNIGHT => knight_attacks(sq),
+        BISHOP => bishop_attacks(sq, occ),
+        ROOK => rook_attacks(sq, occ),
+        QUEEN => bishop_attacks(sq, occ) | rook_attacks(sq, occ),
+        _ => 0,
+    }
+}
+
+#[inline(always)]
+fn threat_code(from: usize, to: usize, attacker: u8, attacked: u8) -> u32 {
+    ((from as u32) << 14) | ((to as u32) << 8) | ((attacker as u32) << 4) | attacked as u32
+}
+
+/// Threats that involve the piece `pc` standing on `sq` in `tb` (as attacker or
+/// target) go to `with`; threats that exist only while `sq` is empty (sliders
+/// seeing past it) go to `without`.
+#[inline]
+fn piece_threats(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<MAX_THREATS>, without: &mut IdxList<MAX_THREATS>) {
+    let pt = piece_type(pc);
+    let occ = tb.occ;
+    let t = &tb.by_type;
+    // What the piece attacks.
+    let mut att = piece_attacks(pc, sq, occ) & tb.targets(pt);
+    while att != 0 {
+        let to = pop_lsb(&mut att);
+        with.push(threat_code(sq, to, pc, tb.board[to]));
+    }
+    if pt == KING {
+        // Kings neither attack nor get attacked, but they do block lines.
+    } else {
+        // What attacks the piece.
+        let diag = bishop_attacks(sq, occ);
+        let ortho = rook_attacks(sq, occ);
+        let mut attackers = (knight_attacks(sq) & t[KNIGHT]) | ((diag | ortho) & t[QUEEN]);
+        if pt != QUEEN {
+            attackers |= (diag & t[BISHOP]) | (ortho & t[ROOK]);
+        }
+        if pt == KNIGHT || pt == ROOK {
+            let white = tb.by_type[PAWN] & tb.by_color[WHITE];
+            let black = tb.by_type[PAWN] & tb.by_color[BLACK];
+            attackers |= (pawn_attacks(BLACK, sq) & white) | (pawn_attacks(WHITE, sq) & black);
+        }
+        while attackers != 0 {
+            let from = pop_lsb(&mut attackers);
+            with.push(threat_code(from, sq, tb.board[from], pc));
+        }
+    }
+    // Sliders whose line runs through `sq` see one piece further when it is empty.
+    let mut sliders = (bishop_attacks(sq, occ) & (t[BISHOP] | t[QUEEN])) | (rook_attacks(sq, occ) & (t[ROOK] | t[QUEEN]));
+    let open = occ ^ bit(sq);
+    while sliders != 0 {
+        let from = pop_lsb(&mut sliders);
+        let spc = tb.board[from];
+        let mut beyond = piece_attacks(spc, from, open) & !piece_attacks(spc, from, occ) & open & tb.targets(piece_type(spc));
+        while beyond != 0 {
+            let to = pop_lsb(&mut beyond);
+            without.push(threat_code(from, to, spc, tb.board[to]));
+        }
+    }
+}
+
+/// Threat changes from `p0` to `p1`, worked out from the pieces that left and
+/// arrived rather than by rescanning both boards. A threat can appear in both
+/// lists; the accumulator arithmetic is linear, so that is harmless.
+fn threat_changes_inc(p0: &Position, p1: &Position, added: &mut IdxList<MAX_THREATS>, removed: &mut IdxList<MAX_THREATS>) {
+    let mut tb = ThreatBoard::new(p0);
+    let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
+    for pt in PAWN..=KING {
+        changed |= p0.by_type[pt] ^ p1.by_type[pt];
+    }
+    // Lift the pieces that leave or are replaced...
+    let mut c = changed;
+    while c != 0 {
+        let sq = pop_lsb(&mut c);
+        let pc = tb.board[sq];
+        if pc != 0 {
+            piece_threats(&tb, pc, sq, removed, added);
+            tb.toggle(sq, pc);
+        }
+    }
+    // ...then set down the arrivals.
+    let mut c = changed;
+    while c != 0 {
+        let sq = pop_lsb(&mut c);
+        let pc = p1.board[sq];
+        if pc != 0 {
+            tb.toggle(sq, pc);
+            piece_threats(&tb, pc, sq, added, removed);
+        }
+    }
+    // Drop threats that were both lost and regained: each costs two row updates.
+    let mut i = 0;
+    while i < added.n {
+        let x = added.as_slice()[i];
+        if let Some(j) = removed.as_slice().iter().position(|&r| r == x) {
+            removed.swap_remove(j);
+            added.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 impl ThreatLuts {
@@ -755,6 +906,99 @@ pub struct NnueState {
     entries: Vec<Entry>,
     /// Piece-square accumulator cache, indexed `[perspective][block][king square]`.
     cache: Vec<CacheEntry>,
+    /// Threat accumulator cache, indexed `[perspective][king on files e-h]`: the
+    /// last threat accumulator built for that orientation and its position.
+    tp_cache: Vec<Option<(Acc, Position)>>,
+}
+
+/// Above this many changed squares a threat refresh starts from scratch rather
+/// than from the cached position.
+const TP_CACHE_MAX_CHANGED: u32 = 12;
+
+/// Threats present in `p1` but not `p0` (`added`) and the reverse (`removed`).
+/// Only threats touching squares whose contents changed, or attacking through them,
+/// can differ, so both positions are scanned on those squares alone.
+fn threat_changes(p0: &Position, p1: &Position, added: &mut IdxList<MAX_THREATS>, removed: &mut IdxList<MAX_THREATS>) {
+    let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
+    for pt in PAWN..=KING {
+        changed |= p0.by_type[pt] ^ p1.by_type[pt];
+    }
+    if changed != 0 {
+        let occ0 = p0.occ();
+        let occ1 = p1.occ();
+        let wp = p0.pieces(WHITE, PAWN) | p1.pieces(WHITE, PAWN);
+        let bp = p0.pieces(BLACK, PAWN) | p1.pieces(BLACK, PAWN);
+        let kn = p0.by_type[KNIGHT] | p1.by_type[KNIGHT];
+        let diag0 = p0.by_type[BISHOP] | p0.by_type[QUEEN];
+        let diag1 = p1.by_type[BISHOP] | p1.by_type[QUEEN];
+        let ortho0 = p0.by_type[ROOK] | p0.by_type[QUEEN];
+        let ortho1 = p1.by_type[ROOK] | p1.by_type[QUEEN];
+        let mut affected = changed;
+        let mut c = changed;
+        while c != 0 {
+            let sq = pop_lsb(&mut c);
+            affected |= (pawn_attacks(BLACK, sq) & wp)
+                | (pawn_attacks(WHITE, sq) & bp)
+                | (knight_attacks(sq) & kn)
+                | (bishop_attacks(sq, occ0) & diag0)
+                | (bishop_attacks(sq, occ1) & diag1)
+                | (rook_attacks(sq, occ0) & ortho0)
+                | (rook_attacks(sq, occ1) & ortho1);
+        }
+        let mut old_t = [0u32; MAX_THREATS];
+        let mut new_t = [0u32; MAX_THREATS];
+        let n_old = gen_threats_masked(p0, affected, &mut old_t);
+        let n_new = gen_threats_masked(p1, affected, &mut new_t);
+        let (a, b) = (&old_t[..n_old], &new_t[..n_new]);
+        let (mut i, mut m) = (0, 0);
+        while i < a.len() && m < b.len() {
+            let (x, y) = (a[i], b[m]);
+            if x == y {
+                i += 1;
+                m += 1;
+            } else if x < y {
+                removed.push(x);
+                i += 1;
+            } else {
+                added.push(y);
+                m += 1;
+            }
+        }
+        for &x in &a[i..] {
+            removed.push(x);
+        }
+        for &y in &b[m..] {
+            added.push(y);
+        }
+    }
+}
+
+/// Feature rows to add and subtract for perspective `p` (oriented by `orient`),
+/// given the threat changes and the pawns before and after.
+#[allow(clippy::too_many_arguments)]
+fn tp_rows(
+    net: &Network,
+    p: usize,
+    orient: usize,
+    added: &IdxList<MAX_THREATS>,
+    removed: &IdxList<MAX_THREATS>,
+    (w0, b0): (u64, u64),
+    (w1, b1): (u64, u64),
+    adds: &mut IdxList<TP_LIST>,
+    subs: &mut IdxList<TP_LIST>,
+) {
+    for &t in added.as_slice() {
+        let idx = net.luts.threat_index(t, p, orient);
+        adds.push_if(idx, (idx as usize) < THREAT_DIMS);
+    }
+    for &t in removed.as_slice() {
+        let idx = net.luts.threat_index(t, p, orient);
+        subs.push_if(idx, (idx as usize) < THREAT_DIMS);
+    }
+    if w0 != w1 || b0 != b1 {
+        net.luts.pair_indices(p, orient, (w1 & !w0) | (b1 & !b0), w1, b1, adds);
+        net.luts.pair_indices(p, orient, (w0 & !w1) | (b0 & !b1), w0, b0, subs);
+    }
 }
 
 impl NnueState {
@@ -783,7 +1027,7 @@ impl NnueState {
         for _ in 0..2 * 3 * 64 {
             cache.push(CacheEntry { acc: net.biases, by_color: [0; 2], by_type: [0; 7] });
         }
-        NnueState { net, entries, cache }
+        NnueState { net, entries, cache, tp_cache: vec![None; 4] }
     }
 
     /// Start a new stack: the position at ply 0 is unrelated to anything before.
@@ -877,7 +1121,36 @@ impl NnueState {
     #[inline(never)]
     fn refresh_tp(&mut self, pos: &Position, ply: usize, persp: usize) {
         let net = &*self.net;
-        let orient = orientation(persp, pos.king_sq(persp));
+        let ksq = pos.king_sq(persp);
+        let orient = orientation(persp, ksq);
+        let slot = persp * 2 + ((ksq >> 2) & 1);
+        // Start from the cached accumulator of the same orientation when the
+        // boards are close: only the threat changes between them need applying.
+        if let Some((acc, cpos)) = &self.tp_cache[slot] {
+            let mut changed = (cpos.by_color[0] ^ pos.by_color[0]) | (cpos.by_color[1] ^ pos.by_color[1]);
+            for pt in PAWN..=KING {
+                changed |= cpos.by_type[pt] ^ pos.by_type[pt];
+            }
+            if popcount(changed) <= TP_CACHE_MAX_CHANGED {
+                let mut added = IdxList::<MAX_THREATS>::new();
+                let mut removed = IdxList::<MAX_THREATS>::new();
+                threat_changes(cpos, pos, &mut added, &mut removed);
+                let mut adds = IdxList::<TP_LIST>::new();
+                let mut subs = IdxList::<TP_LIST>::new();
+                let before = (cpos.pieces(WHITE, PAWN), cpos.pieces(BLACK, PAWN));
+                let after = (pos.pieces(WHITE, PAWN), pos.pieces(BLACK, PAWN));
+                tp_rows(net, persp, orient, &added, &removed, before, after, &mut adds, &mut subs);
+                for &i in adds.as_slice().iter().chain(subs.as_slice()) {
+                    prefetch_row(net.tp_row(i));
+                }
+                let src = *acc;
+                let e = &mut self.entries[ply];
+                apply_rows(&mut e.tp[persp], &src, |i| net.tp_row(i), adds.as_slice(), subs.as_slice());
+                e.tp_ok[persp] = true;
+                self.tp_cache[slot] = Some((e.tp[persp], *pos));
+                return;
+            }
+        }
         let e = &mut self.entries[ply];
         if !e.threats_ok {
             e.n_threats = gen_threats(pos, &mut e.threats);
@@ -896,6 +1169,7 @@ impl NnueState {
         let zero = Acc([0; L1]);
         apply_rows(&mut e.tp[persp], &zero, |i| net.tp_row(i), adds.as_slice(), &[]);
         e.tp_ok[persp] = true;
+        self.tp_cache[slot] = Some((e.tp[persp], *pos));
     }
 
     #[inline(never)]
@@ -913,60 +1187,9 @@ impl NnueState {
             let (prev, cur) = (&mut lo[j - 1], &mut hi[0]);
             if !cur.tp_diff_ok {
                 let (p0, p1) = (&stack[j - 1], &stack[j]);
-                let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
-                for pt in PAWN..=KING {
-                    changed |= p0.by_type[pt] ^ p1.by_type[pt];
-                }
                 let mut added = IdxList::<MAX_THREATS>::new();
                 let mut removed = IdxList::<MAX_THREATS>::new();
-                if changed != 0 {
-                    let occ0 = p0.occ();
-                    let occ1 = p1.occ();
-                    let wp = p0.pieces(WHITE, PAWN) | p1.pieces(WHITE, PAWN);
-                    let bp = p0.pieces(BLACK, PAWN) | p1.pieces(BLACK, PAWN);
-                    let kn = p0.by_type[KNIGHT] | p1.by_type[KNIGHT];
-                    let diag0 = p0.by_type[BISHOP] | p0.by_type[QUEEN];
-                    let diag1 = p1.by_type[BISHOP] | p1.by_type[QUEEN];
-                    let ortho0 = p0.by_type[ROOK] | p0.by_type[QUEEN];
-                    let ortho1 = p1.by_type[ROOK] | p1.by_type[QUEEN];
-                    let mut affected = changed;
-                    let mut c = changed;
-                    while c != 0 {
-                        let sq = pop_lsb(&mut c);
-                        affected |= (pawn_attacks(BLACK, sq) & wp)
-                            | (pawn_attacks(WHITE, sq) & bp)
-                            | (knight_attacks(sq) & kn)
-                            | (bishop_attacks(sq, occ0) & diag0)
-                            | (bishop_attacks(sq, occ1) & diag1)
-                            | (rook_attacks(sq, occ0) & ortho0)
-                            | (rook_attacks(sq, occ1) & ortho1);
-                    }
-                    let mut old_t = [0u32; MAX_THREATS];
-                    let mut new_t = [0u32; MAX_THREATS];
-                    let n_old = gen_threats_masked(p0, affected, &mut old_t);
-                    let n_new = gen_threats_masked(p1, affected, &mut new_t);
-                    let (a, b) = (&old_t[..n_old], &new_t[..n_new]);
-                    let (mut i, mut m) = (0, 0);
-                    while i < a.len() && m < b.len() {
-                        let (x, y) = (a[i], b[m]);
-                        if x == y {
-                            i += 1;
-                            m += 1;
-                        } else if x < y {
-                            removed.push(x);
-                            i += 1;
-                        } else {
-                            added.push(y);
-                            m += 1;
-                        }
-                    }
-                    for &x in &a[i..] {
-                        removed.push(x);
-                    }
-                    for &y in &b[m..] {
-                        added.push(y);
-                    }
-                }
+                threat_changes_inc(p0, p1, &mut added, &mut removed);
                 let (w0, b0) = (p0.pieces(WHITE, PAWN), p0.pieces(BLACK, PAWN));
                 let (w1, b1) = (p1.pieces(WHITE, PAWN), p1.pieces(BLACK, PAWN));
                 for p in 0..2 {
@@ -975,18 +1198,7 @@ impl NnueState {
                         let (adds, subs) = (&mut cur.tp_adds[p], &mut cur.tp_subs[p]);
                         adds.clear();
                         subs.clear();
-                        for &t in added.as_slice() {
-                            let idx = net.luts.threat_index(t, p, orient);
-                            adds.push_if(idx, (idx as usize) < THREAT_DIMS);
-                        }
-                        for &t in removed.as_slice() {
-                            let idx = net.luts.threat_index(t, p, orient);
-                            subs.push_if(idx, (idx as usize) < THREAT_DIMS);
-                        }
-                        if w0 != w1 || b0 != b1 {
-                            net.luts.pair_indices(p, orient, (w1 & !w0) | (b1 & !b0), w1, b1, adds);
-                            net.luts.pair_indices(p, orient, (w0 & !w1) | (b0 & !b1), w0, b0, subs);
-                        }
+                        tp_rows(net, p, orient, &added, &removed, (w0, b0), (w1, b1), adds, subs);
                     }
                 }
                 cur.tp_diff_ok = true;
@@ -1342,4 +1554,67 @@ fn layer_stack(pos: &Position) -> usize {
     let officers = |c: usize| popcount(pos.by_color[c] & !(pos.by_type[PAWN] | pos.by_type[KING]));
     let many = (officers(WHITE).max(officers(BLACK)) >= 2) as usize;
     ((band * 4 + queens) * 3 + layout) * 2 + many
+}
+
+#[cfg(test)]
+mod threat_tests {
+    use super::*;
+    use crate::movegen::legal_moves;
+
+    fn cancelled(mut add: Vec<u32>, mut rem: Vec<u32>) -> (Vec<u32>, Vec<u32>) {
+        let mut i = 0;
+        while i < add.len() {
+            if let Some(j) = rem.iter().position(|&r| r == add[i]) {
+                rem.swap_remove(j);
+                add.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        add.sort_unstable();
+        rem.sort_unstable();
+        (add, rem)
+    }
+
+    /// The move-based threat changes must equal the difference of the two boards.
+    #[test]
+    fn incremental_threats_match_rescan() {
+        crate::bitboard::init();
+        let fens = [
+            crate::position::START_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        ];
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut checked = 0;
+        for fen in fens {
+            for _ in 0..40 {
+                let mut pos = Position::from_fen(fen).unwrap();
+                for _ in 0..60 {
+                    let moves = legal_moves(&pos);
+                    if moves.is_empty() {
+                        break;
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    for &m in &moves {
+                        let next = pos.make(m);
+                        let (mut a1, mut r1) = (IdxList::<MAX_THREATS>::new(), IdxList::<MAX_THREATS>::new());
+                        threat_changes(&pos, &next, &mut a1, &mut r1);
+                        let (mut a2, mut r2) = (IdxList::<MAX_THREATS>::new(), IdxList::<MAX_THREATS>::new());
+                        threat_changes_inc(&pos, &next, &mut a2, &mut r2);
+                        let want = cancelled(a1.as_slice().to_vec(), r1.as_slice().to_vec());
+                        let got = cancelled(a2.as_slice().to_vec(), r2.as_slice().to_vec());
+                        assert_eq!(want, got, "{} {}", pos.to_fen(), m.to_uci());
+                        checked += 1;
+                    }
+                    pos = pos.make(moves[(seed % moves.len() as u64) as usize]);
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
 }
