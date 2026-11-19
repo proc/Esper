@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 description = "A UCI chess engine using Stockfish's NNUE network"
 
 [build-dependencies]
-cc = "1"
+cc = "1.2.20"
 embed-resource = "3"
 
 [features]

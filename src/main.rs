@@ -3,6 +3,7 @@
 mod bitboard;
 mod book;
 mod cuckoo;
+mod mem;
 mod movegen;
 mod nnue;
 mod polyglot_keys;

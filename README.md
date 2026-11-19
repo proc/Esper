@@ -31,6 +31,7 @@ UCI engine; standard chess only, Chess960 is not supported.
 | `cargo build --release --no-default-features --features embed` | Network embedded, opening book left out |
 | `cargo build --release --features portable` | Hand-written SIMD disabled (for checking the SIMD paths) |
 | `cargo build --release --features tune` | Search parameters exposed as `T_*` UCI options for SPSA |
+| `tools/pgo.sh` | Profile-guided build (`target/release/esper-pgo`): instruments, runs the bench, rebuilds with the profile. Needs an `llvm-profdata` matching rustc's LLVM (rustup's `llvm-tools` or Homebrew's `llvm`) |
 
 Building needs Rust (2021 edition) and a C compiler, since `build.rs` compiles the
 vendored Fathom tablebase prober. The release profile uses fat LTO, one codegen

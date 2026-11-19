@@ -5,9 +5,11 @@ use crate::position::*;
 
 pub const MAX_MOVES: usize = 256;
 
+/// Fixed-capacity move list. Slots past `len` are never read, so they are left
+/// uninitialised: filling 256 moves on every creation showed up in profiles.
 #[derive(Clone, Copy)]
 pub struct MoveList {
-    pub moves: [Move; MAX_MOVES],
+    moves: [std::mem::MaybeUninit<Move>; MAX_MOVES],
     pub len: usize,
 }
 
@@ -20,19 +22,20 @@ impl Default for MoveList {
 impl MoveList {
     #[inline(always)]
     pub fn new() -> MoveList {
-        MoveList { moves: [Move::NONE; MAX_MOVES], len: 0 }
+        MoveList { moves: [std::mem::MaybeUninit::uninit(); MAX_MOVES], len: 0 }
     }
     #[inline(always)]
     fn push(&mut self, m: Move) {
         debug_assert!(self.len < MAX_MOVES);
         unsafe {
-            *self.moves.get_unchecked_mut(self.len) = m;
+            self.moves.get_unchecked_mut(self.len).write(m);
         }
         self.len += 1;
     }
     #[inline(always)]
     pub fn as_slice(&self) -> &[Move] {
-        &self.moves[..self.len]
+        // SAFETY: the first `len` slots have been written by `push`.
+        unsafe { std::slice::from_raw_parts(self.moves.as_ptr() as *const Move, self.len) }
     }
 }
 

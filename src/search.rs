@@ -1170,7 +1170,7 @@ impl Searcher {
 
     /// Stockfish-style correction update with `bonus` in [-256, 256].
     fn update_correction_sf(&mut self, ply: usize, bonus: i32) {
-        let pos = self.pos[ply];
+        let pos = self.pos_at(ply);
         let stm = pos.stm;
         let h = &*self.hist;
         hist_update_at(h.pawn_corr(stm, pos.pawn_key), bonus, SF_CORR_LIMIT);
@@ -1401,6 +1401,18 @@ impl Searcher {
         !m2.is_none() && !m4.is_none() && m.from() == m2.to() && m2.from() == m4.to()
     }
 
+    /// The position at `ply`, borrowed independently of `self` so a node can keep
+    /// it while it searches. Sound because `pos` is allocated once (MAX_PLY + 8
+    /// entries, never resized) and a node never writes its own entry: moves are
+    /// made into `ply + 1` and deeper, and re-searches at the same ply (singular,
+    /// razoring, null-move verification) only read it.
+    #[inline(always)]
+    fn pos_at(&self, ply: usize) -> &'static Position {
+        debug_assert!(ply < self.pos.len());
+        // SAFETY: see above; the buffer outlives every search call.
+        unsafe { &*self.pos.as_ptr().add(ply) }
+    }
+
     #[inline(always)]
     fn unmake(&mut self) {
         self.keys.pop();
@@ -1478,7 +1490,7 @@ impl Searcher {
         if pv_node && self.seldepth < ply + 1 {
             self.seldepth = ply + 1;
         }
-        let pos = self.pos[ply];
+        let pos = self.pos_at(ply);
         let in_check = pos.checkers != 0;
         if self.is_draw(ply) == DrawState::Draw {
             return 0;
@@ -1642,7 +1654,7 @@ impl Searcher {
         if pv_node && self.seldepth < ply + 1 {
             self.seldepth = ply + 1;
         }
-        let pos = self.pos[ply];
+        let pos = self.pos_at(ply);
         let in_check = pos.checkers != 0;
         let mut near_rep = false;
         if !root {
@@ -2048,6 +2060,7 @@ impl Searcher {
         }
 
         let mut picker = Picker::new(tt_move, false, depth);
+        let has_pieces = pos.has_non_pawn_material(pos.stm);
         let mut best = if pv_node { tb_floor } else { -INF };
         let mut best_move = Move::NONE;
         let mut move_count = 0;
@@ -2094,7 +2107,7 @@ impl Searcher {
             }
 
             // Shallow-depth pruning
-            if !root && best > -MATE_BOUND && pos.has_non_pawn_material(pos.stm) {
+            if !root && best > -MATE_BOUND && has_pieces {
                 // Move-count pruning: later quiet moves are skipped, this one still counts.
                 if move_count >= (3 + depth * depth) / (2 - improving as i32) {
                     skip_quiets = true;

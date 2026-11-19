@@ -79,6 +79,8 @@ impl Drop for MmapBacking {
 pub struct Network {
     data: &'static [u8],
     _backing: Option<MmapBacking>,
+    /// Huge-page copy of the weights (Linux), which `data` then points into.
+    _large: Option<crate::mem::LargeAlloc>,
     biases: Acc,
     tp_off: usize,
     psq_off: usize,
@@ -189,6 +191,20 @@ fn build_luts() -> Box<ThreatLuts> {
 }
 
 impl Network {
+    /// Like `from_bytes`, but on Linux the weights are first copied into huge
+    /// pages: the threat weights are read at random, so with 4 KB pages most
+    /// row loads would also miss the TLB.
+    pub fn from_bytes_large(data: &'static [u8]) -> Result<Network, String> {
+        if crate::mem::ENABLED {
+            if let Some((large, copy)) = crate::mem::LargeAlloc::copy_of(data) {
+                let mut net = Network::from_bytes(copy)?;
+                net._large = Some(large);
+                return Ok(net);
+            }
+        }
+        Network::from_bytes(data)
+    }
+
     pub fn from_bytes(data: &'static [u8]) -> Result<Network, String> {
         if data.len() < 12 {
             return Err("file too short".into());
@@ -289,6 +305,7 @@ impl Network {
         Ok(Network {
             data,
             _backing: None,
+            _large: None,
             biases,
             tp_off,
             psq_off,
@@ -303,7 +320,7 @@ impl Network {
     pub fn embedded() -> Option<Result<Network, String>> {
         #[cfg(feature = "embed")]
         {
-            Some(Network::from_bytes(EMBEDDED))
+            Some(Network::from_bytes_large(EMBEDDED))
         }
         #[cfg(not(feature = "embed"))]
         {
@@ -347,6 +364,15 @@ impl Network {
                 madvise(ptr, len, MADV_WILLNEED);
             }
             let data: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            // On Linux, move the weights into huge pages (file mappings cannot use them).
+            if crate::mem::ENABLED {
+                if let Some((large, copy)) = crate::mem::LargeAlloc::copy_of(data) {
+                    drop(backing);
+                    let mut net = Network::from_bytes(copy)?;
+                    net._large = Some(large);
+                    return Ok(net);
+                }
+            }
             let mut net = match Network::from_bytes(data) {
                 Ok(n) => n,
                 Err(e) => {
@@ -1009,6 +1035,44 @@ fn tp_rows(
     }
 }
 
+/// Compute a move's feature changes when it is made rather than when the
+/// position is evaluated. Off: many made positions are never evaluated, and the
+/// wasted work cost 6% in cycles per node despite the earlier prefetch.
+const EAGER_DIFF: bool = false;
+
+/// Threat-feature rows that change from `p0` to `p1`, for both perspectives
+/// (those not due a refresh).
+#[inline]
+fn compute_tp_diff(net: &Network, cur: &mut Entry, p0: &Position, p1: &Position) {
+    let mut added = IdxList::<MAX_THREATS>::new();
+    let mut removed = IdxList::<MAX_THREATS>::new();
+    threat_changes_inc(p0, p1, &mut added, &mut removed);
+    let (w0, b0) = (p0.pieces(WHITE, PAWN), p0.pieces(BLACK, PAWN));
+    let (w1, b1) = (p1.pieces(WHITE, PAWN), p1.pieces(BLACK, PAWN));
+    for p in 0..2 {
+        if !cur.tp_refresh[p] {
+            let orient = orientation(p, p1.king_sq(p));
+            let (adds, subs) = (&mut cur.tp_adds[p], &mut cur.tp_subs[p]);
+            adds.clear();
+            subs.clear();
+            tp_rows(net, p, orient, &added, &removed, (w0, b0), (w1, b1), adds, subs);
+        }
+    }
+    cur.tp_diff_ok = true;
+}
+
+/// Piece-square rows that change from `p0` to `p1` for perspective `persp`.
+#[inline]
+fn compute_psq_diff(cur: &mut Entry, p0: &Position, p1: &Position, persp: usize) {
+    let k1 = p1.king_sq(persp);
+    let block = psq_block(p1, persp);
+    let (adds, subs) = (&mut cur.psq_adds[persp], &mut cur.psq_subs[persp]);
+    adds.clear();
+    subs.clear();
+    psq_diff(persp, k1, block, (&p0.by_color, &p0.by_type), (&p1.by_color, &p1.by_type), adds, subs);
+    cur.psq_diff_ok[persp] = true;
+}
+
 impl NnueState {
     pub fn new(net: Arc<Network>, max_ply: usize) -> NnueState {
         let mut entries = Vec::with_capacity(max_ply);
@@ -1065,6 +1129,27 @@ impl NnueState {
             cur.psq_refresh[persp] = k0 != k1 || psq_block(p0, persp) != psq_block(p1, persp);
             cur.tp_refresh[persp] = (k0 ^ k1) & 4 != 0;
         }
+        if EAGER_DIFF {
+            // Work out the feature changes now, as Stockfish does when making a move,
+            // and start loading their weight rows so the memory latency overlaps the
+            // move generation that follows instead of stalling the evaluation.
+            let net = &*self.net;
+            let (p0, p1) = (&stack[j - 1], &stack[j]);
+            compute_tp_diff(net, cur, p0, p1);
+            for persp in 0..2 {
+                if !cur.psq_refresh[persp] {
+                    compute_psq_diff(cur, p0, p1, persp);
+                    for &i in cur.psq_adds[persp].as_slice().iter().chain(cur.psq_subs[persp].as_slice()) {
+                        prefetch_row(net.psq_row(i));
+                    }
+                }
+                if !cur.tp_refresh[persp] {
+                    for &i in cur.tp_adds[persp].as_slice().iter().chain(cur.tp_subs[persp].as_slice()) {
+                        prefetch_row(net.tp_row(i));
+                    }
+                }
+            }
+        }
     }
 
     #[inline(never)]
@@ -1103,14 +1188,7 @@ impl NnueState {
             let (lo, hi) = self.entries.split_at_mut(j);
             let (prev, cur) = (&lo[j - 1], &mut hi[0]);
             if !cur.psq_diff_ok[persp] {
-                let (p0, p1) = (&stack[j - 1], &stack[j]);
-                let k1 = p1.king_sq(persp);
-                let block = psq_block(p1, persp);
-                let (adds, subs) = (&mut cur.psq_adds[persp], &mut cur.psq_subs[persp]);
-                adds.clear();
-                subs.clear();
-                psq_diff(persp, k1, block, (&p0.by_color, &p0.by_type), (&p1.by_color, &p1.by_type), adds, subs);
-                cur.psq_diff_ok[persp] = true;
+                compute_psq_diff(cur, &stack[j - 1], &stack[j], persp);
             }
             for &i in cur.psq_adds[persp].as_slice().iter().chain(cur.psq_subs[persp].as_slice()) {
                 prefetch_row(net.psq_row(i));
@@ -1194,22 +1272,7 @@ impl NnueState {
             let (lo, hi) = self.entries.split_at_mut(j);
             let (prev, cur) = (&mut lo[j - 1], &mut hi[0]);
             if !cur.tp_diff_ok {
-                let (p0, p1) = (&stack[j - 1], &stack[j]);
-                let mut added = IdxList::<MAX_THREATS>::new();
-                let mut removed = IdxList::<MAX_THREATS>::new();
-                threat_changes_inc(p0, p1, &mut added, &mut removed);
-                let (w0, b0) = (p0.pieces(WHITE, PAWN), p0.pieces(BLACK, PAWN));
-                let (w1, b1) = (p1.pieces(WHITE, PAWN), p1.pieces(BLACK, PAWN));
-                for p in 0..2 {
-                    if !cur.tp_refresh[p] {
-                        let orient = orientation(p, p1.king_sq(p));
-                        let (adds, subs) = (&mut cur.tp_adds[p], &mut cur.tp_subs[p]);
-                        adds.clear();
-                        subs.clear();
-                        tp_rows(net, p, orient, &added, &removed, (w0, b0), (w1, b1), adds, subs);
-                    }
-                }
-                cur.tp_diff_ok = true;
+                compute_tp_diff(net, cur, &stack[j - 1], &stack[j]);
             }
             for &i in cur.tp_adds[persp].as_slice().iter().chain(cur.tp_subs[persp].as_slice()) {
                 prefetch_row(net.tp_row(i));
@@ -1237,18 +1300,28 @@ impl NnueState {
         let e = &self.entries[ply];
         let net = &*self.net;
 
-        // Feature transformer output: pairwise product of clipped halves.
+        // Feature transformer output: pairwise product of clipped halves, collecting
+        // non-zero 4-byte group indices on the fly while SIMD registers are live.
         #[repr(C, align(64))]
         struct Ft([u8; L1]);
         let mut ft = std::mem::MaybeUninit::<Ft>::uninit();
         let ft_ref = unsafe { &mut *ft.as_mut_ptr() };
+        let mut nnz = [0u16; L1 / 4 + 8];
+        let mut n_nnz = 0usize;
         for p in 0..2 {
             let c = pos.stm ^ p;
-            transform(&e.psq[c], &e.tp[c], (&mut ft_ref.0[p * (L1 / 2)..(p + 1) * (L1 / 2)]).try_into().unwrap());
+            transform(
+                &e.psq[c],
+                &e.tp[c],
+                (&mut ft_ref.0[p * (L1 / 2)..(p + 1) * (L1 / 2)]).try_into().unwrap(),
+                (p * (L1 / 8)) as u16,
+                &mut nnz,
+                &mut n_nnz,
+            );
         }
 
         let s = &net.stacks[net.stack_index[layer_stack(pos)] as usize];
-        let h0 = layer0(s, &ft_ref.0);
+        let h0 = layer0(s, &ft_ref.0, &nnz[..n_nnz]);
 
         // Squared and linear clipped activations. Clamping first keeps the square
         // inside i32 without changing the (saturated) result.
@@ -1279,20 +1352,51 @@ impl NnueState {
     }
 }
 
-/// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is the
-/// sum of the two accumulator components.
+/// Append up to 8 non-zero group indices described by `mask` starting at `base`.
 #[inline(always)]
-fn transform(psq: &Acc, tp: &Acc, out: &mut [u8; L1 / 2]) {
+fn push_nnz8(mask: usize, base: u16, nnz: &mut [u16; L1 / 4 + 8], n: &mut usize) {
+    let lut = &NNZ_LUT[mask];
+    let dst = unsafe { nnz.as_mut_ptr().add(*n) };
+    for k in 0..8 {
+        unsafe { *dst.add(k) = base + *lut.get_unchecked(k) };
+    }
+    *n += mask.count_ones() as usize;
+}
+
+/// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is the
+/// sum of the two accumulator components, while recording non-zero 4-byte groups.
+#[inline(always)]
+fn transform(
+    psq: &Acc,
+    tp: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut [u16; L1 / 4 + 8],
+    n_nnz: &mut usize,
+) {
     const H: usize = L1 / 2;
     #[cfg(simd_neon)]
     unsafe {
         use std::arch::aarch64::*;
+        const BITS: [u32; 4] = [1, 2, 4, 8];
+        let bits = vld1q_u32(BITS.as_ptr());
         let (a, b) = (psq.0.as_ptr(), tp.0.as_ptr());
-        for j in (0..H).step_by(8) {
+        let step8 = |j: usize| {
             let x = vaddq_s16(vld1q_s16(a.add(j)), vld1q_s16(b.add(j)));
             let y = vaddq_s16(vld1q_s16(a.add(j + H)), vld1q_s16(b.add(j + H)));
             let prod = vmull_u8(vqmovun_s16(x), vqmovun_s16(y));
-            vst1_u8(out.as_mut_ptr().add(j), vshrn_n_u16::<8>(vshrq_n_u16::<1>(prod)));
+            vshrn_n_u16::<8>(vshrq_n_u16::<1>(prod))
+        };
+        for j in (0..H).step_by(32) {
+            let q0 = vcombine_u8(step8(j), step8(j + 8));
+            let q1 = vcombine_u8(step8(j + 16), step8(j + 24));
+            vst1q_u8(out.as_mut_ptr().add(j), q0);
+            vst1q_u8(out.as_mut_ptr().add(j + 16), q1);
+            let u0 = vreinterpretq_u32_u8(q0);
+            let u1 = vreinterpretq_u32_u8(q1);
+            let lo = vaddvq_u32(vandq_u32(vtstq_u32(u0, u0), bits));
+            let hi = vaddvq_u32(vandq_u32(vtstq_u32(u1, u1), bits));
+            push_nnz8((lo | (hi << 4)) as usize, base_group + (j / 4) as u16, nnz, n_nnz);
         }
     }
     #[cfg(simd_avx2)]
@@ -1302,15 +1406,19 @@ fn transform(psq: &Acc, tp: &Acc, out: &mut [u8; L1 / 2]) {
         let zero = _mm256_setzero_si256();
         let max = _mm256_set1_epi16(255);
         let ld = |p: *const i16| _mm256_loadu_si256(p as *const __m256i);
-        for j in (0..H).step_by(16) {
+        let step16 = |j: usize| {
             let x = _mm256_add_epi16(ld(a.add(j)), ld(b.add(j)));
             let y = _mm256_add_epi16(ld(a.add(j + H)), ld(b.add(j + H)));
             let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), max);
             let y = _mm256_min_epi16(_mm256_max_epi16(y, zero), max);
-            // 255 * 255 fits an unsigned 16-bit lane; the logical shift leaves <= 127.
             let p = _mm256_srli_epi16::<9>(_mm256_mullo_epi16(x, y));
-            let packed = _mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(p, p));
-            _mm_storeu_si128(out.as_mut_ptr().add(j) as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(p, p)))
+        };
+        for j in (0..H).step_by(32) {
+            let v = _mm256_set_m128i(step16(j + 16), step16(j));
+            _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
+            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero))) as usize;
+            push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
         }
     }
     #[cfg(simd_avx512)]
@@ -1318,6 +1426,7 @@ fn transform(psq: &Acc, tp: &Acc, out: &mut [u8; L1 / 2]) {
         use std::arch::x86_64::*;
         let (a, b) = (psq.0.as_ptr(), tp.0.as_ptr());
         let zero = _mm512_setzero_si512();
+        let zero256 = _mm256_setzero_si256();
         let max = _mm512_set1_epi16(255);
         let ld = |p: *const i16| _mm512_loadu_si512(p as *const _);
         for j in (0..H).step_by(32) {
@@ -1326,16 +1435,28 @@ fn transform(psq: &Acc, tp: &Acc, out: &mut [u8; L1 / 2]) {
             let x = _mm512_min_epi16(_mm512_max_epi16(x, zero), max);
             let y = _mm512_min_epi16(_mm512_max_epi16(y, zero), max);
             let p = _mm512_srli_epi16::<9>(_mm512_mullo_epi16(x, y));
-            _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, _mm512_cvtepi16_epi8(p));
+            let v = _mm512_cvtepi16_epi8(p);
+            _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
+            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero256))) as usize;
+            push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
         }
     }
     #[cfg(simd_none)]
     {
         let (a, b) = (&psq.0, &tp.0);
-        for j in 0..H {
-            let x = a[j].wrapping_add(b[j]).clamp(0, 255) as u32;
-            let y = a[j + H].wrapping_add(b[j + H]).clamp(0, 255) as u32;
-            out[j] = ((x * y) >> 9) as u8;
+        for j in (0..H).step_by(4) {
+            let mut any = 0u8;
+            for k in 0..4 {
+                let x = a[j + k].wrapping_add(b[j + k]).clamp(0, 255) as u32;
+                let y = a[j + k + H].wrapping_add(b[j + k + H]).clamp(0, 255) as u32;
+                let v = ((x * y) >> 9) as u8;
+                out[j + k] = v;
+                any |= v;
+            }
+            if any != 0 {
+                nnz[*n_nnz] = base_group + (j / 4) as u16;
+                *n_nnz += 1;
+            }
         }
     }
 }
@@ -1357,37 +1478,6 @@ static NNZ_LUT: [[u16; 8]; 256] = {
     }
     t
 };
-
-/// Bit `i` is set if the `i`-th of eight consecutive 4-byte groups at `p` is non-zero.
-#[inline(always)]
-unsafe fn nonzero_mask8(p: *const u8) -> usize {
-    #[cfg(simd_neon)]
-    {
-        use std::arch::aarch64::*;
-        const BITS: [u32; 4] = [1, 2, 4, 8];
-        let bits = vld1q_u32(BITS.as_ptr());
-        let a = vreinterpretq_u32_u8(vld1q_u8(p));
-        let b = vreinterpretq_u32_u8(vld1q_u8(p.add(16)));
-        let lo = vaddvq_u32(vandq_u32(vtstq_u32(a, a), bits));
-        let hi = vaddvq_u32(vandq_u32(vtstq_u32(b, b), bits));
-        (lo | (hi << 4)) as usize
-    }
-    #[cfg(simd_x86)]
-    {
-        use std::arch::x86_64::*;
-        // Every byte is at most 127, so a non-zero group is a positive i32.
-        let v = _mm256_loadu_si256(p as *const __m256i);
-        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, _mm256_setzero_si256()))) as usize
-    }
-    #[cfg(simd_none)]
-    {
-        let mut m = 0;
-        for i in 0..8 {
-            m |= ((std::ptr::read_unaligned(p.add(4 * i) as *const u32) != 0) as usize) << i;
-        }
-        m
-    }
-}
 
 /// Dot product of unsigned activations (at most 127) with signed weights; the
 /// length is a multiple of 64.
@@ -1432,24 +1522,8 @@ fn dot_u8_i8(a: &[u8], w: &[i8]) -> i32 {
 /// First (sparse-input) affine layer: only groups of four inputs that are not all
 /// zero are visited.
 #[inline(never)]
-fn layer0(s: &LayerStack, ft: &[u8; L1]) -> [i32; L2] {
-    // Indices of the non-zero input groups, eight groups per step. Each step
-    // writes eight entries and keeps as many as there are set mask bits.
-    let mut nnz = [0u16; L1 / 4 + 8];
-    let mut n = 0;
-    for i in 0..L1 / 32 {
-        // SAFETY: reads 32 bytes inside `ft`.
-        let mask = unsafe { nonzero_mask8(ft.as_ptr().add(i * 32)) };
-        let lut = &NNZ_LUT[mask];
-        let base = (i * 8) as u16;
-        let slot: &mut [u16; 8] = (&mut nnz[n..n + 8]).try_into().unwrap();
-        for k in 0..8 {
-            slot[k] = base + lut[k];
-        }
-        n += mask.count_ones() as usize;
-    }
-    let nnz = &nnz[..n];
-    let group = |c: usize| u32::from_ne_bytes(ft[c * 4..c * 4 + 4].try_into().unwrap());
+fn layer0(s: &LayerStack, ft: &[u8; L1], nnz: &[u16]) -> [i32; L2] {
+    let group = |c: usize| unsafe { std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const u32) };
 
     #[cfg(simd_neon_dot)]
     unsafe {

@@ -30,6 +30,8 @@ pub struct TT {
     buckets: *mut Bucket,
     len: usize,
     gen: AtomicU8,
+    /// Huge-page backing on Linux; otherwise the table comes from the global allocator.
+    large: Option<crate::mem::LargeAlloc>,
 }
 
 unsafe impl Send for TT {}
@@ -69,12 +71,20 @@ impl TT {
     pub fn new(mb: usize) -> TT {
         let len = (mb.max(1) * 1024 * 1024 / std::mem::size_of::<Bucket>()).max(1);
         let layout = std::alloc::Layout::array::<Bucket>(len).unwrap();
+        // On Linux use 2 MB huge pages: probes land at random, so 4 KB pages
+        // would miss the TLB on almost every one. The mapping arrives zeroed.
+        if crate::mem::ENABLED {
+            if let Some(large) = crate::mem::LargeAlloc::new(layout.size()) {
+                let buckets = large.as_ptr() as *mut Bucket;
+                return TT { buckets, len, gen: AtomicU8::new(0), large: Some(large) };
+            }
+        }
         // SAFETY: an all-zero bit pattern is a valid Bucket (atomics holding 0).
         let buckets = unsafe { std::alloc::alloc_zeroed(layout) as *mut Bucket };
         if buckets.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        TT { buckets, len, gen: AtomicU8::new(0) }
+        TT { buckets, len, gen: AtomicU8::new(0), large: None }
     }
 
     #[inline(always)]
@@ -218,6 +228,9 @@ impl TT {
 
 impl Drop for TT {
     fn drop(&mut self) {
+        if self.large.is_some() {
+            return; // the mapping is released when `large` drops
+        }
         let layout = std::alloc::Layout::array::<Bucket>(self.len).unwrap();
         unsafe { std::alloc::dealloc(self.buckets as *mut u8, layout) };
     }

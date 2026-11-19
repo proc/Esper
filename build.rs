@@ -5,6 +5,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let mut fathom = cc::Build::new();
     fathom.file("third_party/fathom/tbprobe.c").include("third_party/fathom").opt_level(3).warnings(false);
+    // cc would otherwise copy rustc flags such as -Cprofile-generate onto the C
+    // compiler. Apple's clang then instruments Fathom with its own (older) profile
+    // format, which breaks PGO builds: the profiling runtime and instrumentation
+    // disagree and the recorded profile is useless or the binary crashes.
+    fathom.inherit_rustflags(false);
     if fathom.get_compiler().is_like_msvc() {
         // Fathom uses <stdatomic.h>, which MSVC only provides in C11 mode with
         // its (still "experimental") C11 atomics enabled.
