@@ -23,7 +23,8 @@ UCI engine; standard chess only, Chess960 is not supported.
 | Command | Result |
 |---|---|
 | `cargo build --release` | Optimised build for this machine, network embedded |
-| `cargo build --release --no-default-features` | Network left out; loaded from `nn-bddd9d57eb87.nnue` in the working directory or next to the binary |
+| `cargo build --release --no-default-features` | Network and opening book left out; the network is loaded from `nn-bddd9d57eb87.nnue` in the working directory or next to the binary |
+| `cargo build --release --no-default-features --features embed` | Network embedded, opening book left out |
 | `cargo build --release --features portable` | Hand-written SIMD disabled (for checking the SIMD paths) |
 | `cargo build --release --features tune` | Search parameters exposed as `T_*` UCI options for SPSA |
 
@@ -79,6 +80,10 @@ esper -t 4 bench
 | `SyzygyProbeDepth` | 1 | Minimum remaining depth for probing inside the search |
 | `Syzygy50MoveRule` | true | Treat wins and losses that the 50-move rule would draw as draws |
 | `SyzygyProbeLimit` | 7 | Only probe positions with at most this many pieces |
+| `OwnBook` | false | Play opening moves from the book |
+| `BookFile` | `<embedded>` | The built-in book, or the path of any Polyglot `.bin` book |
+| `BookBestMove` | false | Always play the most heavily weighted book move instead of choosing at random by weight |
+| `BookDepth` | 0 | Last move number taken from the book; 0 means no limit |
 | `Clear Hash` | | Clears the hash table and the history tables |
 
 `go` understands `wtime`, `btime`, `winc`, `binc`, `movestogo`, `depth`, `nodes`,
@@ -99,6 +104,7 @@ These are typed at the engine prompt (or given on the command line).
 | `evalbench [n]` | Measures NNUE evaluation throughput |
 | `wac [ms]` | Runs the 300 "Win at Chess" positions (built in from `suites/wac.epd`) at `ms` per position, default 1000, and reports the number solved |
 | `epd <file> [ms]` | The same for any EPD file with `bm` or `am` operations |
+| `book` | Lists the book moves for the current position with their weights |
 | `tbprobe` | Shows the tablebase WDL and root DTZ result for the current position |
 | `selftest [games]` | Plays random games and checks incremental NNUE updates against full refreshes |
 | `evalfile <fens.txt>` | Prints the raw network output for each FEN in a file |
@@ -172,6 +178,31 @@ increment and `movestogo`. The search stops early or runs longer depending on ho
 stable the best move is, whether the score is falling, and what share of the nodes
 went to the best move. Some of this state carries over from move to move.
 
+### Opening book
+
+The book is off by default; `setoption name OwnBook value true` turns it on.
+While the position is in the book, `go` answers at once with a book move (and a
+book reply as the ponder move) instead of searching. `go infinite`, `go ponder`
+and `go searchmoves` always search. Moves are drawn at random in proportion to
+their weights unless `BookBestMove` is set.
+
+The embedded book (`books/esper.bin`, 1.70 million entries, 27 MB) is built from
+the first 40 plies of all 2,483,177 games in the CCRL 40/40 database
+(`CCRL-4040-commented.[2483177].pgn`). A move is included if engines played it in
+at least 3 games, it scored at least 20% for the side playing it, and it scored
+within 30 points per 100 games of the best such move in its position. Only
+positions reachable from the start through book moves are kept. A move's weight
+is its game count times the square of its score, so popular, successful moves are
+chosen most often. The book was made with `pgn2book` from the devilfish project:
+
+```bash
+pgn2book -in CCRL-4040.pgn -plies 40 -min-games 3 -min-share 0 -max-loss 0.30 -min-score 0.20 -out books/esper.bin
+```
+
+Any Polyglot book can be used instead through `BookFile`. Books are looked up in
+place (a binary search over the raw entries), so the embedded one costs no
+loading time or extra memory.
+
 ### Tablebases
 
 With `SyzygyPath` set, a won or lost root position within the tables is played
@@ -193,6 +224,8 @@ distance. `info` lines include `tbhits`.
 | `src/tt.rs` | Transposition table |
 | `src/search.rs` | Search, move ordering, histories, time management, Lazy SMP |
 | `src/tb.rs` | Syzygy probing (bindings to Fathom) |
+| `src/book.rs`, `src/polyglot_keys.rs` | Polyglot opening book |
+| `books/esper.bin` | The embedded opening book |
 | `src/tune.rs` | Tunable search parameters |
 | `src/uci.rs` | UCI front end and the extra commands |
 | `suites/wac.epd` | Win at Chess test suite |

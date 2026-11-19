@@ -30,7 +30,7 @@ const MAIN_HIST_LIMIT: i32 = 7183;
 const CAPTURE_HIST_LIMIT: i32 = 10692;
 const CONT_HIST_LIMIT: i32 = 30000;
 const PAWN_HIST_LIMIT: i32 = 8192;
-const PAWN_HIST_SIZE: usize = 2048;
+const PAWN_HIST_SIZE: usize = 512;
 const LOW_PLY_SIZE: usize = 5;
 /// Quiet moves scoring at or below this are tried after everything else.
 const GOOD_QUIET_THRESHOLD: i32 = -14000;
@@ -78,7 +78,7 @@ const MULTI_CUT: bool = false;
 const MC_CANDIDATES: usize = 8;
 const MC_CUTOFFS: usize = 3;
 /// Quiet moves whose history is below `-margin * depth` are pruned at low depth.
-const HISTORY_PRUNE_MARGIN: i32 = 8000;
+const HISTORY_PRUNE_MARGIN: i32 = 4000;
 // The history tables sit well below zero on average (negative starting values,
 // penalties larger than bonuses), so reductions measure against typical scores.
 const QUIET_HIST_CENTRE: i32 = -16000;
@@ -132,6 +132,13 @@ impl Shared {
     pub fn total_nodes(&self, threads: usize) -> u64 {
         self.nodes[..threads].iter().map(|n| n.0.load(Relaxed)).sum()
     }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum DrawState {
+    None,
+    NearRep,
+    Draw,
 }
 
 #[derive(Clone, Copy)]
@@ -1193,13 +1200,13 @@ impl Searcher {
         self.keys.pop();
     }
 
-    fn is_draw(&self, ply: usize) -> bool {
+    fn is_draw(&self, ply: usize) -> DrawState {
         let pos = &self.pos[ply];
         if pos.rule50 >= 100 && (pos.checkers == 0 || has_legal_move(pos)) {
-            return true;
+            return DrawState::Draw;
         }
         if pos.insufficient_material() {
-            return true;
+            return DrawState::Draw;
         }
         let end = (pos.rule50 as usize).min(pos.plies_from_null as usize);
         let cur = self.keys.len() - 1;
@@ -1209,16 +1216,16 @@ impl Searcher {
             if self.keys[cur - i] == pos.key {
                 // A single repetition inside the search tree is enough.
                 if i <= ply {
-                    return true;
+                    return DrawState::Draw;
                 }
                 reps += 1;
                 if reps == 2 {
-                    return true;
+                    return DrawState::Draw;
                 }
             }
             i += 2;
         }
-        false
+        if reps == 1 { DrawState::NearRep } else { DrawState::None }
     }
 
     #[inline(always)]
@@ -1228,7 +1235,9 @@ impl Searcher {
 
     fn check_time(&mut self) {
         self.shared.nodes[self.id].0.store(self.nodes, Relaxed);
-        self.shared.tb_hits[self.id].0.store(self.tb_hits, Relaxed);
+        if self.tb_cardinality > 0 {
+            self.shared.tb_hits[self.id].0.store(self.tb_hits, Relaxed);
+        }
         if self.shared.stop.0.load(Relaxed) && (self.id != 0 || self.completed_depth > 0) {
             self.stopped = true;
             return;
@@ -1262,7 +1271,8 @@ impl Searcher {
         }
         let pos = self.pos[ply];
         let in_check = pos.checkers != 0;
-        if self.is_draw(ply) {
+        let draw = self.is_draw(ply);
+        if draw == DrawState::Draw {
             return self.draw_score();
         }
         if ply >= MAX_PLY {
@@ -1274,7 +1284,7 @@ impl Searcher {
         let mut tt_pv = pv_node;
         if let Some(t) = tte {
             let s = score_from_tt(t.score, ply);
-            if !pv_node && t.bound & (if s >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0 {
+            if !pv_node && draw != DrawState::NearRep && t.bound & (if s >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0 {
                 return s;
             }
             tt_move = t.mv;
@@ -1393,7 +1403,9 @@ impl Searcher {
             return -MATE + ply as i32;
         }
         let bound = if best >= beta { BOUND_LOWER } else { BOUND_UPPER };
-        self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
+        if best >= beta || tte.is_none() {
+            self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
+        }
         best
     }
 
@@ -1417,10 +1429,13 @@ impl Searcher {
         }
         let pos = self.pos[ply];
         let in_check = pos.checkers != 0;
+        let mut near_rep = false;
         if !root {
-            if self.is_draw(ply) {
+            let draw = self.is_draw(ply);
+            if draw == DrawState::Draw {
                 return self.draw_score();
             }
+            near_rep = draw == DrawState::NearRep;
             if ply >= MAX_PLY {
                 return if in_check { 0 } else { self.evaluate(ply) };
             }
@@ -1433,7 +1448,12 @@ impl Searcher {
 
         let excluded = self.ss[ply].excluded;
         // Check extension
-        if in_check && !root && excluded.is_none() && ply < 2 * self.completed_depth.max(1) as usize + 4 {
+        if in_check
+            && !root
+            && excluded.is_none()
+            && (!cut_node || depth <= 10)
+            && ply < 2 * self.completed_depth.max(1) as usize + 4
+        {
             depth += 1;
         }
         let tte = if excluded.is_none() { self.tt.probe(pos.key) } else { None };
@@ -1454,6 +1474,7 @@ impl Searcher {
                 tt_move = t.mv;
             }
             if !pv_node
+                && !near_rep
                 && tt_depth >= depth
                 && tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
                 && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
@@ -1951,9 +1972,12 @@ impl Searcher {
             let nodes_before = self.nodes;
             let mut score;
 
-            // Late move reductions: quiets from the third move on, captures later.
-            let do_lmr =
-                if quiet { depth >= 3 && moves_searched >= 2 } else { depth >= 4 && moves_searched >= 4 };
+            // Late move reductions: quiets from the second/third move on, captures from the fourth.
+            let do_lmr = if quiet {
+                depth >= 2 && moves_searched >= 1 + pv_node as i32
+            } else {
+                depth >= 3 && moves_searched >= 3 + pv_node as i32
+            };
             if do_lmr {
                 let base = lmr.0[depth.min(63) as usize][(move_count as usize).min(63)];
                 let mut r;
@@ -1962,6 +1986,9 @@ impl Searcher {
                     r += if pv_node { -1024 } else { 1024 };
                     r += if improving { -1024 } else { 1024 };
                     r += if tt_pv { -512 } else { 1024 };
+                    if !in_check && static_eval + 150 <= alpha {
+                        r += 1024;
+                    }
                     if cut_node {
                         r += if tt_move.is_none() { 1024 } else { 1536 };
                     }
@@ -2265,7 +2292,7 @@ impl Searcher {
                     self.optimism[root.stm] = opt;
                     self.optimism[root.stm ^ 1] = -opt;
                 }
-                let mut delta = 14 + (self.id as i32 % 4) * 3 + prev * prev / 24000;
+                let mut delta = 10 + (self.id as i32 % 4) * 3 + prev * prev / 24000;
                 let (mut alpha, mut beta) = (-INF, INF);
                 if depth >= 4 {
                     alpha = (prev - delta).max(-INF);
@@ -2294,7 +2321,7 @@ impl Searcher {
                         let line = Line { score: s, seldepth: self.seldepth, pv: self.pv[0][..self.pv_len[0]].to_vec() };
                         self.print_info(depth, pv_idx, &line, label);
                     }
-                    delta += delta / 2 + 4;
+                    delta += delta / 3 + 2;
                     if delta > 1500 {
                         alpha = -INF;
                         beta = INF;
@@ -2497,6 +2524,7 @@ struct WorkerState {
 
 struct WorkerHandle {
     state: Arc<(Mutex<WorkerState>, Condvar)>,
+    done_flag: Arc<PaddedAtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -2517,7 +2545,9 @@ impl ThreadPool {
                 Mutex::new(WorkerState { gen: 0, job: WorkerJob::Idle, done: true, result: None }),
                 Condvar::new(),
             ));
+            let done_flag = Arc::new(PaddedAtomicBool(AtomicBool::new(true)));
             let st = state.clone();
+            let df = done_flag.clone();
             let net = net.clone();
             let tt = tt.clone();
             let shared = shared.clone();
@@ -2562,17 +2592,19 @@ impl ThreadPool {
                         let mut guard = lock.lock().unwrap();
                         guard.result = result;
                         guard.done = true;
+                        df.0.store(true, std::sync::atomic::Ordering::Release);
                         cv.notify_all();
                     }
                 })
                 .expect("failed to spawn search worker thread");
-            helpers.push(WorkerHandle { state, join: Some(join) });
+            helpers.push(WorkerHandle { state, done_flag, join: Some(join) });
         }
         ThreadPool { main, helpers, threads }
     }
 
     fn dispatch(&self, mut make_job: impl FnMut(usize) -> WorkerJob) {
         for (idx, h) in self.helpers.iter().enumerate() {
+            h.done_flag.0.store(false, Relaxed);
             let (lock, cv) = &*h.state;
             let mut guard = lock.lock().unwrap();
             guard.gen += 1;
@@ -2586,6 +2618,12 @@ impl ThreadPool {
     fn wait_helpers(&self) -> Vec<ThreadResult> {
         let mut results = Vec::with_capacity(self.helpers.len());
         for h in &self.helpers {
+            for _ in 0..64 {
+                if h.done_flag.0.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
             let (lock, cv) = &*h.state;
             let mut guard = lock.lock().unwrap();
             while !guard.done {

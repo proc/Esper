@@ -147,7 +147,10 @@ impl TT {
                     mv = old.mv;
                 }
                 // Keep deeper results from the same search unless this one is exact.
-                if bound != BOUND_EXACT && depth + 4 <= old.depth && ((data >> 59) as u8) == gen {
+                if bound != BOUND_EXACT
+                    && (depth + 4 <= old.depth || (depth == 0 && old.depth > 0))
+                    && ((data >> 59) as u8) == gen
+                {
                     return;
                 }
                 victim = i;

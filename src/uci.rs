@@ -1,5 +1,6 @@
 //! UCI protocol front end.
 
+use crate::book::{self, Book};
 use crate::movegen::{legal_moves, parse_move, parse_san, perft, to_san};
 use crate::nnue::{Network, NnueState, DEFAULT_NET_NAME};
 use crate::position::*;
@@ -46,6 +47,15 @@ pub struct Engine {
     overhead: u64,
     show_wdl: bool,
     tb: TbConfig,
+    /// Play from the opening book (`OwnBook`); off by default.
+    own_book: bool,
+    book_file: String,
+    /// Loaded on first use, so an engine without OwnBook never touches it.
+    book: Option<Book>,
+    /// Always play the most heavily weighted book move instead of a weighted draw.
+    book_best: bool,
+    /// Last move number played from the book; 0 means no limit.
+    book_depth: u32,
 }
 
 pub fn load_default_network() -> Result<Network, String> {
@@ -86,6 +96,11 @@ impl Engine {
             overhead: 25,
             show_wdl: false,
             tb: TbConfig::DEFAULT,
+            own_book: false,
+            book_file: book::EMBEDDED_NAME.to_string(),
+            book: None,
+            book_best: false,
+            book_depth: 0,
         };
         e.rebuild_searchers();
         e
@@ -191,7 +206,67 @@ impl Engine {
             }
             i += 1;
         }
+        if self.own_book && !limits.ponder && !limits.infinite && limits.searchmoves.is_empty() {
+            if let Some(m) = self.book_move() {
+                let next = self.pos.make(m);
+                let seen = |key: u64| key == next.key || self.keys.contains(&key);
+                let ponder = self.book.as_ref().and_then(|b| b.probe(&next, true, |p| !seen(next.make(p).key)));
+                println!("info string book move {}", to_san(&self.pos, m));
+                match ponder {
+                    Some(p) => println!("bestmove {} ponder {}", m.to_uci(), p.to_uci()),
+                    None => println!("bestmove {}", m.to_uci()),
+                }
+                return;
+            }
+        }
         self.start_search(limits, false);
+    }
+
+    /// Load the book named by `BookFile` if it is not loaded yet.
+    fn ensure_book(&mut self) -> bool {
+        if self.book.is_none() {
+            match Book::load(&self.book_file) {
+                Ok(b) => {
+                    println!("info string book {} loaded: {} entries", b.name, b.len());
+                    self.book = Some(b);
+                }
+                Err(e) => {
+                    println!("info string could not load book: {e}");
+                    self.own_book = false;
+                }
+            }
+        }
+        self.book.is_some()
+    }
+
+    fn book_move(&mut self) -> Option<Move> {
+        if self.book_depth != 0 && self.pos.fullmove as u32 > self.book_depth {
+            return None;
+        }
+        if !self.ensure_book() {
+            return None;
+        }
+        // Book lines can loop (engines shuffled pieces in the source games), and
+        // Polyglot keys know nothing of the game's history, so never let the book
+        // repeat a position this game has already had.
+        let (pos, keys) = (&self.pos, &self.keys);
+        self.book.as_ref()?.probe(pos, self.book_best, |m| !keys.contains(&pos.make(m).key))
+    }
+
+    /// `book`: list the book moves of the current position with their weights.
+    fn show_book(&mut self) {
+        if !self.ensure_book() {
+            return;
+        }
+        let moves = self.book.as_ref().unwrap().moves(&self.pos);
+        if moves.is_empty() {
+            println!("no book moves (key {:016x})", book::hash(&self.pos));
+            return;
+        }
+        let total: u64 = moves.iter().map(|m| m.weight as u64).sum::<u64>().max(1);
+        for m in moves {
+            println!("{:<8} {:>5}  {:5.1}%", to_san(&self.pos, m.mv), m.weight, 100.0 * m.weight as f64 / total as f64);
+        }
     }
 
     fn start_search(&mut self, mut limits: Limits, silent: bool) {
@@ -347,6 +422,26 @@ impl Engine {
                         self.rebuild_searchers();
                     }
                     Err(e) => println!("info string could not load network: {e}"),
+                }
+            }
+            "ownbook" => {
+                self.own_book = value.trim().eq_ignore_ascii_case("true");
+                if self.own_book {
+                    self.ensure_book();
+                }
+            }
+            "bookfile" => {
+                let v = value.trim();
+                self.book_file = if v.is_empty() || v == "<empty>" { book::EMBEDDED_NAME.to_string() } else { v.to_string() };
+                self.book = None;
+                if self.own_book {
+                    self.ensure_book();
+                }
+            }
+            "bookbestmove" => self.book_best = value.trim().eq_ignore_ascii_case("true"),
+            "bookdepth" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    self.book_depth = n.min(1000);
                 }
             }
             "ponder" => {}
@@ -679,6 +774,10 @@ impl Engine {
                 println!("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
                 println!("option name Syzygy50MoveRule type check default true");
                 println!("option name SyzygyProbeLimit type spin default 7 min 0 max 7");
+                println!("option name OwnBook type check default false");
+                println!("option name BookFile type string default {}", book::EMBEDDED_NAME);
+                println!("option name BookBestMove type check default false");
+                println!("option name BookDepth type spin default 0 min 0 max 1000");
                 println!("option name Clear Hash type button");
                 crate::tune::print_uci_options();
                 println!("uciok");
@@ -720,6 +819,7 @@ impl Engine {
             }
             "evalbench" => self.eval_bench(args.first().and_then(|s| s.parse().ok()).unwrap_or(50_000)),
             "perftbench" => self.perft_bench(),
+            "book" => self.show_book(),
             "tbprobe" => {
                 let wdl = if self.pos.castling == 0 && self.pos.rule50 == 0 { tb::probe_wdl(&self.pos) } else { None };
                 let root = tb::probe_root(&self.pos, &self.tb);

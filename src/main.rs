@@ -1,8 +1,10 @@
 //! Esper - a UCI chess engine.
 
 mod bitboard;
+mod book;
 mod movegen;
 mod nnue;
+mod polyglot_keys;
 mod position;
 mod search;
 mod tb;

@@ -9,9 +9,11 @@ description = "A UCI chess engine using Stockfish's NNUE network"
 cc = "1"
 
 [features]
-default = ["embed"]
+default = ["embed", "book"]
 # Embed the network file in the binary so the engine is a single standalone file.
 embed = []
+# Embed the opening book (books/esper.bin). It is only used with OwnBook on.
+book = []
 # Disable hand-written SIMD and use the portable code paths (for testing).
 portable = []
 # List the SPSA tuning parameters as UCI options (see src/tune.rs).
