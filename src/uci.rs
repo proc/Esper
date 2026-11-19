@@ -43,7 +43,6 @@ struct SearchTask {
     show_wdl: bool,
     silent: bool,
     shared: Arc<Shared>,
-    root_tb: Option<tb::RootResult>,
 }
 
 enum CoordCmd {
@@ -82,6 +81,8 @@ pub struct Engine {
     book_best: bool,
     /// Last move number played from the book; 0 means no limit.
     book_depth: u32,
+    /// The `Ponder` option (time management plans a little more when it is on).
+    ponder_opt: bool,
 }
 
 pub fn load_default_network() -> Result<Network, String> {
@@ -128,15 +129,25 @@ impl Engine {
                             mut pool,
                             pos,
                             keys,
-                            limits,
+                            mut limits,
                             multipv,
                             overhead,
                             tb_cfg,
                             show_wdl,
                             silent,
                             shared,
-                            root_tb,
                         } = *task;
+                        let mut root_tb = if !silent && multipv == 1 && limits.searchmoves.is_empty() {
+                            tb::probe_root(&pos, &tb_cfg)
+                        } else {
+                            None
+                        };
+                        if let Some(r) = &root_tb {
+                            if tb::outcome(r.wdl, &tb_cfg) == 0 && r.keeping.len() > 1 {
+                                limits.searchmoves = r.keeping.clone();
+                                root_tb = None;
+                            }
+                        }
                         let hold = limits.infinite;
                         if let Some(r) = root_tb {
                             let outcome = tb::outcome(r.wdl, &tb_cfg);
@@ -208,6 +219,7 @@ impl Engine {
             book: None,
             book_best: false,
             book_depth: 0,
+            ponder_opt: false,
         };
         e.rebuild_searchers();
         e
@@ -293,7 +305,7 @@ impl Engine {
             let depth = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
             return self.perft(depth);
         }
-        let mut limits = Limits { received: Some(Instant::now()), ..Limits::default() };
+        let mut limits = Limits { received: Some(Instant::now()), ponder_option: self.ponder_opt, ..Limits::default() };
         let mut i = 0;
         let num = |i: usize| args.get(i + 1).and_then(|s| s.parse::<i64>().ok()).map(|v| v.max(0) as u64);
         while i < args.len() {
@@ -381,22 +393,8 @@ impl Engine {
         }
     }
 
-    fn start_search(&mut self, mut limits: Limits, silent: bool) {
+    fn start_search(&mut self, limits: Limits, silent: bool) {
         self.stop();
-        // With the root position in the tablebases its exact value is known. A won
-        // or lost position is played straight from the distance-to-zero tables; in
-        // a drawn one the search still runs, but only over moves that hold the draw.
-        let mut root_tb = if !silent && self.multipv == 1 && limits.searchmoves.is_empty() {
-            tb::probe_root(&self.pos, &self.tb)
-        } else {
-            None
-        };
-        if let Some(r) = &root_tb {
-            if tb::outcome(r.wdl, &self.tb) == 0 && r.keeping.len() > 1 {
-                limits.searchmoves = r.keeping.clone();
-                root_tb = None;
-            }
-        }
         self.shared.stop.0.store(false, Relaxed);
         self.shared.pondering.0.store(limits.ponder, Relaxed);
         let task = Box::new(SearchTask {
@@ -410,7 +408,6 @@ impl Engine {
             show_wdl: self.show_wdl,
             silent,
             shared: self.shared.clone(),
-            root_tb,
         });
         let (lock, cv) = &*self.coord;
         let mut guard = lock.lock().unwrap();
@@ -520,7 +517,7 @@ impl Engine {
                     self.book_depth = n.min(1000);
                 }
             }
-            "ponder" => {}
+            "ponder" => self.ponder_opt = value.trim().eq_ignore_ascii_case("true"),
             _ if crate::tune::set_by_name(&name, &value) => {}
             _ => println!("info string unknown option: {name}"),
         }
@@ -533,6 +530,16 @@ impl Engine {
             pool.clear();
         } else {
             self.tt.clear();
+        }
+    }
+
+    /// Fast new-game reset for `ucinewgame`: ages all existing TT entries without
+    /// zeroing potentially gigabytes of RAM synchronously, and clears history tables.
+    fn uci_new_game(&mut self) {
+        self.stop();
+        self.tt.new_search();
+        if let Some(pool) = self.pool.as_mut() {
+            pool.clear();
         }
     }
 
@@ -859,7 +866,7 @@ impl Engine {
                 println!("uciok");
             }
             "isready" => println!("readyok"),
-            "ucinewgame" => self.new_game(),
+            "ucinewgame" => self.uci_new_game(),
             "position" => {
                 self.stop();
                 self.set_position(args);

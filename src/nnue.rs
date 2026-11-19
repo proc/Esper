@@ -338,6 +338,14 @@ impl Network {
                 return Err(format!("{path}: mmap failed: {}", std::io::Error::last_os_error()));
             }
             let backing = MmapBacking(ptr as *const u8, len);
+            // Hint the OS to asynchronously read ahead the mapped network pages.
+            const MADV_WILLNEED: core::ffi::c_int = 3;
+            extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int) -> core::ffi::c_int;
+            }
+            unsafe {
+                madvise(ptr, len, MADV_WILLNEED);
+            }
             let data: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
             let mut net = match Network::from_bytes(data) {
                 Ok(n) => n,

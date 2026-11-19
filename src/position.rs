@@ -29,8 +29,9 @@ pub fn piece_color(pc: u8) -> usize {
     (pc >> 3) as usize
 }
 
-/// Piece values for static exchange evaluation, in centipawns.
-pub const SEE_VALUE: [i32; 8] = [0, 100, 320, 330, 500, 950, 20000, 0];
+/// Piece values for static exchange evaluation, in centipawns: Stockfish's
+/// PieceValue (208, 781, 825, 1276, 2538) rescaled to 100 per pawn.
+pub const SEE_VALUE: [i32; 8] = [0, 100, 375, 397, 613, 1220, 20000, 0];
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Move(pub u16);
@@ -75,6 +76,11 @@ impl Move {
         f == FLAG_KCASTLE || f == FLAG_QCASTLE
     }
     /// Captures and promotions.
+    /// Stockfish's `capture_stage`: captures (en passant included) and queen promotions.
+    #[inline(always)]
+    pub fn is_capture_stage(self) -> bool {
+        self.is_capture() || (self.is_promo() && self.promo_type() == QUEEN)
+    }
     #[inline(always)]
     pub fn is_noisy(self) -> bool {
         self.0 & (12 << 12) != 0
@@ -587,7 +593,9 @@ impl Position {
 
     /// Static exchange evaluation: is the exchange started by `m` worth at least `threshold`?
     pub fn see_ge(&self, m: Move, threshold: i32) -> bool {
-        if m.is_castle() {
+        // Like Stockfish, special moves (castling, en passant, promotions) count as
+        // an even exchange.
+        if m.is_castle() || m.is_promo() || m.flag() == FLAG_EP {
             return threshold <= 0;
         }
         let (from, to, flag) = (m.from(), m.to(), m.flag());

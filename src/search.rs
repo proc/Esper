@@ -31,28 +31,21 @@ const MAIN_HIST_LIMIT: i32 = 7183;
 const CAPTURE_HIST_LIMIT: i32 = 10692;
 const CONT_HIST_LIMIT: i32 = 30000;
 const PAWN_HIST_LIMIT: i32 = 8192;
-const PAWN_HIST_SIZE: usize = 512;
+/// Pawn-history entries per thread (Stockfish's PAWN_HISTORY_BASE_SIZE).
+const PAWN_HIST_SIZE: usize = 8192;
 const LOW_PLY_SIZE: usize = 5;
 /// Quiet moves scoring at or below this are tried after everything else.
 const GOOD_QUIET_THRESHOLD: i32 = -14000;
 const KILLER_ORDERING: bool = true;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
-const SF_RFP: bool = true;
-const SF_RAZOR: bool = true;
 const SF_NMP: bool = false;
-const SF_FUTILITY: bool = true;
-const SF_QSEARCH: bool = true;
 // Further Stockfish-derived techniques.
 const SF_EVAL_SCALE: bool = true;
 const SF_CORRECTION: bool = true;
-const SF_SINGULAR: bool = true;
-const SF_LMR_EXTEND: bool = true;
 const SF_TT_CUTOFF: bool = true;
 const SF_SMALL_PROBCUT: bool = true;
-const SF_CAPTURE_PRUNE: bool = true;
 const SF_SEEK_MATE: bool = false;
 const SF_SHUFFLING: bool = true;
-const SF_TIME: bool = true;
 /// Range of the Stockfish-style correction history entries.
 const SF_CORR_LIMIT: i32 = 1024;
 /// Share the continuation, pawn and correction histories between threads.
@@ -62,50 +55,32 @@ const SHARED_HISTORY: bool = true;
 const SF_UPCOMING_REP: bool = true;
 /// Adjust depth by the parent's reduction and how the evaluation moved.
 const SF_HINDSIGHT: bool = true;
-/// Stockfish's reduction formula, history-based pruning depth and full-depth reductions.
-const SF_LMR2: bool = true;
-/// Razor only at expected all-nodes, with a margin linear in depth.
-const SF_RAZOR2: bool = true;
-/// Internal iterative reduction only at PV and cut nodes, off the previous PV.
-const SF_IIR2: bool = true;
 /// Accept a hash entry one ply shallower when it is an upper bound at or below beta.
 const SF_TT_DEPTH: bool = true;
 /// Store the static evaluation in the hash table on a miss; inherit it in check.
 const SF_EVAL_STORE: bool = true;
-/// Small items: opponent-worsening in reverse futility, `improving` when above
-/// beta, extending the hash move into PV leaves, parent stat score in bonuses.
-const SF_SMALL2: bool = true;
-/// Reverse futility pruning applies up to this remaining depth.
-const RFP_MAX_DEPTH: i32 = 8;
-const RFP_SKIP_TT_PV: bool = false;
-/// Depth limit used instead when the opponent has a pawn within two steps of promoting.
-const RFP_RUNNER_DEPTH: i32 = 0;
+/// Third round: line-by-line parity with Stockfish's search (see the audit).
+const SF_PARITY: bool = true;
+/// Esper's old check extension at node entry (Stockfish has none).
+const SF_CHECK_EXT: bool = false;
+/// Esper's guard against the deeper LMR re-search chaining down long lines.
+const DEEPER_PLY_GUARD: bool = false;
+/// Searched moves remembered for history maluses (Stockfish's SEARCHEDLIST_CAPACITY).
+const SEARCHED_CAP: usize = 32;
 /// Extra null-move reduction (plies) granted when the evaluation is far above beta.
 const NMP_EVAL_PLIES: i32 = 3;
 /// Piece values in internal evaluation units, used to weigh moves for ordering.
 const PIECE_VALUE: [i32; 8] = [0, 208, 781, 825, 1276, 2538, 0, 0];
-const CORR_SIZE: usize = 16384;
+/// Correction-history entries per thread (Stockfish's CORRHIST_BASE_SIZE).
+const CORR_SIZE: usize = 65536;
+#[allow(dead_code)]
 const CORR_LIMIT: i32 = 96 * 256;
 const NO_CONT: usize = usize::MAX;
-// Time management
-const DOMINANT_SHARE: f64 = 0.65;
-const DISPUTED_SHARE: f64 = 0.35;
-const STABLE_ITERATIONS: u32 = 4;
-/// Score drop between iterations (40 centipawns) that buys extra time.
-const FAIL_LOW_DROP: i32 = 40 * NORMALIZE_PAWN / 100;
 /// Multi-cut (off by default: it cost about 80 Elo in testing): prune a cut node when `MC_CUTOFFS` of its first `MC_CANDIDATES`
 /// moves fail high at reduced depth.
 const MULTI_CUT: bool = false;
 const MC_CANDIDATES: usize = 8;
 const MC_CUTOFFS: usize = 3;
-/// Quiet moves whose history is below `-margin * depth` are pruned at low depth.
-const HISTORY_PRUNE_MARGIN: i32 = 4000;
-// The history tables sit well below zero on average (negative starting values,
-// penalties larger than bonuses), so reductions measure against typical scores.
-const QUIET_HIST_CENTRE: i32 = -16000;
-const QUIET_HIST_STEP: i32 = 4500;
-const CAPTURE_HIST_CENTRE: i32 = -7000;
-const CAPTURE_HIST_STEP: i32 = 3500;
 /// Internal evaluation units per pawn, for UCI centipawn output.
 pub const NORMALIZE_PAWN: i32 = 290;
 
@@ -122,6 +97,8 @@ pub struct Limits {
     pub searchmoves: Vec<Move>,
     /// When the `go` command arrived; the clock runs from here.
     pub received: Option<Instant>,
+    /// The `Ponder` option is on (Stockfish then plans a quarter more time).
+    pub ponder_option: bool,
 }
 
 #[repr(align(128))]
@@ -137,6 +114,10 @@ pub struct Shared {
     pub tb_hits: Vec<PaddedAtomicU64>,
     /// Root best-move changes summed over all threads (time management).
     pub best_move_changes: PaddedAtomicU64,
+    /// Stockfish's threads.increaseDepth: false once half the planned time is used.
+    pub increase_depth: PaddedAtomicBool,
+    /// Time is up but the engine is pondering: stop as soon as the ponder hits.
+    pub stop_on_ponderhit: PaddedAtomicBool,
 }
 
 impl Shared {
@@ -147,6 +128,8 @@ impl Shared {
             nodes: (0..1024).map(|_| PaddedAtomicU64(AtomicU64::new(0))).collect(),
             tb_hits: (0..1024).map(|_| PaddedAtomicU64(AtomicU64::new(0))).collect(),
             best_move_changes: PaddedAtomicU64(AtomicU64::new(0)),
+            increase_depth: PaddedAtomicBool(AtomicBool::new(true)),
+            stop_on_ponderhit: PaddedAtomicBool(AtomicBool::new(false)),
         }
     }
     pub fn total_tb_hits(&self, threads: usize) -> u64 {
@@ -181,21 +164,12 @@ struct Stack {
     stat_score: i32,
     /// This node lies on the previous iteration's principal variation.
     follow_pv: bool,
-}
-
-struct LmrTable([[i32; 64]; 64]);
-
-fn lmr_table() -> &'static LmrTable {
-    static T: std::sync::OnceLock<LmrTable> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = LmrTable([[0; 64]; 64]);
-        for d in 1..64 {
-            for m in 1..64 {
-                t.0[d][m] = ((0.75 + (d as f64).ln() * (m as f64).ln() / 2.0) * 1024.0) as i32;
-            }
-        }
-        t
-    })
+    /// Stockfish's ss->ttPv: this position is or was on a principal variation.
+    tt_pv: bool,
+    /// Stockfish's priorNMPFailHigh.
+    prior_nmp_fail_high: i32,
+    /// Which continuation table this ply's move feeds: in check * 2 + capture.
+    cont_block: usize,
 }
 
 /// Stockfish's reduction table: `reductions[i] = 2872 / 128 * ln(i)`.
@@ -225,12 +199,25 @@ fn lmr_divisor(depth: i32) -> i32 {
     3000 + 7 * (d - 8) * (d - 8)
 }
 
+/// Running statistics of one root move (Stockfish's RootMove fields).
+#[derive(Clone, Copy)]
+struct RootStat {
+    mv: Move,
+    /// Nodes spent below this move during the whole search.
+    effort: u64,
+    /// Exponential moving average of its scores; -INF before the first one.
+    avg: i32,
+    /// Moving average of score * |score|.
+    mss: i64,
+}
+
+const MSS_NONE: i64 = -(INF as i64) * (INF as i64);
+
 pub struct Searcher {
     pub id: usize,
     pub threads: usize,
     pub tt: Arc<TT>,
     pub shared: Arc<Shared>,
-    lmr: &'static LmrTable,
     nnue: NnueState,
     pos: Vec<Position>,
     ss: Vec<Stack>,
@@ -269,6 +256,23 @@ pub struct Searcher {
     stopped: bool,
     completed_depth: i32,
     root_excluded: Vec<Move>,
+    /// Move to try first at the root (the current line's previous best).
+    root_move: Move,
+    /// Index of the MultiPV line being searched.
+    pv_idx: usize,
+    root_stats: Vec<RootStat>,
+    /// Iterations that did not get the go-ahead to deepen (Stockfish's searchAgainCounter).
+    search_again: i32,
+    /// Depth held back after fail highs on the first line (failHighRecovery).
+    fail_high_recovery: i32,
+    /// Per-game time scale from the first move's clock (originalTimeAdjust); -1 unset.
+    orig_time_adjust: f64,
+    /// The clock (wtime/btime) drives this search.
+    time_managed: bool,
+    /// A `go movetime` limit, checked as is.
+    movetime: Option<u64>,
+    /// Average score of the best root move, for the next move's time management.
+    pub avg_score: i32,
     root_nodes: Box<[u64; 4096]>,
     nmp_min_ply: usize,
     // limits / time management (used by the main thread)
@@ -335,48 +339,66 @@ fn atomic_table(len: usize, fill: i16) -> Box<[AtomicI16]> {
 /// pawn histories and the pawn, minor-piece and non-pawn correction histories.
 /// With `SHARED_HISTORY` off each thread gets its own copy.
 pub struct SharedHist {
+    /// Continuation history, `[in check][capture][piece-to of the earlier move][piece-to]`.
     cont_hist: Box<[AtomicI16]>,
+    /// Stand-in row for a missing earlier move (Stockfish's sentinel): reads -586
+    /// and is never written.
+    cont_sentinel: Box<[AtomicI16]>,
     /// Indexed by pawn structure, piece and destination.
     pawn_hist: Box<[AtomicI16]>,
+    pawn_mask: usize,
     /// `[stm][key]`
     pawn_corr: Box<[AtomicI16]>,
     /// Correction by knight and bishop placement, `[stm][key]`.
     minor_corr: Box<[AtomicI16]>,
     /// `[color][stm][key]`
     nonpawn_corr: Box<[AtomicI16]>,
+    corr_size: usize,
 }
 
+/// Stockfish's starting values.
+const CONT_HIST_FILL: i16 = -586;
+const PAWN_HIST_FILL: i16 = -1338;
+const CORR_FILL: i16 = -5;
+
 impl SharedHist {
-    pub fn new() -> SharedHist {
+    /// Tables sized for `threads` threads, as Stockfish sizes its shared ones.
+    pub fn new(threads: usize) -> SharedHist {
+        let scale = threads.max(1).next_power_of_two();
+        let pawn_entries = PAWN_HIST_SIZE * scale;
+        let corr_size = CORR_SIZE * scale;
         SharedHist {
-            cont_hist: atomic_table(1024 * 1024, -586),
-            pawn_hist: atomic_table(PAWN_HIST_SIZE * 1024, 5),
-            pawn_corr: atomic_table(2 * CORR_SIZE, 0),
-            minor_corr: atomic_table(2 * CORR_SIZE, 0),
-            nonpawn_corr: atomic_table(4 * CORR_SIZE, 0),
+            cont_hist: atomic_table(4 * 1024 * 1024, CONT_HIST_FILL),
+            cont_sentinel: atomic_table(1024, CONT_HIST_FILL),
+            pawn_hist: atomic_table(pawn_entries * 1024, PAWN_HIST_FILL),
+            pawn_mask: pawn_entries - 1,
+            pawn_corr: atomic_table(2 * corr_size, CORR_FILL),
+            minor_corr: atomic_table(2 * corr_size, CORR_FILL),
+            nonpawn_corr: atomic_table(4 * corr_size, CORR_FILL),
+            corr_size,
         }
     }
 
     fn clear(&self) {
         let fill = |t: &[AtomicI16], v: i16| t.iter().for_each(|e| e.store(v, Relaxed));
-        fill(&self.cont_hist, -586);
-        fill(&self.pawn_hist, 5);
-        fill(&self.pawn_corr, 0);
-        fill(&self.minor_corr, 0);
-        fill(&self.nonpawn_corr, 0);
+        fill(&self.cont_hist, CONT_HIST_FILL);
+        fill(&self.pawn_hist, PAWN_HIST_FILL);
+        fill(&self.pawn_corr, CORR_FILL);
+        fill(&self.minor_corr, CORR_FILL);
+        fill(&self.nonpawn_corr, CORR_FILL);
     }
 
     #[inline(always)]
     fn pawn_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
-        &self.pawn_corr[stm * CORR_SIZE + key as usize % CORR_SIZE]
+        &self.pawn_corr[stm * self.corr_size + (key as usize & (self.corr_size - 1))]
     }
     #[inline(always)]
     fn minor_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
-        &self.minor_corr[stm * CORR_SIZE + key as usize % CORR_SIZE]
+        &self.minor_corr[stm * self.corr_size + (key as usize & (self.corr_size - 1))]
     }
     #[inline(always)]
     fn nonpawn_corr(&self, color: usize, stm: usize, key: u64) -> &AtomicI16 {
-        &self.nonpawn_corr[(color * 2 + stm) * CORR_SIZE + key as usize % CORR_SIZE]
+        &self.nonpawn_corr[(color * 2 + stm) * self.corr_size + (key as usize & (self.corr_size - 1))]
     }
 }
 
@@ -391,11 +413,23 @@ fn score_to_tt(s: i32, ply: usize) -> i32 {
     }
 }
 
+/// Stockfish's value_from_tt: mate and tablebase scores that the 50-move rule
+/// could overtake are downgraded to the largest non-decisive bound.
 #[inline(always)]
-fn score_from_tt(s: i32, ply: usize) -> i32 {
+fn score_from_tt(s: i32, ply: usize, rule50: u8) -> i32 {
+    if s == NONE {
+        return NONE;
+    }
+    let r50 = rule50 as i32;
     if s >= MATE_BOUND {
+        if (s >= MATE_IN_MAX && MATE - s > 100 - r50) || TB_WIN - s > 100 - r50 {
+            return MATE_BOUND - 1;
+        }
         s - ply as i32
     } else if s <= -MATE_BOUND {
+        if (s <= -MATE_IN_MAX && MATE + s > 100 - r50) || TB_WIN + s > 100 - r50 {
+            return -MATE_BOUND + 1;
+        }
         s + ply as i32
     } else {
         s
@@ -528,6 +562,7 @@ impl Picker {
     }
 
     /// Is the move just returned one of the captures that passed the exchange test?
+    #[allow(dead_code)]
     #[inline(always)]
     fn in_good_captures(&self) -> bool {
         self.stage == Stage::GoodCapture
@@ -551,12 +586,9 @@ impl Picker {
         generate(pos, &mut list, true, false);
         for (i, &m) in list.as_slice().iter().enumerate() {
             let pc = pos.board[m.from()] as usize;
-            let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
-            let mut v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
-            if m.is_promo() && m.promo_type() != QUEEN {
-                // Under-promotions never pass the good-capture test.
-                v -= 1 << 24;
-            }
+            // En passant lands on an empty square: no victim, as in Stockfish.
+            let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
+            let v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
             self.buf[at + i].write(Ext { m, v, hist: 0 });
         }
         at + list.len
@@ -569,7 +601,9 @@ impl Picker {
         let us = pos.stm;
         let them = us ^ 1;
         let occ = pos.occ();
-        let detailed = self.depth > 1;
+        // Enemy sliders see through our king (Stockfish's threat squares).
+        let occ_no_king = occ ^ bit(pos.king_sq(us));
+        let detailed = true;
 
         // Squares attacked by enemy pieces of lesser value than the mover.
         let mut lesser = [0u64; 8];
@@ -588,11 +622,11 @@ impl Picker {
             }
             let mut b = pos.pieces(them, BISHOP);
             while b != 0 {
-                minor_att |= bishop_attacks(pop_lsb(&mut b), occ);
+                minor_att |= bishop_attacks(pop_lsb(&mut b), occ_no_king);
             }
             let mut b = pos.pieces(them, ROOK);
             while b != 0 {
-                rook_att |= rook_attacks(pop_lsb(&mut b), occ);
+                rook_att |= rook_attacks(pop_lsb(&mut b), occ_no_king);
             }
             lesser[KNIGHT] = pawn_att;
             lesser[BISHOP] = pawn_att;
@@ -608,23 +642,14 @@ impl Picker {
             checks[QUEEN] = checks[BISHOP] | checks[ROOK];
         }
 
-        let cont_slice = |back: usize| -> Option<&[AtomicI16]> {
-            if ply >= back {
-                let c = s.ss[ply - back].cont;
-                if c != NO_CONT {
-                    let base = c * 1024;
-                    return Some(&s.hist.cont_hist[base..base + 1024]);
-                }
-            }
-            None
-        };
+        let cont_slice = |back: usize| -> Option<&[AtomicI16]> { Some(s.cont_row(ply, back)) };
         let c1 = cont_slice(1);
         let c2 = cont_slice(2);
         let c3 = cont_slice(3);
         let c4 = cont_slice(4);
         let c6 = cont_slice(6);
 
-        let pawn_base = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024;
+        let pawn_base = s.pawn_hist_base(pos);
         let killers = s.ss[ply].killers;
         let counter = s.counter_move(ply);
         for (i, &m) in list.as_slice().iter().enumerate() {
@@ -679,8 +704,8 @@ impl Picker {
         let mut list = MoveList::new();
         generate(pos, &mut list, true, true);
         for (i, &m) in list.as_slice().iter().enumerate() {
-            let v = if m.is_capture() {
-                let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
+            let v = if m.is_capture_stage() {
+                let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
                 PIECE_VALUE[victim] + (1 << 28)
             } else {
                 let idx = pos.board[m.from()] as usize * 64 + m.to();
@@ -872,7 +897,6 @@ impl Searcher {
             threads,
             tt,
             shared,
-            lmr: lmr_table(),
             nnue: NnueState::new(net, MAX_PLY + 8),
             pos: vec![Position::empty(); MAX_PLY + 8],
             ss: vec![
@@ -889,6 +913,9 @@ impl Searcher {
                     reduction: 0,
                     stat_score: 0,
                     follow_pv: false,
+                    tt_pv: false,
+                    prior_nmp_fail_high: 0,
+                    cont_block: 0,
                 };
                 MAX_PLY + 8
             ],
@@ -900,7 +927,7 @@ impl Searcher {
             hist,
             low_ply_hist: vec![[102i16; 4096]; LOW_PLY_SIZE].into_boxed_slice().try_into().unwrap(),
             counter: vec![Move::NONE; 1024],
-            cont_corr: vec![0; 1024 * 1024],
+            cont_corr: vec![5; 1024 * 1024],
             tt_move_hist: 0,
             optimism: [0; 2],
             root_depth: 1,
@@ -916,6 +943,15 @@ impl Searcher {
             stopped: false,
             completed_depth: 0,
             root_excluded: Vec::new(),
+            root_move: Move::NONE,
+            pv_idx: 0,
+            root_stats: Vec::new(),
+            search_again: 0,
+            fail_high_recovery: 0,
+            orig_time_adjust: -1.0,
+            time_managed: false,
+            movetime: None,
+            avg_score: -INF,
             root_nodes: vec![0u64; 4096].into_boxed_slice().try_into().unwrap(),
             nmp_min_ply: 0,
             limits: Limits::default(),
@@ -945,11 +981,12 @@ impl Searcher {
             self.hist.clear();
         }
         self.counter.fill(Move::NONE);
-        self.cont_corr.fill(0);
+        self.cont_corr.fill(5);
         self.tt_move_hist = 0;
         self.prev_time_reduction = 0.85;
         self.prev_avg_score = NONE;
         self.prev_best_score = NONE;
+        self.orig_time_adjust = -1.0;
     }
 
     /// Static evaluation of `pos` (not in check), for the `eval` command.
@@ -988,6 +1025,8 @@ impl Searcher {
         self.best_pv.clear();
         self.root_nodes.fill(0);
         self.low_ply_hist.iter_mut().for_each(|a| a.fill(102));
+        // Stockfish decays the move history at the start of every search.
+        self.butterfly.iter_mut().flatten().for_each(|h| *h = (*h as i32 * 729 / 1024) as i16);
         for s in self.ss.iter_mut() {
             s.mv = Move::NONE;
             s.cont = NO_CONT;
@@ -1002,39 +1041,55 @@ impl Searcher {
         self.start = limits.received.unwrap_or_else(Instant::now);
         self.soft_ms = u64::MAX;
         self.hard_ms = u64::MAX;
+        self.time_managed = false;
+        self.movetime = limits.movetime;
         let us = root.stm;
-        if let Some(mt) = limits.movetime {
-            let t = mt.saturating_sub(overhead).max(1);
-            self.soft_ms = t;
-            self.hard_ms = t;
-        } else if let Some(time) = limits.time[us] {
+        // Stockfish's TimeManagement::init.
+        if let Some(time) = limits.time[us].filter(|&t| t > 0) {
+            self.time_managed = true;
             let t = time as f64;
             let inc = limits.inc[us] as f64;
-            let move_overhead = overhead as f64;
-            let ply = game_keys.len().saturating_sub(1).min(50) as f64;
-            let centi_mtg = limits.movestogo.map_or(5051.0, |m| (m.max(1) as f64 * 100.0).min(5000.0));
-            let time_left =
-                (t + inc * (centi_mtg - 100.0) / 100.0 - move_overhead * (2.0 + centi_mtg / 100.0)).max(1.0);
-            let (opt_scale, max_scale) = match limits.movestogo {
-                Some(_) => (
-                    ((0.88 + ply / 116.4) / (centi_mtg / 100.0)).min(0.88 * t / time_left),
-                    1.3 + 0.11 * (centi_mtg / 100.0),
-                ),
-                None => (
-                    (0.0084 + (ply + 3.0).sqrt() * 0.0042).min(0.213 * t / time_left),
-                    (4.0 + ply / 12.0).min(6.67),
-                ),
-            };
-            let soft = opt_scale * time_left;
-            let mut hard = (0.851 * t - move_overhead).min(max_scale * soft);
-            // Short of time, keep a wider reserve: the engine, GUI and OS can all
+            let overhead = overhead as f64;
+            let ply = (2 * (root.fullmove as i64 - 1) + (us == BLACK) as i64) as f64;
+            let mut mtg = limits.movestogo.map_or(50, |m| m.min(50)) as f64;
+            if t < 1000.0 && limits.movestogo.is_none() {
+                mtg = (t * 0.05).floor();
+            }
+            let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
+            let (mut opt_scale, max_scale);
+            if limits.movestogo.is_none() {
+                if self.orig_time_adjust < 0.0 {
+                    self.orig_time_adjust = 0.3272 * time_left.log10() - 0.4141;
+                }
+                let log_t = (t / 1000.0).log10();
+                let opt_c = (0.0029869 + 0.00033554 * log_t).min(0.004905);
+                let max_c = (3.3744 + 3.0608 * log_t).max(3.1441);
+                opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_c).min(0.19404 * t / time_left)
+                    * self.orig_time_adjust;
+                max_scale = (max_c + ply / 12.352).min(6.873);
+            } else {
+                opt_scale = ((0.88 + ply / 116.4) / mtg).min(0.88 * t / time_left);
+                max_scale = 1.3 + 0.11 * mtg;
+            }
+            // Behind on the clock, plan less time.
+            if limits.movestogo != Some(1) {
+                let theirs = limits.time[us ^ 1].unwrap_or(0) as f64;
+                let advantage = (t - theirs) / (1.0 + t + theirs);
+                opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
+            }
+            let mut soft = (opt_scale * time_left).max(1.0);
+            let mut hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
+            // Esper's reserve when short of time: the engine, GUI and OS can all
             // stall for a few milliseconds, and losing on time costs the game.
             if t < 1000.0 {
-                hard = hard.min(0.5 * t - move_overhead);
+                hard = hard.min(0.5 * t - overhead);
             }
-            hard = hard.min(t - 2.0 * move_overhead);
-            self.hard_ms = (hard.max(1.0)) as u64;
-            self.soft_ms = (soft.max(1.0) as u64).min(self.hard_ms);
+            hard = hard.min(t - 2.0 * overhead).max(1.0);
+            if limits.ponder_option {
+                soft += soft / 4.0;
+            }
+            self.hard_ms = hard as u64;
+            self.soft_ms = (soft as u64).min(self.hard_ms).max(1);
         }
     }
 
@@ -1153,6 +1208,7 @@ impl Searcher {
         (2 * p + w + b) / 512
     }
 
+    #[allow(dead_code)]
     fn update_correction(&mut self, pos: &Position, diff: i32, depth: i32) {
         let stm = pos.stm;
         let w = (depth + 1).min(16);
@@ -1167,18 +1223,33 @@ impl Searcher {
         upd(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
     }
 
+    /// The continuation-history row of the move made `back` plies before `ply`,
+    /// or the never-updated sentinel row when there is no such move.
     #[inline(always)]
-    fn cont_score(&self, ply: usize, back: usize, idx: usize) -> i32 {
+    fn cont_row(&self, ply: usize, back: usize) -> &[AtomicI16] {
         if ply >= back {
-            let c = self.ss[ply - back].cont;
-            if c != NO_CONT {
-                return ld(&self.hist.cont_hist[c * 1024 + idx]);
+            let e = &self.ss[ply - back];
+            if e.cont != NO_CONT {
+                let base = (e.cont_block * 1024 + e.cont) * 1024;
+                return &self.hist.cont_hist[base..base + 1024];
             }
         }
-        0
+        &self.hist.cont_sentinel
+    }
+
+    #[inline(always)]
+    fn cont_score(&self, ply: usize, back: usize, idx: usize) -> i32 {
+        ld(&self.cont_row(ply, back)[idx])
+    }
+
+    /// Start of the pawn-history row for `pos`'s pawn structure.
+    #[inline(always)]
+    fn pawn_hist_base(&self, pos: &Position) -> usize {
+        (pos.pawn_key as usize & self.hist.pawn_mask) * 1024
     }
 
     /// History score of a quiet move as used by pruning and reductions.
+    #[allow(dead_code)]
     #[inline]
     fn quiet_score(&self, ply: usize, pos: &Position, m: Move) -> i32 {
         let idx = pos.board[m.from()] as usize * 64 + m.to();
@@ -1199,7 +1270,8 @@ impl Searcher {
             if ply >= back {
                 let c = self.ss[ply - back].cont;
                 if c != NO_CONT {
-                    let e = &self.hist.cont_hist[c * 1024 + idx];
+                    let base = (self.ss[ply - back].cont_block * 1024 + c) * 1024;
+                    let e = &self.hist.cont_hist[base + idx];
                     if ld(e) > 0 {
                         positive += 1;
                     }
@@ -1217,7 +1289,7 @@ impl Searcher {
         }
         let idx = pos.board[m.from()] as usize * 64 + m.to();
         self.update_cont(ply, pos.in_check(), idx, bonus * 750 / 1024);
-        let pawn_idx = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + idx;
+        let pawn_idx = self.pawn_hist_base(&pos) + idx;
         let scale = if bonus > -4 { 1104 } else { 459 };
         hist_update_at(&self.hist.pawn_hist[pawn_idx], bonus * scale / 1024, PAWN_HIST_LIMIT);
     }
@@ -1243,6 +1315,7 @@ impl Searcher {
         let pc = self.pos[ply].board[m.from()] as usize;
         self.ss[ply].mv = m;
         self.ss[ply].cont = pc * 64 + m.to();
+        self.ss[ply].cont_block = 2 * self.pos[ply].in_check() as usize + m.is_capture_stage() as usize;
         self.pos[ply + 1] = self.pos[ply].make(m);
         let key = self.pos[ply + 1].key;
         self.tt.prefetch(key);
@@ -1266,22 +1339,18 @@ impl Searcher {
     /// Before a deep hash cutoff, check that the position after the hash move
     /// agrees: its own entry must not contradict the cutoff. This guards against
     /// scores carried over from transpositions with a different history.
-    fn tt_cutoff_confirmed(&self, pos: &Position, tt_move: Move, tt_score: i32, beta: i32, depth: i32, ply: usize) -> bool {
+    fn tt_cutoff_confirmed(&self, pos: &Position, tt_move: Move, tt_score: i32, beta: i32, depth: i32) -> bool {
         if depth < 7 || tt_move.is_none() || tt_score.abs() >= MATE_BOUND || !pos.is_legal(tt_move) {
             return true;
         }
-        let next_key = pos.key_after(tt_move);
-        match self.tt.probe(next_key) {
-            None => true,
-            Some(t) => {
-                let s = score_from_tt(t.score, ply + 1);
-                (tt_score >= beta) == (-s >= beta)
-            }
+        match self.tt.probe(pos.key_after(tt_move)) {
+            Some(t) if t.bound != 0 && t.score != NONE => (tt_score >= beta) == (-t.score >= beta),
+            _ => true,
         }
     }
 
     /// Futility and exchange pruning for a capture in the move loop.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     #[inline]
     fn prune_capture(
         &self,
@@ -1352,7 +1421,7 @@ impl Searcher {
         while i <= end && i <= cur {
             if self.keys[cur - i] == pos.key {
                 // A single repetition inside the search tree is enough.
-                if i <= ply {
+                if i < ply {
                     return DrawState::Draw;
                 }
                 reps += 1;
@@ -1367,7 +1436,7 @@ impl Searcher {
 
     #[inline(always)]
     fn draw_score(&self) -> i32 {
-        1 - (self.nodes & 2) as i32
+        -1 + (self.nodes & 2) as i32
     }
 
     fn check_time(&mut self) {
@@ -1375,14 +1444,17 @@ impl Searcher {
         if self.tb_cardinality > 0 {
             self.shared.tb_hits[self.id].0.store(self.tb_hits, Relaxed);
         }
-        if self.shared.stop.0.load(Relaxed) && (self.id != 0 || self.completed_depth > 0) {
+        if self.shared.stop.0.load(Relaxed) {
             self.stopped = true;
             return;
         }
         if self.id != 0 || self.completed_depth == 0 || self.shared.pondering.0.load(Relaxed) {
             return;
         }
-        let mut stop = self.hard_ms != u64::MAX && self.start.elapsed().as_millis() as u64 >= self.hard_ms;
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        let mut stop = (self.time_managed && elapsed > self.hard_ms)
+            || self.movetime.is_some_and(|mt| elapsed >= mt)
+            || self.shared.stop_on_ponderhit.0.load(Relaxed);
         if let Some(n) = self.limits.nodes {
             stop |= self.shared.total_nodes(self.threads) >= n;
         }
@@ -1408,9 +1480,8 @@ impl Searcher {
         }
         let pos = self.pos[ply];
         let in_check = pos.checkers != 0;
-        let draw = self.is_draw(ply);
-        if draw == DrawState::Draw {
-            return self.draw_score();
+        if self.is_draw(ply) == DrawState::Draw {
+            return 0;
         }
         if ply >= MAX_PLY {
             return if in_check { 0 } else { self.evaluate(ply) };
@@ -1424,14 +1495,18 @@ impl Searcher {
 
         let tte = self.tt.probe(pos.key);
         let mut tt_move = Move::NONE;
-        let mut tt_pv = pv_node;
+        let mut tt_score = NONE;
+        let tt_pv = tte.is_some_and(|t| t.pv);
         if let Some(t) = tte {
-            let s = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply) };
-            if !pv_node && draw != DrawState::NearRep && t.bound & (if s >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0 {
-                return s;
+            tt_score = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply, pos.rule50) };
+            if !pv_node
+                && t.depth >= 0
+                && tt_score != NONE
+                && t.bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
+            {
+                return tt_score;
             }
             tt_move = t.mv;
-            tt_pv |= t.pv;
         }
 
         let raw_eval;
@@ -1446,28 +1521,33 @@ impl Searcher {
                 Some(t) if t.eval != NONE => t.eval,
                 _ => self.evaluate(ply),
             };
-            best = (raw_eval + self.correction_at(ply)).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
-            if let Some(t) = tte {
-                let s = score_from_tt(t.score, ply);
-                if s.abs() < MATE_BOUND && t.bound & (if s > best { BOUND_LOWER } else { BOUND_UPPER }) != 0 {
-                    best = s;
-                }
+            let static_eval = (raw_eval + self.correction_at(ply)).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
+            self.ss[ply].static_eval = static_eval;
+            best = static_eval;
+            if tt_score != NONE
+                && tt_score.abs() < MATE_BOUND
+                && tte.is_some_and(|t| t.bound & (if tt_score > best { BOUND_LOWER } else { BOUND_UPPER }) != 0)
+            {
+                best = tt_score;
             }
             if best >= beta {
+                // Lean the stand-pat score toward beta.
+                best = (441 * best + 583 * beta) / 1024;
                 if tte.is_none() {
-                    self.tt.store(pos.key, Move::NONE, score_to_tt(best, ply), raw_eval, 0, BOUND_LOWER, tt_pv);
+                    self.tt.store(pos.key, Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, BOUND_LOWER, false);
                 }
                 return best;
             }
             if best > alpha {
                 alpha = best;
             }
-            futility_base = best + if SF_QSEARCH { tune::T_QsFutBase.get() } else { 180 };
+            futility_base = static_eval + tune::T_QsFutBase.get();
         }
 
         if !(pos.is_pseudo_legal(tt_move) && (in_check || tt_move.is_noisy())) {
             tt_move = Move::NONE;
         }
+        let prev_to = if ply > 0 && !self.ss[ply - 1].mv.is_none() { Some(self.ss[ply - 1].mv.to()) } else { None };
         let mut picker = Picker::new(tt_move, !in_check, 0);
         let mut best_move = Move::NONE;
         let mut move_count = 0;
@@ -1480,47 +1560,28 @@ impl Searcher {
                 continue;
             }
             move_count += 1;
-            if SF_QSEARCH && best > -MATE_BOUND && !in_check {
-                // Late captures, futility and exchange tests, except for checks,
-                // recaptures and promotions.
-                let recapture = ply > 0 && !self.ss[ply - 1].mv.is_none() && m.to() == self.ss[ply - 1].mv.to();
-                if !m.is_promo() && !recapture && !pos.gives_check(m) {
+            if best > -MATE_BOUND {
+                let gives_check = pos.gives_check(m);
+                if !gives_check && Some(m.to()) != prev_to && futility_base > -MATE_BOUND && !m.is_promo() {
                     if move_count > 2 {
                         continue;
                     }
-                    let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
+                    let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
                     let fut = futility_base + PIECE_VALUE[victim];
                     if fut <= alpha {
                         best = best.max(fut);
                         continue;
                     }
-                    let see_thresh = (alpha - futility_base) * 100 / NORMALIZE_PAWN;
-                    if !pos.see_ge(m, see_thresh.max(-36)) {
-                        if see_thresh >= -36 || !pos.see_ge(m, see_thresh) {
-                            best = best.max(alpha.min(futility_base));
-                        }
+                    // Stockfish's exchange threshold, in its units of 208 per pawn.
+                    if !pos.see_ge(m, (alpha - futility_base) * 100 / 208) {
+                        best = best.max(alpha.min(futility_base));
                         continue;
                     }
-                } else if !pos.see_ge(m, -36) {
+                }
+                if !m.is_capture_stage() {
                     continue;
                 }
-            } else if best > -MATE_BOUND {
-                if in_check {
-                    // Once an evasion holds, don't bother with quiet ones.
-                    if !m.is_noisy() {
-                        break;
-                    }
-                } else {
-                    if !m.is_promo() {
-                        let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
-                        let fut = futility_base + SEE_VALUE[victim] * 2;
-                        if fut <= alpha {
-                            best = best.max(fut);
-                            continue;
-                        }
-                    }
-                }
-                if !pos.see_ge(m, -80) {
+                if !pos.see_ge(m, -74 * 100 / 208) {
                     continue;
                 }
             }
@@ -1535,20 +1596,31 @@ impl Searcher {
                 if score > alpha {
                     best_move = m;
                     if score >= beta {
-                        self.ss[ply].cutoff_cnt += 1;
                         break;
                     }
                     alpha = score;
                 }
             }
         }
-        if in_check && move_count == 0 {
-            return -MATE + ply as i32;
+        if move_count == 0 {
+            if in_check {
+                return -MATE + ply as i32;
+            }
+            // Stalemate after a capture of a piece, with nothing left that can move.
+            let us = pos.stm;
+            let pushes = if us == WHITE { pos.pieces(us, PAWN) << 8 } else { pos.pieces(us, PAWN) >> 8 } & !pos.occ();
+            let captured_piece = ply >= 1
+                && self.ss[ply - 1].mv.is_capture()
+                && piece_type(self.pos[ply - 1].board[self.ss[ply - 1].mv.to()]) >= KNIGHT;
+            if pushes == 0 && !pos.has_non_pawn_material(us) && captured_piece && !has_legal_move(&pos) {
+                best = 0;
+            }
+        }
+        if best.abs() < MATE_BOUND && best > beta {
+            best = (462 * best + 562 * beta) / 1024;
         }
         let bound = if best >= beta { BOUND_LOWER } else { BOUND_UPPER };
-        if best >= beta || tte.is_none() {
-            self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
-        }
+        self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
         best
     }
 
@@ -1580,7 +1652,7 @@ impl Searcher {
             }
             near_rep = draw == DrawState::NearRep;
             if ply >= MAX_PLY {
-                return if in_check { 0 } else { self.evaluate(ply) };
+                return if in_check { self.draw_score() } else { self.evaluate(ply) };
             }
             alpha = alpha.max(-MATE + ply as i32);
             beta = beta.min(MATE - ply as i32 - 1);
@@ -1598,14 +1670,16 @@ impl Searcher {
         let all_node = !pv_node && !cut_node;
         let prior_reduction = if ply > 0 { std::mem::take(&mut self.ss[ply - 1].reduction) } else { 0 };
         self.ss[ply].stat_score = 0;
+        self.ss[ply + 1].prior_nmp_fail_high = 0;
         self.ss[ply].follow_pv = root
             || (self.ss[ply - 1].follow_pv
                 && ply - 1 < self.best_pv.len()
                 && self.ss[ply - 1].mv == self.best_pv[ply - 1]);
 
         let excluded = self.ss[ply].excluded;
-        // Check extension
-        if in_check
+        // Esper's old check extension; Stockfish has none.
+        if SF_CHECK_EXT
+            && in_check
             && !root
             && excluded.is_none()
             && (!cut_node || depth <= 10)
@@ -1613,24 +1687,37 @@ impl Searcher {
         {
             depth += 1;
         }
-        let tte = if excluded.is_none() { self.tt.probe(pos.key) } else { None };
-        if excluded.is_none() {
-            self.ss[ply].tt_hit = tte.is_some();
+        depth = depth.min(MAX_PLY as i32 - 1);
+        self.ss[ply + 2].cutoff_cnt = 0;
+        // NearRep (Esper's own) blocks hash cutoffs one repetition early; Stockfish
+        // relies on its draw detection alone.
+        if SF_PARITY {
+            near_rep = false;
         }
+
+        // The hash table is probed in singular (excluded-move) searches too; only the
+        // cutoff is skipped there, and the PV flag carries over from the outer visit.
+        let tte = self.tt.probe(pos.key);
+        self.ss[ply].tt_hit = tte.is_some();
         let mut tt_move = Move::NONE;
         let mut tt_score = NONE;
         let mut tt_depth = -1;
         let mut tt_bound = 0;
-        let mut tt_pv = pv_node;
+        let mut tt_pv = if excluded.is_none() { pv_node || tte.is_some_and(|t| t.pv) } else { self.ss[ply].tt_pv };
         if let Some(t) = tte {
-            tt_score = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply) };
+            tt_score = if t.bound == 0 { NONE } else { score_from_tt(t.score, ply, pos.rule50) };
             tt_depth = t.depth;
             tt_bound = t.bound;
-            tt_pv |= t.pv;
             if pos.is_pseudo_legal(t.mv) {
                 tt_move = t.mv;
             }
         }
+        // At the root the move to try first is the previous iteration's best.
+        if root && !self.root_move.is_none() && pos.is_pseudo_legal(self.root_move) {
+            tt_move = self.root_move;
+        }
+        self.ss[ply].tt_pv = tt_pv;
+        let tt_capture = tt_move.is_capture_stage();
 
         // Correction value, computed once per node as Stockfish does.
         let corr_raw = if SF_CORRECTION { self.correction_raw(ply) } else { 0 };
@@ -1645,8 +1732,8 @@ impl Searcher {
             static_eval = if SF_EVAL_STORE && ply >= 2 { self.ss[ply - 2].static_eval } else { NONE };
             eval = static_eval;
         } else if !excluded.is_none() {
-            raw_eval = NONE;
             static_eval = self.ss[ply].static_eval;
+            raw_eval = static_eval;
             eval = static_eval;
         } else {
             raw_eval = match tte {
@@ -1655,12 +1742,12 @@ impl Searcher {
             };
             // Save the evaluation for the next visit even if nothing else gets stored.
             if SF_EVAL_STORE && tte.is_none() {
-                self.tt.store(pos.key, Move::NONE, NONE, raw_eval, 0, 0, tt_pv);
+                self.tt.store(pos.key, Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, 0, tt_pv);
             }
             let corr = if SF_CORRECTION { corr_raw / 131072 } else { self.correction(&self.pos[ply]) };
             static_eval = (raw_eval + corr).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
             eval = static_eval;
-            if tte.is_some()
+            if tt_score != NONE
                 && tt_score.abs() < MATE_BOUND
                 && tt_bound & (if tt_score > eval { BOUND_LOWER } else { BOUND_UPPER }) != 0
             {
@@ -1669,12 +1756,23 @@ impl Searcher {
         }
         self.ss[ply].static_eval = static_eval;
 
+        let mut improving = if SF_PARITY {
+            static_eval != NONE && ply >= 2 && self.ss[ply - 2].static_eval != NONE && static_eval > self.ss[ply - 2].static_eval
+        } else {
+            !in_check && {
+                if ply >= 2 && self.ss[ply - 2].static_eval != NONE {
+                    static_eval > self.ss[ply - 2].static_eval
+                } else if ply >= 4 && self.ss[ply - 4].static_eval != NONE {
+                    static_eval > self.ss[ply - 4].static_eval
+                } else {
+                    true
+                }
+            }
+        };
         // Hindsight: a big reduction of the previous move that the evaluation
         // does not support is partly given back; a quiet position loses a ply.
-        let opponent_worsening = static_eval != NONE
-            && ply >= 1
-            && self.ss[ply - 1].static_eval != NONE
-            && static_eval > -self.ss[ply - 1].static_eval;
+        let prev_eval = if ply >= 1 { self.ss[ply - 1].static_eval } else { NONE };
+        let opponent_worsening = static_eval != NONE && (prev_eval == NONE || static_eval > -prev_eval);
         if SF_HINDSIGHT && excluded.is_none() {
             if prior_reduction >= 3 && !opponent_worsening {
                 depth += 1;
@@ -1682,56 +1780,69 @@ impl Searcher {
             if prior_reduction >= 2
                 && depth >= 2
                 && static_eval != NONE
-                && self.ss[ply - 1].static_eval != NONE
-                && static_eval + self.ss[ply - 1].static_eval > 166
+                && prev_eval != NONE
+                && static_eval + prev_eval > 166
             {
                 depth -= 1;
             }
         }
 
+        // Hash cutoff (Stockfish's step 6): with enough depth, update the
+        // histories as for a cutoff, then return unless the 50-move rule is near or
+        // the position after the hash move disagrees.
         if !pv_node
+            && excluded.is_none()
             && !near_rep
             && tt_score != NONE
             && if SF_TT_DEPTH { tt_depth > depth - (tt_score <= beta) as i32 } else { tt_depth >= depth }
-            && tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
-            && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
-            && pos.rule50 < if SF_TT_CUTOFF { 96 } else { 90 }
-            && (!SF_TT_CUTOFF || self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth, ply))
         {
-            // Reward the hash move for causing a cutoff again.
-            if tt_score >= beta && !tt_move.is_none() {
-                if !tt_move.is_noisy() {
-                    self.update_quiet(ply, &pos, tt_move, 131 * depth);
-                }
-                // The opponent's early quiet move ran into a known refutation.
-                if ply >= 1 {
-                    let prev = self.ss[ply - 1];
-                    if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.move_count < 5 {
-                        let prev_in_check = self.pos[ply - 1].in_check();
-                        self.update_cont(ply - 1, prev_in_check, prev.cont, -2210);
+            if tt_bound & (if tt_score >= beta { BOUND_LOWER } else { BOUND_UPPER }) != 0
+                && (!SF_TT_CUTOFF || cut_node == (tt_score >= beta) || depth > 4)
+            {
+                if tt_score >= beta && !tt_move.is_none() {
+                    if !tt_capture {
+                        self.update_quiet(ply, &pos, tt_move, 131 * depth);
+                    }
+                    // The opponent's early quiet move ran into a known refutation.
+                    if ply >= 1 {
+                        let prev = self.ss[ply - 1];
+                        if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.move_count < 5 {
+                            let prev_in_check = self.pos[ply - 1].in_check();
+                            self.update_cont(ply - 1, prev_in_check, prev.cont, -2210);
+                        }
                     }
                 }
+                if pos.rule50 < 96 && self.tt_cutoff_confirmed(&pos, tt_move, tt_score, beta, depth) {
+                    return tt_score;
+                }
+            } else if depth > 5 {
+                // Deep enough but bounded the wrong way: let the entry be replaced sooner.
+                self.tt.penalize(pos.key, 1);
             }
-            return tt_score;
         }
 
         // Tablebase probe: an exact win/draw/loss verdict replaces searching.
         let mut tb_floor = -INF;
         let mut tb_ceiling = INF;
+        let pieces = popcount(pos.occ());
         if !root
             && self.tb_cardinality > 0
             && excluded.is_none()
-            && depth >= self.tb.probe_depth
+            && pieces <= self.tb_cardinality
+            && (pieces < self.tb_cardinality || depth >= self.tb.probe_depth)
             && pos.rule50 == 0
             && pos.castling == 0
-            && popcount(pos.occ()) <= self.tb_cardinality
         {
             if let Some(wdl) = tb::probe_wdl(&pos) {
                 self.tb_hits += 1;
-                let (v, bound) = match tb::outcome(wdl, &self.tb) {
-                    1 => (TB_WIN - ply as i32, BOUND_LOWER),
-                    -1 => (-TB_WIN + ply as i32, BOUND_UPPER),
-                    _ => (0, BOUND_EXACT),
+                let draw_score = self.tb.rule50 as i32;
+                let (v, bound) = if wdl < -draw_score {
+                    (-TB_WIN + ply as i32, BOUND_UPPER)
+                } else if wdl > draw_score {
+                    (TB_WIN - ply as i32, BOUND_LOWER)
+                } else {
+                    // Cursed wins and blessed losses score just off zero.
+                    (2 * wdl * draw_score, BOUND_EXACT)
                 };
                 if bound == BOUND_EXACT
                     || (bound == BOUND_LOWER && v >= beta)
@@ -1742,126 +1853,94 @@ impl Searcher {
                     return v;
                 }
                 // In PV nodes keep searching for the line, bounded by the verdict.
-                if bound == BOUND_LOWER {
-                    tb_floor = v;
-                    alpha = alpha.max(v);
-                } else {
-                    tb_ceiling = v;
-                }
-            }
-        }
-
-
-        // The change in static evaluation caused by the opponent's last quiet move
-        // says something about that move's quality.
-        if !in_check && excluded.is_none() && ply >= 1 {
-            let prev = self.ss[ply - 1];
-            if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.static_eval != NONE && !self.pos[ply - 1].in_check() {
-                let diff = (-(prev.static_eval + static_eval)).clamp(-189, 194) + 60;
-                hist_update(&mut self.butterfly[pos.stm ^ 1][prev.mv.from_to()], diff * 11, MAIN_HIST_LIMIT);
-                if tte.is_none() && prev.cont / 64 & 7 != PAWN && !prev.mv.is_promo() {
-                    let i = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + prev.cont;
-                    hist_update_at(&self.hist.pawn_hist[i], diff * 13, PAWN_HIST_LIMIT);
-                }
-            }
-        }
-        let mut improving = !in_check && {
-            if ply >= 2 && self.ss[ply - 2].static_eval != NONE {
-                static_eval > self.ss[ply - 2].static_eval
-            } else if ply >= 4 && self.ss[ply - 4].static_eval != NONE {
-                static_eval > self.ss[ply - 4].static_eval
-            } else {
-                true
-            }
-        };
-        self.ss[ply + 1].killers = [Move::NONE; 2];
-        self.ss[ply + 1].cutoff_cnt = 0;
-        self.ss[ply].double_ext = if ply > 0 { self.ss[ply - 1].double_ext } else { 0 };
-
-        if !pv_node && !in_check && excluded.is_none() {
-            // Reverse futility pruning (static null move)
-            // The static evaluation is least trustworthy when the opponent has a pawn
-            // about to promote, or when this position has been on a principal variation.
-            let their_runners = pos.pieces(pos.stm ^ 1, PAWN)
-                & if pos.stm == WHITE { RANK_2 | RANK_3 } else { RANK_6 | RANK_7 };
-            let rfp_depth = if their_runners != 0 { RFP_RUNNER_DEPTH } else { RFP_MAX_DEPTH };
-            if SF_RFP {
-                if their_runners == 0
-                    && !tt_pv
-                    && depth < if self.seek_mate { 6 } else { 19 }
-                    && eval >= beta
-                    && (tt_move.is_none() || tt_move.is_noisy())
-                    && eval < MATE_BOUND
-                    && beta > -MATE_BOUND
-                {
-                    let mult = (45 + 4 * depth).min(85) - 20 * tte.is_none() as i32;
-                    let margin = if SF_SMALL2 {
-                        mult * depth
-                            - (tune::T_RfpImproving.get() * improving as i32 + 335 * opponent_worsening as i32) * mult / 1024
-                            + corr_raw.abs() / 198435
+                if pv_node {
+                    if bound == BOUND_LOWER {
+                        tb_floor = v;
+                        alpha = alpha.max(v);
                     } else {
-                        mult * depth - tune::T_RfpImproving.get() * improving as i32 * mult / 1024
-                    };
-                    if eval - margin >= beta {
-                        return (661 * beta + 363 * eval) / 1024;
+                        tb_ceiling = v;
                     }
                 }
-            } else if depth <= rfp_depth
-                && !(RFP_SKIP_TT_PV && tt_pv)
-                && eval - (if improving { 80 } else { 60 }) * depth >= beta
-                && eval < MATE_BOUND
-                && beta > -MATE_BOUND
-            {
-                return (eval + beta) / 2;
+            }
+        }
+
+        self.ss[ply + 1].killers = [Move::NONE; 2];
+        self.ss[ply].double_ext = if ply > 0 { self.ss[ply - 1].double_ext } else { 0 };
+
+        // Stockfish skips everything up to the move loop when in check.
+        if !in_check {
+            // The change in static evaluation caused by the opponent's last quiet move
+            // says something about that move's quality.
+            if ply >= 1 {
+                let prev = self.ss[ply - 1];
+                if prev.cont != NO_CONT && !prev.mv.is_capture() && prev.static_eval != NONE && !self.pos[ply - 1].in_check() {
+                    let diff = (-(prev.static_eval + static_eval)).clamp(-189, 194) + 60;
+                    hist_update(&mut self.butterfly[pos.stm ^ 1][prev.mv.from_to()], diff * 11, MAIN_HIST_LIMIT);
+                    if tte.is_none() && prev.cont / 64 & 7 != PAWN && !prev.mv.is_promo() {
+                        let i = self.pawn_hist_base(&pos) + prev.cont;
+                        hist_update_at(&self.hist.pawn_hist[i], diff * 13, PAWN_HIST_LIMIT);
+                    }
+                }
             }
 
             // Razoring
-            if SF_RAZOR {
-                let razor = if SF_RAZOR2 {
-                    all_node && eval < alpha - 342 * depth
-                } else {
-                    eval < alpha - 485 - 280 * depth * depth
-                };
-                if !self.seek_mate && razor {
-                    return self.qsearch(ply, alpha, beta);
-                }
-            } else if depth <= 3 && static_eval + 150 + 125 * depth <= alpha {
-                let v = self.qsearch(ply, alpha, alpha + 1);
-                if v <= alpha {
-                    return v;
+            if all_node && eval < alpha - 342 * depth && !self.seek_mate {
+                return self.qsearch(ply, alpha, beta);
+            }
+
+            // Reverse futility pruning (static null move)
+            let their_runners = pos.pieces(pos.stm ^ 1, PAWN)
+                & if pos.stm == WHITE { RANK_2 | RANK_3 } else { RANK_6 | RANK_7 };
+            if (SF_PARITY || their_runners == 0)
+                && !tt_pv
+                && depth < if self.seek_mate { 6 } else { 19 }
+                && eval >= beta
+                && (tt_move.is_none() || tt_capture)
+                && eval < MATE_BOUND
+                && beta > -MATE_BOUND
+            {
+                let mult = (45 + 4 * depth).min(85) - 20 * tte.is_none() as i32;
+                let margin = mult * depth
+                    - (tune::T_RfpImproving.get() * improving as i32 + 335 * opponent_worsening as i32) * mult / 1024
+                    + corr_raw.abs() / 198435;
+                if eval - margin >= beta {
+                    return (661 * beta + 363 * eval) / 1024;
                 }
             }
 
             // Null move pruning
             let nmp_ok = if SF_NMP {
-                cut_node && static_eval >= beta - 13 * depth - 47 * improving as i32 + 365
+                cut_node
+                    && static_eval + 50 * self.ss[ply].prior_nmp_fail_high >= beta - 13 * depth - 47 * improving as i32 + 365
+                    && beta >= -2000
             } else {
-                depth >= 3 && eval >= beta
+                !pv_node && depth >= 3 && eval >= beta && beta > -MATE_BOUND
             };
             if nmp_ok
+                && excluded.is_none()
                 && ply > 0
                 && !self.ss[ply - 1].mv.is_none()
                 && pos.has_non_pawn_material(pos.stm)
                 && ply >= self.nmp_min_ply
-                && beta > -MATE_BOUND
             {
                 // Total depth taken off the null-move search.
                 let r = if SF_NMP {
-                    7 + depth / 3 + ((static_eval - beta) / 256).max(0)
+                    7 + depth / 3 + ((static_eval - beta) / 256).max(0) - (self.id & 1) as i32
                 } else {
                     1 + 3 + depth / 4 + !improving as i32 + ((eval - beta) / 200).clamp(0, NMP_EVAL_PLIES)
                 };
                 // Searching for a mate, null-move cutoffs are less trustworthy.
-                let r = if self.seek_mate { r - (r - 1) / 2 } else { r };
+                let r = if self.seek_mate { r - r / 2 } else { r };
                 self.make_null(ply);
-                let v = -self.search(ply + 1, -beta, -beta + 1, depth - r, !cut_node);
+                let v = -self.search(ply + 1, -beta, -beta + 1, depth - r, if SF_NMP { false } else { !cut_node });
                 self.unmake();
                 if self.stopped {
                     return 0;
                 }
-                if v >= beta {
-                    let v = if v >= MATE_BOUND { beta } else { v };
-                    if self.nmp_min_ply != 0 || depth < if SF_NMP { 16 } else { 14 } {
+                // Unproven mates and tablebase wins are not returned.
+                if v >= beta && v < MATE_BOUND {
+                    if self.nmp_min_ply != 0 || depth < 16 {
+                        self.ss[ply].prior_nmp_fail_high += 1;
                         return v;
                     }
                     // Verification search at high depth guards against zugzwang.
@@ -1872,53 +1951,60 @@ impl Searcher {
                         return 0;
                     }
                     if verify >= beta {
+                        self.ss[ply].prior_nmp_fail_high += 1;
                         return v;
                     }
                 }
             }
 
-            if SF_SMALL2 {
-                improving |= static_eval >= beta;
+            improving |= static_eval >= beta;
+
+            // Internal iterative reduction
+            if !self.ss[ply].follow_pv && !all_node && depth >= 6 && tt_move.is_none() {
+                depth -= 1;
             }
 
             // ProbCut: a capture that beats beta by a margin at reduced depth
-            let pc_beta = beta + 200 - 48 * improving as i32;
-            if cut_node
-                && depth >= 5
-                && beta.abs() < MATE_BOUND
-                && (tt_move.is_none() || tt_move.is_noisy())
-                && !(tt_depth >= depth - 3 && tt_score != NONE && tt_score < pc_beta)
-            {
-                let see_margin = (pc_beta - static_eval) * 100 / NORMALIZE_PAWN;
-                let tm = if tt_move.is_noisy() { tt_move } else { Move::NONE };
+            let pc_beta = beta + 241 - 64 * improving as i32;
+            if depth >= 3 && beta.abs() < MATE_BOUND && !(tt_score != NONE && tt_score < pc_beta) {
+                // Stockfish's threshold is in its units of 208 per pawn.
+                let see_margin = (pc_beta - static_eval) * 100 / 208;
+                let tm = if tt_capture { tt_move } else { Move::NONE };
+                let pc_depth = depth - if improving { 5 } else { 3 };
                 let mut picker = Picker::new(tm, true, 0);
                 loop {
                     let m = picker.next(self, ply, true);
                     if m.is_none() {
                         break;
                     }
-                    if !pos.is_legal(m) || !pos.see_ge(m, see_margin) {
+                    if m == excluded || !m.is_capture_stage() || !pos.is_legal(m) {
+                        continue;
+                    }
+                    // The hash move skips the exchange test, as in Stockfish's picker.
+                    if m != tm && !pos.see_ge(m, see_margin) {
                         continue;
                     }
                     self.make(ply, m);
                     let mut v = -self.qsearch(ply + 1, -pc_beta, -pc_beta + 1);
-                    if v >= pc_beta {
-                        v = -self.search(ply + 1, -pc_beta, -pc_beta + 1, depth - 4, !cut_node);
+                    if v >= pc_beta && pc_depth > 0 {
+                        v = -self.search(ply + 1, -pc_beta, -pc_beta + 1, pc_depth, !cut_node);
                     }
                     self.unmake();
                     if self.stopped {
                         return 0;
                     }
                     if v >= pc_beta {
-                        self.tt.store(pos.key, m, score_to_tt(v, ply), raw_eval, depth - 3, BOUND_LOWER, tt_pv);
-                        return v;
+                        self.tt.store(pos.key, m, score_to_tt(v, ply), raw_eval, pc_depth + 1, BOUND_LOWER, tt_pv);
+                        if v.abs() < MATE_BOUND {
+                            return v - (pc_beta - beta);
+                        }
                     }
                 }
             }
 
             // Multi-cut: if several of the first moves each refute the node at
             // reduced depth, trust that one of them would at full depth too.
-            if MULTI_CUT && cut_node && depth >= 6 && beta.abs() < MATE_BOUND {
+            if MULTI_CUT && !pv_node && excluded.is_none() && cut_node && depth >= 6 && beta.abs() < MATE_BOUND {
                 let mut picker = Picker::new(tt_move, false, 0);
                 let (mut tried, mut cuts) = (0, 0);
                 while tried < MC_CANDIDATES {
@@ -1946,18 +2032,9 @@ impl Searcher {
             }
         }
 
-        // Internal iterative reduction
-        if SF_IIR2 {
-            if !self.ss[ply].follow_pv && !all_node && depth >= 6 && tt_move.is_none() {
-                depth -= 1;
-            }
-        } else if (depth >= 4 && tt_move.is_none()) || (cut_node && depth >= 6 && tt_depth + 4 <= depth) {
-            depth -= 1;
-        }
-
         // Hash-entry ProbCut: the stored lower bound already beats beta by a wide
         // margin at nearly this depth.
-        if SF_SMALL_PROBCUT && !pv_node && excluded.is_none() && !self.seek_mate {
+        if SF_SMALL_PROBCUT && !self.seek_mate {
             let pc_beta = beta + tune::T_SmallProbCut.get();
             if tt_bound & BOUND_LOWER != 0
                 && tt_depth >= depth - 4
@@ -1970,17 +2047,15 @@ impl Searcher {
             }
         }
 
-        let lmr = self.lmr;
         let mut picker = Picker::new(tt_move, false, depth);
-        let mut best = tb_floor;
+        let mut best = if pv_node { tb_floor } else { -INF };
         let mut best_move = Move::NONE;
         let mut move_count = 0;
         let mut skip_quiets = false;
-        let mut quiets = [Move::NONE; 64];
+        let mut quiets = [Move::NONE; SEARCHED_CAP];
         let mut n_quiets = 0;
-        let mut noisies = [Move::NONE; 32];
+        let mut noisies = [Move::NONE; SEARCHED_CAP];
         let mut n_noisies = 0;
-        let orig_alpha = alpha;
 
         loop {
             let m = picker.next(self, ply, skip_quiets);
@@ -2000,139 +2075,71 @@ impl Searcher {
                 continue;
             }
             move_count += 1;
-            let moves_searched = move_count - 1;
-            let quiet = !m.is_noisy();
-            let good_capture = !quiet && picker.in_good_captures();
-
-            // Late move pruning (checked before history/check lookups)
-            if quiet
-                && !root
-                && !in_check
-                && best > -MATE_BOUND
-                && pos.has_non_pawn_material(pos.stm)
-                && move_count + SF_LMR2 as i32 > (3 + depth * depth) / (2 - improving as i32)
-            {
-                skip_quiets = true;
-                continue;
-            }
-
-            let hist = if quiet {
-                if picker.has_last_hist {
-                    picker.last_hist
-                } else {
-                    self.quiet_score(ply, &pos, m)
-                }
-            } else {
-                let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
-                self.capture_hist[pos.board[m.from()] as usize][m.to()][victim] as i32
-            };
-            let killers = self.ss[ply].killers;
-            let is_killer = quiet && (m == killers[0] || m == killers[1]);
-            let is_counter = quiet && !is_killer && m == self.counter_move(ply);
+            let capture = m.is_capture_stage();
             let gives_check = pos.gives_check(m);
+            let pc = pos.board[m.from()] as usize;
+            let idx = pc * 64 + m.to();
+            // En passant targets an empty square: no victim, as in Stockfish.
+            let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
+            let capt_hist = self.capture_hist[pc][m.to()][victim] as i32;
+            let new_depth_base = depth - 1;
 
-            // Stockfish's reduction, in 1024ths of a ply, and the depth the move
-            // would be searched at, used by the pruning below.
-            let mut r_sf = 0;
-            let mut lmr_depth_sf = 0;
-            if SF_LMR2 {
-                r_sf = sf_reduction(improving, depth, move_count);
-                if pv_node {
-                    r_sf -= 512;
-                }
-                if tt_pv {
-                    r_sf += 929;
-                }
-                lmr_depth_sf = depth - 1 - r_sf / 1024;
+            // Stockfish's reduction, in 1024ths of a ply.
+            let mut r = sf_reduction(improving, depth, move_count);
+            if pv_node {
+                r -= 512;
+            }
+            if tt_pv {
+                r += 929;
             }
 
-            // Move-loop pruning
+            // Shallow-depth pruning
             if !root && best > -MATE_BOUND && pos.has_non_pawn_material(pos.stm) {
-                if SF_LMR2 && quiet && !gives_check {
-                    if !self.ss[ply].follow_pv || !pv_node {
-                        let idx = pos.board[m.from()] as usize * 64 + m.to();
-                        let pawn_idx = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + idx;
-                        let mut history = self.cont_score(ply, 1, idx)
-                            + self.cont_score(ply, 2, idx)
-                            + ld(&self.hist.pawn_hist[pawn_idx]);
-                        // Continuation-history pruning
-                        if history < -4136 * depth {
-                            continue;
-                        }
-                        history += 69 * self.butterfly[pos.stm][m.from_to()] as i32 / 32;
-                        let mut lmr_depth = lmr_depth_sf + history / lmr_divisor(depth);
-                        // Futility pruning: parent node
-                        let fut = static_eval
-                            + tune::T_FutMult.get() * lmr_depth
-                            + tune::T_FutAboveAlpha.get() * (static_eval > alpha) as i32
-                            + tune::T_FutBase.get();
-                        if !in_check && lmr_depth < 12 && fut <= alpha {
-                            if best <= fut && best.abs() < MATE_BOUND && fut < MATE_BOUND {
-                                best = fut;
-                            }
-                            continue;
-                        }
-                        lmr_depth = lmr_depth.max(0);
-                        // SEE pruning (Stockfish's margin is in units of 208 per pawn)
-                        if !pos.see_ge(m, -23 * lmr_depth * lmr_depth * 100 / 208) {
-                            continue;
-                        }
-                    }
-                } else if SF_LMR2 && quiet {
-                    // Checking quiets get the capture-style exchange test below.
-                } else if quiet {
-                    let protected = is_killer || is_counter;
-                    let base = (lmr.0[depth.min(63) as usize][(move_count as usize).min(63)] + 512) >> 10;
-                    let lmr_depth =
-                        (depth - 1 - base + ((hist - QUIET_HIST_CENTRE) / QUIET_HIST_STEP).clamp(-2, 2)).max(0);
-                    if SF_FUTILITY && !in_check && !gives_check {
-                        // Futility on the depth this move would be searched at after
-                        // reductions, adjusted by its history.
-                        let fut = static_eval
-                            + tune::T_FutMult.get() * lmr_depth
-                            + tune::T_FutAboveAlpha.get() * (static_eval > alpha) as i32
-                            + tune::T_FutBase.get();
-                        if lmr_depth < 12 && fut <= alpha {
-                            if best <= fut && fut.abs() < MATE_BOUND {
-                                best = fut;
-                            }
-                            continue;
-                        }
-                    }
-                    // Futility pruning
-                    if !SF_FUTILITY
-                        && depth <= 6
-                        && !in_check
-                        && !gives_check
-                        && !protected
-                        && static_eval + (if improving { 80 } else { 60 }) * depth <= alpha
-                    {
-                        continue;
-                    }
-                    // History pruning
-                    if lmr_depth <= 6 && !protected && hist < -HISTORY_PRUNE_MARGIN * lmr_depth.max(1) {
-                        continue;
-                    }
-                    // SEE pruning
-                    if !pos.see_ge(m, -25 * lmr_depth * lmr_depth) {
-                        continue;
-                    }
-                } else if SF_CAPTURE_PRUNE {
-                    let lmr_depth = if SF_LMR2 {
-                        lmr_depth_sf
-                    } else {
-                        (depth - 1 - ((lmr.0[depth.min(63) as usize][1] + 512) >> 10)).max(0)
-                    };
-                    if self.prune_capture(&pos, m, depth, static_eval, alpha, in_check, gives_check, hist, lmr_depth) {
-                        continue;
-                    }
-                } else if !good_capture && !pos.see_ge(m, -90 * depth) {
-                    continue;
+                // Move-count pruning: later quiet moves are skipped, this one still counts.
+                if move_count >= (3 + depth * depth) / (2 - improving as i32) {
+                    skip_quiets = true;
                 }
-                // Checking quiet moves: the same exchange test as captures.
-                if SF_CAPTURE_PRUNE && quiet && gives_check {
-                    let margin = tune::T_CapSeeMult.get() * depth * 100 / 208;
+                let mut lmr_depth = new_depth_base - r / 1024;
+                if capture || gives_check {
+                    // Futility for captures
+                    if !gives_check && lmr_depth < 8 {
+                        let fut = static_eval
+                            + tune::T_CapFutBase.get()
+                            + tune::T_CapFutMult.get() * lmr_depth
+                            + PIECE_VALUE[victim]
+                            + 134 * capt_hist / 1024;
+                        if static_eval != NONE && fut <= alpha {
+                            continue;
+                        }
+                    }
+                    // Exchange test for captures and checks (Stockfish's units of 208 per pawn).
+                    let margin = (tune::T_CapSeeMult.get() * depth + capt_hist * 34 / 1024) * 100 / 208;
                     if !self.stalemate_sac(&pos, m, alpha) && !pos.see_ge(m, -margin) {
+                        continue;
+                    }
+                } else if !self.ss[ply].follow_pv || !pv_node {
+                    let pawn_idx = self.pawn_hist_base(&pos) + idx;
+                    let mut history =
+                        self.cont_score(ply, 1, idx) + self.cont_score(ply, 2, idx) + ld(&self.hist.pawn_hist[pawn_idx]);
+                    // Continuation-history pruning
+                    if history < -4136 * depth {
+                        continue;
+                    }
+                    history += 69 * self.butterfly[pos.stm][m.from_to()] as i32 / 32;
+                    lmr_depth += history / lmr_divisor(depth);
+                    // Futility pruning: parent node
+                    let fut = static_eval
+                        + tune::T_FutMult.get() * lmr_depth
+                        + tune::T_FutAboveAlpha.get() * (static_eval > alpha) as i32
+                        + tune::T_FutBase.get();
+                    if !in_check && lmr_depth < 12 && fut <= alpha {
+                        if best <= fut && best.abs() < MATE_BOUND && fut < MATE_BOUND {
+                            best = fut;
+                        }
+                        continue;
+                    }
+                    lmr_depth = lmr_depth.max(0);
+                    if !pos.see_ge(m, -23 * lmr_depth * lmr_depth * 100 / 208) {
                         continue;
                     }
                 }
@@ -2140,69 +2147,19 @@ impl Searcher {
 
             // Singular extension: is the hash move much better than everything else?
             let mut ext = 0;
-            if SF_SINGULAR {
-                if !root
-                    && depth >= 6 + tt_pv as i32
-                    && m == tt_move
-                    && excluded.is_none()
-                    && tt_depth >= depth - 3
-                    && tt_bound & BOUND_LOWER != 0
-                    && tt_score.abs() < MATE_BOUND
-                    && !(SF_SHUFFLING && self.is_shuffling(ply, m))
-                    && !self.seek_mate
-                    && ply < 2 * self.completed_depth.max(1) as usize + 4
-                {
-                    let margin = (tune::T_SingularMargin.get() + 66 * (tt_pv && !pv_node) as i32) * depth / 63;
-                    let s_beta = tt_score - margin;
-                    self.ss[ply].excluded = m;
-                    let v = self.search(ply, s_beta - 1, s_beta, (depth - 1) / 2, cut_node);
-                    self.ss[ply].excluded = Move::NONE;
-                    if self.stopped {
-                        return 0;
-                    }
-                    let tt_capture = tt_move.is_noisy();
-                    if v < s_beta {
-                        let corr_adj = corr_raw.abs() / 198368;
-                        let deep = (ply as i32 > self.root_depth) as i32;
-                        let double = tune::T_DoubleExtMargin.get() + 204 * pv_node as i32
-                            - 152 * !tt_capture as i32
-                            - corr_adj
-                            - 1175 * self.tt_move_hist as i32 / 114178
-                            - 38 * deep;
-                        let triple = tune::T_TripleExtMargin.get() + 279 * pv_node as i32 - 188 * !tt_capture as i32
-                            + 81 * tt_pv as i32
-                            - corr_adj
-                            - 43 * deep;
-                        if !pv_node && self.ss[ply].double_ext <= 8 {
-                            ext = 1 + (v < s_beta - double) as i32 + (v < s_beta - triple) as i32;
-                            if ext >= 2 {
-                                self.ss[ply].double_ext += 1;
-                            }
-                        } else {
-                            ext = 1;
-                        }
-                    } else if v >= beta && v.abs() < MATE_BOUND {
-                        // Multi-cut: other moves beat beta too.
-                        hist_update(&mut self.tt_move_hist, -421 - 110 * depth, 8192);
-                        if SF_CORRECTION && !in_check && v > static_eval {
-                            let bonus = ((v - static_eval) * 664 / 1024).clamp(-SF_CORR_LIMIT / 4, SF_CORR_LIMIT / 4);
-                            self.update_correction_sf(ply, bonus);
-                        }
-                        return v;
-                    } else if tt_score >= beta || cut_node {
-                        ext = -3;
-                    }
-                }
-            } else if !root
-                && depth >= 7
+            if !root
                 && m == tt_move
                 && excluded.is_none()
-                && tt_depth >= depth - 3
-                && tt_bound & BOUND_LOWER != 0
+                && depth >= 6 + tt_pv as i32
+                && tt_score != NONE
                 && tt_score.abs() < MATE_BOUND
-                && ply < 2 * self.completed_depth.max(1) as usize + 4
+                && tt_bound & BOUND_LOWER != 0
+                && tt_depth >= depth - 3
+                && !(SF_SHUFFLING && self.is_shuffling(ply, m))
+                && !self.seek_mate
             {
-                let s_beta = tt_score - depth * 2;
+                let margin = (tune::T_SingularMargin.get() + 66 * (tt_pv && !pv_node) as i32) * depth / 63;
+                let s_beta = tt_score - margin;
                 self.ss[ply].excluded = m;
                 let v = self.search(ply, s_beta - 1, s_beta, (depth - 1) / 2, cut_node);
                 self.ss[ply].excluded = Move::NONE;
@@ -2210,189 +2167,112 @@ impl Searcher {
                     return 0;
                 }
                 if v < s_beta {
-                    ext = 1;
-                    if !pv_node && v < s_beta - 30 && self.ss[ply].double_ext <= 8 {
-                        ext = 2;
-                        self.ss[ply].double_ext += 1;
+                    let corr_adj = corr_raw.abs() / 198368;
+                    let deep = (ply as i32 > self.root_depth) as i32;
+                    let double = tune::T_DoubleExtMargin.get() + 204 * pv_node as i32
+                        - 152 * !tt_capture as i32
+                        - corr_adj
+                        - 1175 * self.tt_move_hist as i32 / 114178
+                        - 38 * deep;
+                    let triple = tune::T_TripleExtMargin.get() + 279 * pv_node as i32 - 188 * !tt_capture as i32
+                        + 81 * tt_pv as i32
+                        - corr_adj
+                        - 43 * deep;
+                    ext = 1 + (v < s_beta - double) as i32 + (v < s_beta - triple) as i32;
+                    depth += 1;
+                } else if v >= beta && v.abs() < MATE_BOUND {
+                    // Multi-cut: other moves beat beta too.
+                    hist_update(&mut self.tt_move_hist, -421 - 110 * depth, 8192);
+                    if !in_check && static_eval != NONE && v > static_eval {
+                        let bonus = ((v - static_eval) * 664 / 1024).clamp(-SF_CORR_LIMIT / 4, SF_CORR_LIMIT / 4);
+                        self.update_correction_sf(ply, bonus);
                     }
-                } else if s_beta >= beta {
-                    // Multi-cut: several moves beat beta.
-                    return s_beta;
-                } else if tt_score >= beta {
-                    ext = -2;
-                } else if cut_node {
-                    ext = -1;
+                    return v;
+                } else if tt_score >= beta || cut_node {
+                    ext = -3;
                 }
             }
 
-            self.ss[ply].move_count = move_count;
             // Stockfish's statScore: how well this move has done before.
-            let stat_score = if !quiet {
-                let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
-                873 * PIECE_VALUE[victim] / 128 + hist
+            let stat_score = if capture {
+                let captured = if m.flag() == FLAG_EP { PAWN } else { victim };
+                873 * PIECE_VALUE[captured] / 128 + capt_hist
             } else {
-                let idx = pos.board[m.from()] as usize * 64 + m.to();
                 (2252 * self.butterfly[pos.stm][m.from_to()] as i32
                     + 1126 * self.cont_score(ply, 1, idx)
                     + 1093 * self.cont_score(ply, 2, idx))
                     / 1024
             };
             self.ss[ply].stat_score = stat_score;
+            self.ss[ply].move_count = move_count;
             self.make(ply, m);
             debug_assert_eq!(gives_check, self.pos[ply + 1].checkers != 0);
-            let mut new_depth = depth - 1 + ext;
+            let mut new_depth = new_depth_base + ext;
             let nodes_before = self.nodes;
             let mut score;
 
-            if SF_LMR2 {
-                let mut r = r_sf;
-                // Fewer reductions for positions that have been on a PV.
-                if tt_pv {
-                    r -= 3023
-                        + pv_node as i32 * 1004
-                        + (tt_score != NONE && tt_score > alpha) as i32 * 885
-                        + (tt_depth >= depth) as i32 * (816 + cut_node as i32 * 940);
-                }
-                r += 697;
-                r -= move_count * 65;
-                r -= corr_raw.abs() / 26310;
-                if cut_node {
-                    r += 4026 + 933 * tt_move.is_none() as i32;
-                }
-                if tt_move.is_noisy() {
-                    r += 1079;
-                }
-                let cutoffs = self.ss[ply + 1].cutoff_cnt;
-                if cutoffs > 1 {
-                    r += 264 + 1095 * (cutoffs > 2) as i32 + 1138 * all_node as i32;
-                } else if m == tt_move {
-                    r -= 2179;
-                }
-                r -= stat_score * 439 / 4096;
-                if quiet && alpha.abs() < MATE_BOUND {
-                    r += 3 * (alpha - eval).clamp(-64, 96);
-                }
-                if all_node {
-                    r += r * 276 / (256 * depth + 268);
-                }
-                if SF_SEEK_MATE && self.seek_mate && r > 0 {
-                    r += (if gives_check { -r } else { r }) / 4;
-                }
-                if depth >= 2 && move_count > 1 {
-                    // A negative reduction may extend, but not deep in the tree.
-                    let cap = if (ply as i32) < 2 * self.root_depth { 2 } else { 0 };
-                    let d = (new_depth + (-r / 1024).min(cap)).max(1) + pv_node as i32;
-                    self.ss[ply].reduction = new_depth - d;
-                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
-                    self.ss[ply].reduction = 0;
-                    if score > alpha {
-                        // Re-searching deeper restores the full depth; deep in the tree that
-                        // can chain ply after ply down long shuffling lines, so it is
-                        // bounded like the extensions.
-                        let deeper = d < new_depth && score > best + 53 && (ply as i32) < 2 * self.root_depth;
-                        let shallower = score < best + 8;
-                        new_depth += deeper as i32 - shallower as i32;
-                        if new_depth > d {
-                            score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
-                        }
-                        // The move did better than its late position suggested.
-                        let idx = pos.board[m.from()] as usize * 64 + m.to();
-                        self.update_cont(ply, in_check, idx, 1334);
-                    }
-                } else if !pv_node || move_count > 1 {
-                    // No LMR here, but a very large reduction still costs a ply or two.
-                    if tt_move.is_none() {
-                        r += 1127;
-                    }
-                    let d = new_depth - (r > 5234) as i32 - (r > 5487 && new_depth > 2) as i32;
-                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, !cut_node);
-                } else {
-                    score = alpha + 1;
-                }
-            } else {
-                // Late move reductions: quiets from the second/third move on, captures from the fourth.
-                let do_lmr = if quiet {
-                    depth >= 2 && moves_searched >= 1 + pv_node as i32
-                } else {
-                    depth >= 3 && moves_searched >= 3 + pv_node as i32
-                };
-                if do_lmr {
-                    let base = lmr.0[depth.min(63) as usize][(move_count as usize).min(63)];
-                    let mut r;
-                    if quiet {
-                        r = base;
-                        r += if pv_node { -1024 } else { 1024 };
-                        r += if improving { -1024 } else { 1024 };
-                        r += if tt_pv { -512 } else { 1024 };
-                        if !in_check && static_eval + 150 <= alpha {
-                            r += 1024;
-                        }
-                        if cut_node {
-                            r += if tt_move.is_none() { 1024 } else { 1536 };
-                        }
-                        if !tt_move.is_none() && tt_move.is_noisy() {
-                            r += 1024;
-                        }
-                        if self.ss[ply + 1].cutoff_cnt > 3 {
-                            r += 1024;
-                        }
-                        if is_killer {
-                            r -= 2048;
-                        } else if is_counter {
-                            r -= 1024;
-                        }
-                        r -= ((hist - QUIET_HIST_CENTRE) * 1024 / QUIET_HIST_STEP).clamp(-2048, 2560);
-                    } else {
-                        r = base / 2;
-                        r += if tt_pv { -512 } else { 1024 };
-                        if cut_node {
-                            r += 1024;
-                        }
-                        r -= ((hist - CAPTURE_HIST_CENTRE) * 1024 / CAPTURE_HIST_STEP).clamp(-1024, 1536);
-                        if !good_capture && !pos.see_ge(m, 0) {
-                            r += 1024;
-                        }
-                    }
-                    if in_check {
-                        r -= 1024;
-                    }
-                    if gives_check {
-                        r -= 1024;
-                    }
-                    // When looking for a mate, reduce checks less and other moves more.
-                    if SF_SEEK_MATE && self.seek_mate && r > 0 {
-                        r += (if gives_check { -r } else { r }) / 4;
-                    }
-                    let r_plies = (r + 512) >> 10;
-                    let d = if SF_LMR_EXTEND {
-                        // A negative reduction may extend by 1 ply near the root.
-                        let cap = if (ply as i32) < 2 * self.root_depth { 1 } else { 0 };
-                        (new_depth + (-r_plies).min(cap)).max(1)
-                    } else {
-                        (new_depth - r_plies.max(0)).clamp(1, new_depth.max(1))
-                    };
-                    score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
-                    // A reduced search that fails high is repeated at adjusted full depth.
-                    if score > alpha && d < new_depth {
-                        let do_deeper = score > best + 50 + 2 * new_depth;
-                        let do_shallower = score < best + new_depth;
-                        let re_depth = (new_depth + do_deeper as i32 - do_shallower as i32).max(1);
-                        score = -self.search(ply + 1, -alpha - 1, -alpha, re_depth, !cut_node);
-                        // The move did better than its late position suggested.
-                        let idx = pos.board[m.from()] as usize * 64 + m.to();
-                        self.update_cont(ply, in_check, idx, 1334);
-                    }
-                } else if !pv_node || move_count > 1 {
-                    score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
-                } else {
-                    score = alpha + 1;
-                }
+            // Late move reductions
+            if tt_pv {
+                r -= 3023
+                    + pv_node as i32 * 1004
+                    + (tt_score > alpha) as i32 * 885
+                    + (tt_depth >= depth) as i32 * (816 + cut_node as i32 * 940);
             }
-            if pv_node && (move_count == 1 || (score > alpha && (root || score < beta))) {
-                if SF_SMALL2
-                    && m == tt_move
-                    && ((tt_score != NONE && tt_score.abs() >= MATE_BOUND && tt_depth > 0) || tt_depth > 1)
-                {
+            r += 697;
+            r -= move_count * 65;
+            r -= corr_raw.abs() / 26310;
+            if cut_node {
+                r += 4026 + 933 * tt_move.is_none() as i32;
+            }
+            if tt_capture {
+                r += 1079;
+            }
+            let cutoffs = self.ss[ply + 1].cutoff_cnt;
+            if cutoffs > 1 {
+                r += 264 + 1095 * (cutoffs > 2) as i32 + 1138 * all_node as i32;
+            } else if m == tt_move {
+                r -= 2179;
+            }
+            r -= stat_score * 439 / 4096;
+            if !capture && alpha.abs() < MATE_BOUND {
+                r += 3 * (alpha - eval).clamp(-64, 96);
+            }
+            if all_node {
+                r += r * 276 / (256 * depth + 268);
+            }
+            if self.seek_mate && r > 0 {
+                r += (if gives_check { -r } else { r }) / 4;
+            }
+            if depth >= 2 && move_count > 1 {
+                // A negative reduction may extend, but not deep in the tree.
+                let cap = if (ply as i32) < 2 * self.root_depth { 2 } else { 0 };
+                let d = (new_depth + (-r / 1024).min(cap)).max(1) + pv_node as i32;
+                self.ss[ply].reduction = new_depth - d;
+                score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
+                self.ss[ply].reduction = 0;
+                if score > alpha {
+                    let deeper = d < new_depth && score > best + 53 && (!DEEPER_PLY_GUARD || (ply as i32) < 2 * self.root_depth);
+                    let shallower = score < best + 8;
+                    new_depth += deeper as i32 - shallower as i32;
+                    if new_depth > d {
+                        score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
+                    }
+                    // The move did better than its late position suggested.
+                    self.update_cont(ply, in_check, idx, 1334);
+                }
+            } else if !pv_node || move_count > 1 {
+                // No LMR here, but a very large reduction still costs a ply or two.
+                if tt_move.is_none() {
+                    r += 1127;
+                }
+                let d = new_depth - (r > 5234) as i32 - (r > 5487 && new_depth > 2) as i32;
+                score = -self.search(ply + 1, -alpha - 1, -alpha, d, !cut_node);
+            } else {
+                score = alpha + 1;
+            }
+            if pv_node && (move_count == 1 || score > alpha) {
+                // Extend the hash move rather than drop into qsearch.
+                if m == tt_move && ((tt_score != NONE && tt_score.abs() >= MATE_BOUND && tt_depth > 0) || tt_depth > 1) {
                     new_depth = new_depth.max(1);
                 }
                 score = -self.search(ply + 1, -beta, -alpha, new_depth, false);
@@ -2402,13 +2282,30 @@ impl Searcher {
                 return 0;
             }
             if root {
-                self.root_nodes[m.from_to()] += self.nodes - nodes_before;
+                let n = self.nodes - nodes_before;
+                self.root_nodes[m.from_to()] += n;
+                // Stockfish's effort-weighted moving averages of the root move's score.
+                if let Some(rs) = self.root_stats.iter_mut().find(|r| r.mv == m) {
+                    rs.effort += n;
+                    let e_prev = (rs.effort - n).max(1);
+                    let w = ((32 * n * 2) / (n * 2 + 3 * e_prev)).clamp(12, 24) as i64;
+                    let w_mss = w.min(16);
+                    let v = score as i64;
+                    let v2 = v * v.abs();
+                    rs.avg = if rs.avg == -INF { score } else { ((v * w + rs.avg as i64 * (32 - w)) / 32) as i32 };
+                    rs.mss = if rs.mss == MSS_NONE { v2 } else { (v2 * w_mss + rs.mss * (32 - w_mss)) / 32 };
+                }
             }
 
-            if score > best {
+            // Equal scores late in the tree occasionally count as better (Stockfish).
+            let inc = (score == best
+                && ply as i32 + 2 >= self.root_depth
+                && (self.nodes as i32 & 14) == 0
+                && (score.abs() + 1) < MATE_BOUND) as i32;
+            if score + inc > best {
                 best = score;
-                if score > alpha {
-                    if root && move_count > 1 {
+                if score + inc > alpha {
+                    if root && move_count > 1 && self.pv_idx == 0 {
                         self.shared.best_move_changes.0.fetch_add(1, Relaxed);
                     }
                     best_move = m;
@@ -2420,50 +2317,58 @@ impl Searcher {
                         self.pv_len[ply] = n + 1;
                     }
                     if score >= beta {
-                        self.ss[ply].cutoff_cnt += (!SF_LMR2 || ext < 2 || pv_node) as i32;
+                        self.ss[ply].cutoff_cnt += (ext < 2 || pv_node) as i32;
                         break;
+                    }
+                    // Having raised alpha, search the remaining moves shallower.
+                    if depth > 3 && depth < 12 && score.abs() < MATE_BOUND {
+                        depth -= 3;
                     }
                     alpha = score;
                 }
             }
-            if m != best_move {
-                if quiet {
-                    if n_quiets < quiets.len() {
-                        quiets[n_quiets] = m;
-                        n_quiets += 1;
-                    }
-                } else if n_noisies < noisies.len() {
+            if m != best_move && move_count as usize <= SEARCHED_CAP {
+                if capture {
                     noisies[n_noisies] = m;
                     n_noisies += 1;
+                } else {
+                    quiets[n_quiets] = m;
+                    n_quiets += 1;
                 }
             }
         }
 
+        // A fail high is averaged toward beta.
+        if best >= beta && best.abs() < MATE_BOUND && alpha.abs() < MATE_BOUND {
+            best = (best * depth + beta) / (depth + 1);
+        }
+
         if move_count == 0 {
-            return if !excluded.is_none() {
+            best = if !excluded.is_none() {
                 alpha
             } else if in_check {
                 -MATE + ply as i32
             } else {
                 0
             };
-        }
-
-        if best >= beta {
-            // The more moves had to be tried first, the more the refutation is worth.
-            let prev_stat = if SF_SMALL2 && ply >= 1 { self.ss[ply - 1].stat_score } else { 0 };
+        } else if !best_move.is_none() {
+            // The more moves had to be tried first, the more the best one is worth.
+            let prev_stat = if ply >= 1 { self.ss[ply - 1].stat_score } else { 0 };
             let mut bonus = stat_bonus(depth) + 364 * (best_move == tt_move) as i32 + prev_stat / 28;
-            bonus += bonus * (n_quiets + n_noisies) as i32 / 256;
+            bonus += (bonus * (n_quiets + n_noisies) as i32).div_euclid(256);
             let malus = stat_malus(depth);
-            if !best_move.is_noisy() {
-                let k = &mut self.ss[ply].killers;
-                if k[0] != best_move {
-                    k[1] = k[0];
-                    k[0] = best_move;
-                }
-                if ply >= 1 && self.ss[ply - 1].cont != NO_CONT {
-                    let c = self.ss[ply - 1].cont;
-                    self.counter[c] = best_move;
+            if !best_move.is_capture_stage() {
+                // Killers and the countermove are Esper's own, kept on quiet cutoffs.
+                if best >= beta {
+                    let k = &mut self.ss[ply].killers;
+                    if k[0] != best_move {
+                        k[1] = k[0];
+                        k[0] = best_move;
+                    }
+                    if ply >= 1 && self.ss[ply - 1].cont != NO_CONT {
+                        let c = self.ss[ply - 1].cont;
+                        self.counter[c] = best_move;
+                    }
                 }
                 self.update_quiet(ply, &pos, best_move, bonus * 899 / 1024);
                 // Earlier quiets are penalised most, later ones progressively less.
@@ -2486,67 +2391,62 @@ impl Searcher {
             for &n in &noisies[..n_noisies] {
                 self.update_capture(&pos, n, -malus * 1489 / 1024);
             }
-        }
-
-        // Nothing here beat alpha, so the opponent's previous move did well.
-        if best < beta && best_move.is_none() && excluded.is_none() && ply >= 1 {
+            if !pv_node {
+                hist_update(&mut self.tt_move_hist, if best_move == tt_move { 918 } else { -747 }, 8192);
+            }
+        } else if ply >= 1 {
+            // Nothing here beat alpha, so the opponent's previous move did well.
             let prev = self.ss[ply - 1];
             if prev.cont != NO_CONT && !prev.mv.is_capture() {
                 let prev_in_check = self.pos[ply - 1].in_check();
                 let mut scale = -241 + (59 * depth).min(420) + 186 * (prev.move_count > 9) as i32;
-                if SF_SMALL2 {
-                    scale -= prev.stat_score / 98;
-                }
-                scale += 142 * (!in_check && best <= static_eval - 106) as i32;
+                scale -= prev.stat_score / 98;
+                scale += 142 * (!in_check && static_eval != NONE && best <= static_eval - 106) as i32;
                 scale += 159 * (!prev_in_check && prev.static_eval != NONE && best <= -prev.static_eval - 68) as i32;
                 let scaled = (150 * depth - 85).min(1337) * scale.max(0);
                 self.update_cont(ply - 1, prev_in_check, prev.cont, scaled * 263 / 16384);
                 hist_update(&mut self.butterfly[pos.stm ^ 1][prev.mv.from_to()], scaled * 215 / 32768, MAIN_HIST_LIMIT);
                 if prev.cont / 64 & 7 != PAWN && !prev.mv.is_promo() {
-                    let i = (pos.pawn_key as usize % PAWN_HIST_SIZE) * 1024 + prev.cont;
+                    let i = self.pawn_hist_base(&pos) + prev.cont;
                     hist_update_at(&self.hist.pawn_hist[i], scaled * 324 / 8192, PAWN_HIST_LIMIT);
                 }
             } else if prev.cont != NO_CONT {
                 // A capture: credit it in the capture history.
                 let before = &self.pos[ply - 1];
                 let to = prev.mv.to();
-                let victim = if prev.mv.flag() == FLAG_EP { PAWN } else { piece_type(before.board[to]) };
-                hist_update(&mut self.capture_hist[pos.board[to] as usize][to][victim], 892, CAPTURE_HIST_LIMIT);
+                let captured = if prev.mv.flag() == FLAG_EP { PAWN } else { piece_type(before.board[to]) };
+                hist_update(&mut self.capture_hist[pos.board[to] as usize][to][captured], 892, CAPTURE_HIST_LIMIT);
             }
         }
-        if !pv_node && !best_move.is_none() && excluded.is_none() {
-            hist_update(&mut self.tt_move_hist, if best_move == tt_move { 918 } else { -747 }, 8192);
+        if pv_node {
+            best = best.min(tb_ceiling);
         }
-        best = best.min(tb_ceiling);
-        if excluded.is_none() {
+        // A position that fails low under a PV parent is marked as PV too.
+        if best <= alpha && ply >= 1 {
+            tt_pv |= self.ss[ply - 1].tt_pv;
+            self.ss[ply].tt_pv = tt_pv;
+        }
+        if excluded.is_none() && !(root && self.pv_idx > 0) {
             let bound = if best >= beta {
                 BOUND_LOWER
-            } else if pv_node && best > orig_alpha {
+            } else if pv_node && !best_move.is_none() {
                 BOUND_EXACT
             } else {
                 BOUND_UPPER
             };
-            if SF_CORRECTION {
-                // Update when the result lies on the side of the static eval that the
-                // outcome (a best move or none) says it should.
-                if !in_check
-                    && !(!best_move.is_none() && best_move.is_capture())
-                    && (best > static_eval) == !best_move.is_none()
-                    && best.abs() < MATE_BOUND
-                {
-                    let k = if best_move.is_none() { 18 } else { 12 };
-                    let bonus = ((best - static_eval) * depth * k / 128).clamp(-SF_CORR_LIMIT / 4, SF_CORR_LIMIT / 4);
-                    self.update_correction_sf(ply, 1061 * bonus / 1024);
-                }
-            } else if !in_check
-                && (best_move.is_none() || !best_move.is_noisy())
-                && !(bound == BOUND_LOWER && best <= static_eval)
-                && !(bound == BOUND_UPPER && best >= static_eval)
-                && best.abs() < MATE_BOUND
-            {
-                self.update_correction(&pos, best - static_eval, depth);
-            }
-            self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, depth, bound, tt_pv);
+            let d = if move_count != 0 { depth } else { (depth + 6).min(MAX_PLY as i32 - 1) };
+            self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, d, bound, tt_pv);
+        }
+        // Correction history: update when the result lies on the side of the static
+        // eval that the outcome (a best move or none) says it should.
+        if !in_check
+            && static_eval != NONE
+            && !(!best_move.is_none() && best_move.is_capture())
+            && (best > static_eval) == !best_move.is_none()
+        {
+            let k = if best_move.is_none() { 18 } else { 12 };
+            let bonus = ((best - static_eval) * depth * k / 128).clamp(-SF_CORR_LIMIT / 4, SF_CORR_LIMIT / 4);
+            self.update_correction_sf(ply, 1061 * bonus / 1024);
         }
         best
     }
@@ -2583,6 +2483,10 @@ impl Searcher {
         );
     }
 
+    fn root_stat(&self, m: Move) -> (i32, i64, u64) {
+        self.root_stats.iter().find(|r| r.mv == m).map_or((-INF, MSS_NONE, 0), |r| (r.avg, r.mss, r.effort))
+    }
+
     pub fn iterate(&mut self) {
         let root = self.pos[0];
         let mut root_moves = legal_moves(&root);
@@ -2593,76 +2497,77 @@ impl Searcher {
             return;
         }
         self.best_move = root_moves[0];
+        self.root_stats = root_moves.iter().map(|&mv| RootStat { mv, effort: 0, avg: -INF, mss: MSS_NONE }).collect();
+        self.avg_score = -INF;
         let main = self.id == 0;
         let multipv = if main { self.multipv.min(root_moves.len()).max(1) } else { 1 };
-        let max_depth = self.limits.depth.unwrap_or(MAX_PLY as i32 - 1).clamp(1, MAX_PLY as i32 - 1);
-        let mut prev_scores = vec![0i32; multipv];
-        let mut avg_scores = vec![NONE; multipv];
-        let mut stability = 0u32;
+        // Only the main thread stops at a depth limit; helpers run until told to stop.
+        let max_depth = if main {
+            self.limits.depth.unwrap_or(MAX_PLY as i32 - 1).clamp(1, MAX_PLY as i32 - 1)
+        } else {
+            MAX_PLY as i32 - 1
+        };
+        let mut prev_lines: Vec<Move> = Vec::new();
+        let mut prev_scores = vec![-INF; multipv];
         let mut last_best = Move::NONE;
-        // Time management state (main thread).
         let mut last_best_depth = 0;
         let start_score = if self.prev_best_score == NONE { 0 } else { self.prev_best_score };
         let mut iter_values = [start_score; 4];
         let mut iter_idx = 0;
         let mut time_reduction = 1.0f64;
         let mut tot_changes = 0.0f64;
+        self.search_again = 0;
+        self.fail_high_recovery = 0;
 
-        let start_depth = if !main && max_depth > 1 && self.id % 2 == 1 { 2 } else { 1 };
-        for depth in start_depth..=max_depth {
-            // Helpers skip iterations in a staggered pattern, so the threads spread
-            // over neighbouring depths and feed the shared table from different angles.
-            if !main && depth > 1 && depth < max_depth {
-                const SKIP_SIZE: [i32; 20] = [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
-                const SKIP_PHASE: [i32; 20] = [0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7];
-                let i = (self.id - 1) % 20;
-                if ((depth + SKIP_PHASE[i]) / SKIP_SIZE[i]) % 2 != 0 {
-                    continue;
-                }
+        for depth in 1..=max_depth {
+            if !self.shared.increase_depth.0.load(Relaxed) {
+                self.search_again += 1;
             }
             let mut lines: Vec<Line> = Vec::with_capacity(multipv);
             self.root_excluded.clear();
             for pv_idx in 0..multipv {
+                self.pv_idx = pv_idx;
                 self.seldepth = 0;
                 self.root_depth = depth;
+                // This line's move from the previous iteration leads, and its score
+                // averages centre the aspiration window.
+                let line_move = prev_lines.get(pv_idx).copied().unwrap_or(Move::NONE);
+                self.root_move = line_move;
+                let (avg, mss, _) = self.root_stat(line_move);
                 let prev = prev_scores[pv_idx];
-                let have_prev = depth > start_depth;
-                // Look harder for a mate once the root score is far from equal.
                 let mate_threshold = 750 + 220000 / (depth * depth);
-                self.seek_mate = SF_SEEK_MATE && have_prev && prev.abs() >= mate_threshold;
-                // Optimism follows the running average score of the root move.
+                self.seek_mate = SF_SEEK_MATE && prev != -INF && prev.abs() >= mate_threshold;
                 if SF_EVAL_SCALE {
-                    let avg = if avg_scores[pv_idx] == NONE { prev } else { avg_scores[pv_idx] };
-                    let opt = if have_prev {
-                        tune::T_OptimismScale.get() * avg / (avg.abs() + tune::T_OptimismDiv.get())
-                    } else {
-                        0
-                    };
+                    let opt = tune::T_OptimismScale.get() * avg / (avg.abs() + tune::T_OptimismDiv.get());
                     self.optimism[root.stm] = opt;
                     self.optimism[root.stm ^ 1] = -opt;
                 }
-                let mut delta = 10 + (self.id as i32 % 4) * 3 + prev * prev / 24000;
-                let (mut alpha, mut beta) = (-INF, INF);
-                if depth >= 4 {
-                    alpha = (prev - delta).max(-INF);
-                    beta = (prev + delta).min(INF);
-                }
+                let mut delta = (5 + (self.id % 8) as i64 + mss.abs() / 10193).min(2 * INF as i64) as i32;
+                let mut alpha = (avg as i64 - delta as i64).max(-INF as i64) as i32;
+                let mut beta = (avg as i64 + delta as i64).min(INF as i64) as i32;
                 let mut fail_highs = 0;
+                if pv_idx == 0 {
+                    self.fail_high_recovery = (self.fail_high_recovery - 2).max(0);
+                }
                 let score = loop {
-                    let s = self.search(0, alpha, beta, (depth - fail_highs).max(1), false);
+                    let adjusted =
+                        (depth - fail_highs - self.fail_high_recovery - 3 * (self.search_again + 1) / 4).max(1);
+                    let s = self.search(0, alpha, beta, adjusted, false);
                     if self.stopped {
                         break s;
                     }
                     let label = if s <= alpha { " upperbound" } else { " lowerbound" };
                     if s <= alpha {
-                        beta = (alpha + beta) / 2;
+                        beta = alpha;
                         alpha = (s - delta).max(-INF);
                         fail_highs = 0;
-                    } else if s >= beta {
-                        beta = (s + delta).min(INF);
-                        if s.abs() < MATE_BOUND {
-                            fail_highs = (fail_highs + 1).min(3);
+                        if main {
+                            self.shared.stop_on_ponderhit.0.store(false, Relaxed);
                         }
+                    } else if s >= beta {
+                        alpha = (beta - delta).max(alpha);
+                        beta = (s + delta).min(INF);
+                        fail_highs += 1;
                     } else {
                         break s;
                     }
@@ -2670,12 +2575,11 @@ impl Searcher {
                         let line = Line { score: s, seldepth: self.seldepth, pv: self.pv[0][..self.pv_len[0]].to_vec() };
                         self.print_info(depth, pv_idx, &line, label);
                     }
-                    delta += delta / 3 + 2;
-                    if delta > 1500 {
-                        alpha = -INF;
-                        beta = INF;
-                    }
+                    delta += 47 * delta / 128;
                 };
+                if fail_highs > 0 && pv_idx == 0 {
+                    self.fail_high_recovery = (fail_highs + 1) / 2 + 2;
+                }
                 if self.stopped {
                     // A move that was fully searched at this depth and beat the previous
                     // best is still worth playing, even though the iteration was cut short.
@@ -2689,35 +2593,28 @@ impl Searcher {
                     break;
                 }
                 let pv = self.pv[0][..self.pv_len[0]].to_vec();
-                prev_scores[pv_idx] = score;
-                avg_scores[pv_idx] = if avg_scores[pv_idx] == NONE || score.abs() >= MATE_BOUND {
-                    score
-                } else {
-                    (score + avg_scores[pv_idx]) / 2
-                };
                 self.root_excluded.push(pv[0]);
                 lines.push(Line { score, seldepth: self.seldepth, pv });
             }
             self.root_excluded.clear();
+            self.pv_idx = 0;
             if self.stopped || lines.len() < multipv {
                 break;
             }
             lines.sort_by_key(|l| -l.score);
+            prev_lines = lines.iter().map(|l| l.pv[0]).collect();
             for (i, l) in lines.iter().enumerate() {
                 prev_scores[i] = l.score;
             }
             self.completed_depth = depth;
-            let prev_score = self.best_score;
             self.best_move = lines[0].pv[0];
             self.ponder_move = lines[0].pv.get(1).copied().unwrap_or(Move::NONE);
             self.best_score = lines[0].score;
             self.best_pv.clear();
             self.best_pv.extend_from_slice(&lines[0].pv);
             self.best_seldepth = lines[0].seldepth;
-            if self.best_move == last_best {
-                stability += 1;
-            } else {
-                stability = 0;
+            self.avg_score = self.root_stat(self.best_move).0;
+            if self.best_move != last_best {
                 last_best = self.best_move;
                 last_best_depth = depth;
             }
@@ -2731,9 +2628,13 @@ impl Searcher {
             // Stockfish's time management: scale the optimum time by how much the
             // score is falling, how long the best move has been stable, how often it
             // changed across all threads, and how much of the effort it took.
-            if SF_TIME && self.soft_ms != u64::MAX && !self.shared.pondering.0.load(Relaxed) {
-                let best = self.best_score;
-                let prev_avg = if self.prev_avg_score == NONE { best } else { self.prev_avg_score };
+            let best = lines[lines.len() - 1].score;
+            let pondering = self.shared.pondering.0.load(Relaxed);
+            if self.time_managed
+                && !self.shared.stop.0.load(Relaxed)
+                && !self.shared.stop_on_ponderhit.0.load(Relaxed)
+            {
+                let prev_avg = if self.prev_avg_score == NONE { INF } else { self.prev_avg_score };
                 let falling = ((11.48 + 2.30 * (prev_avg - best) as f64 + 1.1 * (iter_values[iter_idx] - best) as f64)
                     / 100.0)
                     .clamp(0.576, 1.728);
@@ -2742,40 +2643,28 @@ impl Searcher {
                 let reduction = (1.468 + self.prev_time_reduction) / (2.284 * time_reduction);
                 tot_changes = tot_changes / 2.0 + self.shared.best_move_changes.0.swap(0, Relaxed) as f64;
                 let instability = 1.077 + 2.229 * tot_changes / self.threads as f64;
-                let effort = self.root_nodes[self.best_move.from_to()] as f64 * 100000.0 / self.nodes.max(1) as f64;
+                let effort = (self.root_stat(self.best_move).2 * 100000 / self.nodes.max(1)) as f64;
                 let high_effort = interpolate(effort, 75800.0, 104510.0, 0.969, 0.714).clamp(0.693, 0.838);
                 let mut total = self.soft_ms as f64 * falling * reduction * instability * high_effort;
                 if root_moves.len() == 1 {
                     total = total.min(500.0);
                 }
-                iter_values[iter_idx] = best;
-                iter_idx = (iter_idx + 1) & 3;
                 let elapsed = self.start.elapsed().as_millis() as f64;
-                if elapsed > total.min(self.hard_ms as f64) || best >= MATE - 3 || best == -(MATE - 2) {
-                    break;
-                }
-            } else if self.soft_ms != u64::MAX && !self.shared.pondering.0.load(Relaxed) {
-                let elapsed = self.start.elapsed().as_millis() as f64;
-                let mut scale = 1.0;
-                // Root move dominance: share of the nodes spent on the best move.
-                let frac = self.root_nodes[self.best_move.from_to()] as f64 / self.nodes.max(1) as f64;
-                if frac >= DOMINANT_SHARE {
-                    scale *= 0.75;
-                } else if frac < DISPUTED_SHARE {
-                    scale *= 1.30;
-                }
-                // Best move stability: the same move for several iterations in a row.
-                if stability >= STABLE_ITERATIONS {
-                    scale *= 0.80;
-                }
-                // Fail-low recovery: the score dropped, look for a way out.
-                if depth > 4 && self.best_score < prev_score - FAIL_LOW_DROP {
-                    scale *= 1.40;
-                }
-                if elapsed >= self.soft_ms as f64 * scale {
-                    break;
+                if elapsed > total.min(self.hard_ms as f64)
+                    || lines[multipv - 1].score >= MATE - 3
+                    || lines[0].score == -(MATE - 2)
+                {
+                    if pondering {
+                        self.shared.stop_on_ponderhit.0.store(true, Relaxed);
+                    } else {
+                        break;
+                    }
+                } else {
+                    self.shared.increase_depth.0.store(pondering || elapsed <= total * 0.5, Relaxed);
                 }
             }
+            iter_values[iter_idx] = best;
+            iter_idx = (iter_idx + 1) & 3;
             if let Some(n) = self.limits.nodes {
                 if self.shared.total_nodes(self.threads) >= n {
                     break;
@@ -2784,10 +2673,6 @@ impl Searcher {
         }
         if main {
             self.prev_time_reduction = time_reduction;
-            if self.completed_depth > 0 {
-                self.prev_avg_score = avg_scores[0];
-                self.prev_best_score = self.best_score;
-            }
         }
         self.shared.nodes[self.id].0.store(self.nodes, Relaxed);
         self.shared.tb_hits[self.id].0.store(self.tb_hits, Relaxed);
@@ -2798,6 +2683,7 @@ impl Searcher {
 struct ThreadResult {
     completed_depth: i32,
     best_score: i32,
+    avg_score: i32,
     best_seldepth: usize,
     best_pv: Vec<Move>,
 }
@@ -2807,40 +2693,40 @@ impl ThreadResult {
         ThreadResult {
             completed_depth: s.completed_depth,
             best_score: s.best_score,
+            avg_score: s.avg_score,
             best_seldepth: s.best_seldepth,
             best_pv: s.best_pv.clone(),
         }
     }
 }
 
-/// Pick the thread whose result to play. Every thread votes for its best move
-/// with a weight growing with its score and completed depth; the move with the
-/// most votes wins, represented by the strongest thread that chose it. Proven
-/// mates take precedence, shortest first.
-fn best_thread(results: &[ThreadResult], multipv: usize) -> usize {
+/// Pick the thread whose result to play (Stockfish's get_best_thread). Every
+/// thread votes for its best move with its score above the lowest one plus 14;
+/// the move with the most votes wins (ties to the longer PV). A thread with a
+/// proven result is preferred, the more decisive the better.
+fn best_thread(results: &[ThreadResult]) -> usize {
     let valid = |r: &ThreadResult| r.completed_depth > 0 && !r.best_pv.is_empty();
-    if multipv > 1 || !valid(&results[0]) {
+    if !valid(&results[0]) {
         return 0;
     }
     let min_score = results.iter().filter(|r| valid(r)).map(|r| r.best_score).min().unwrap_or(0);
-    let weight = |r: &ThreadResult| (r.best_score - min_score + 14) as i64 * r.completed_depth as i64;
-    let mut votes = vec![0i64; 4096];
+    let mut votes = vec![0i64; 65536];
     for r in results.iter().filter(|r| valid(r)) {
-        votes[r.best_pv[0].from_to()] += weight(r);
+        votes[r.best_pv[0].0 as usize] += (r.best_score - min_score + 14) as i64;
     }
+    let decisive = |s: i32| s.abs() >= MATE_BOUND;
     let mut best = 0;
     for (i, r) in results.iter().enumerate().skip(1) {
         if !valid(r) {
             continue;
         }
         let b = &results[best];
-        let (vs, vb) = (votes[r.best_pv[0].from_to()], votes[b.best_pv[0].from_to()]);
-        let better = if b.best_score >= MATE_BOUND {
-            r.best_score > b.best_score
-        } else if r.best_score >= MATE_BOUND {
-            true
+        let (vr, vb) = (votes[r.best_pv[0].0 as usize], votes[b.best_pv[0].0 as usize]);
+        let better = if decisive(b.best_score) {
+            decisive(r.best_score) && r.best_score.abs() > b.best_score.abs()
         } else {
-            r.best_score > -MATE_BOUND && (vs > vb || (vs == vb && weight(r) > weight(b)))
+            decisive(r.best_score)
+                || (r.best_score > -MATE_BOUND && (vr > vb || (vr == vb && r.best_pv.len() > b.best_pv.len())))
         };
         if better {
             best = i;
@@ -2887,8 +2773,8 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(threads: usize, net: Arc<Network>, tt: Arc<TT>, shared: Arc<Shared>) -> ThreadPool {
-        let hist = Arc::new(SharedHist::new());
-        let thread_hist = |id: usize| if SHARED_HISTORY || id == 0 { hist.clone() } else { Arc::new(SharedHist::new()) };
+        let hist = Arc::new(SharedHist::new(if SHARED_HISTORY { threads } else { 1 }));
+        let thread_hist = |id: usize| if SHARED_HISTORY || id == 0 { hist.clone() } else { Arc::new(SharedHist::new(1)) };
         let main = Searcher::new(0, threads, net.clone(), tt.clone(), shared.clone(), thread_hist(0));
         let mut helpers = Vec::with_capacity(threads.saturating_sub(1));
         for id in 1..threads {
@@ -3024,6 +2910,8 @@ impl ThreadPool {
         self.main.silent = silent;
         self.main.show_wdl = show_wdl;
 
+        shared.increase_depth.0.store(true, Relaxed);
+        shared.stop_on_ponderhit.0.store(false, Relaxed);
         let shared_keys: Arc<[u64]> = Arc::from(keys);
         self.dispatch(|_| WorkerJob::Search {
             pos: *pos,
@@ -3047,16 +2935,30 @@ impl ThreadPool {
         results.push(ThreadResult::from_searcher(&self.main));
         results.extend(helper_results);
 
-        let best = best_thread(&results, multipv);
-        if best == 0 {
-            return (self.main.best_move, self.main.ponder_move, nodes);
+        // Stockfish only votes when no depth limit was given.
+        let best = if self.main.limits.depth.is_some() || multipv > 1 { 0 } else { best_thread(&results) };
+        let r = results[best].clone();
+        // The next move's time management starts from the chosen thread's result.
+        if r.completed_depth > 0 {
+            self.main.prev_best_score = r.best_score;
+            self.main.prev_avg_score = if r.avg_score == -INF { NONE } else { r.avg_score };
         }
-        let r = &results[best];
-        self.main.best_move = r.best_pv[0];
-        self.main.ponder_move = r.best_pv.get(1).copied().unwrap_or(Move::NONE);
-        if !silent {
-            let line = Line { score: r.best_score, seldepth: r.best_seldepth, pv: r.best_pv.clone() };
-            self.main.print_info(r.completed_depth, 0, &line, "");
+        if best != 0 {
+            self.main.best_move = r.best_pv[0];
+            self.main.ponder_move = r.best_pv.get(1).copied().unwrap_or(Move::NONE);
+            if !silent {
+                let line = Line { score: r.best_score, seldepth: r.best_seldepth, pv: r.best_pv.clone() };
+                self.main.print_info(r.completed_depth, 0, &line, "");
+            }
+        }
+        // Without a reply in the PV, take one from the hash table (Stockfish).
+        if self.main.ponder_move.is_none() && !self.main.best_move.is_none() {
+            let next = self.main.pos[0].make(self.main.best_move);
+            if let Some(t) = self.main.tt.probe(next.key) {
+                if !t.mv.is_none() && next.is_pseudo_legal(t.mv) && next.is_legal(t.mv) {
+                    self.main.ponder_move = t.mv;
+                }
+            }
         }
         (self.main.best_move, self.main.ponder_move, nodes)
     }

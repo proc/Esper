@@ -86,13 +86,24 @@ pub fn generate(pos: &Position, list: &mut MoveList, noisy: bool, quiet: bool) {
     let promo_pawns = pawns & rank7;
     let other_pawns = pawns & !rank7;
 
-    if noisy {
-        // Promotions (pushes and captures)
+    // Promotion pushes: the queen promotion is noisy, under-promotions are quiet
+    // (Stockfish's split).
+    if noisy || quiet {
         let mut b = fwd(promo_pawns) & empty & target;
         while b != 0 {
             let to = pop_lsb(&mut b);
-            push_promos(list, back(to, 8), to, false);
+            let from = back(to, 8);
+            if noisy {
+                list.push(Move::new(from, to, FLAG_PROMO | 3));
+            }
+            if quiet {
+                list.push(Move::new(from, to, FLAG_PROMO));
+                list.push(Move::new(from, to, FLAG_PROMO | 2));
+                list.push(Move::new(from, to, FLAG_PROMO | 1));
+            }
         }
+    }
+    if noisy {
         let mut pp = promo_pawns;
         while pp != 0 {
             let from = pop_lsb(&mut pp);

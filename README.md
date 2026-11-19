@@ -147,8 +147,10 @@ rises.
 
 ### Search
 
-Iterative deepening with aspiration windows and principal variation search,
-following Stockfish closely:
+Iterative deepening with aspiration windows and principal variation search. The
+search was compared with Stockfish's current source line by line and follows it
+closely, down to its constants; the remaining differences are deliberate (killer
+and countermove ordering, and the switches below).
 
 - **Move ordering**: a staged move picker (hash move, good captures, quiets,
   bad captures) with butterfly, low-ply, capture, continuation (1, 2, 3, 4 and 6
@@ -167,10 +169,12 @@ following Stockfish closely:
 - **Correction histories** keyed by pawns, non-pawns, minor pieces and the
   continuation, which adjust the static evaluation from search results.
 - **Transposition table**: lock-free, four entries per 64-byte bucket, shared by
-  all threads.
+  all threads, with Stockfish's replacement and aging rules.
+- **Root**: each root move keeps effort-weighted averages of its scores, which
+  centre the aspiration window and set the evaluation's optimism.
 
 `src/search.rs` begins with a block of constants that switch individual features
-on or off (for example `MULTI_CUT`, `SF_NMP`, `SF_LMR2`, `SHARED_HISTORY`), so each one can be
+on or off (for example `MULTI_CUT`, `SF_NMP`, `SF_PARITY`, `SHARED_HISTORY`), so each one can be
 measured by playing a build with it against a build without.
 
 ### Lazy SMP
@@ -183,9 +187,12 @@ vote among the threads, weighted by depth and score.
 ### Time management
 
 Following Stockfish, each move gets an optimum and a maximum time from the clock,
-increment and `movestogo`. The search stops early or runs longer depending on how
-stable the best move is, whether the score is falling, and what share of the nodes
-went to the best move. Some of this state carries over from move to move.
+increment, `movestogo`, the game ply and the opponent's clock (less time when
+behind), plus a quarter more when `Ponder` is on. The search stops early or runs
+longer depending on how stable the best move is, whether the score is falling, and
+what share of the nodes went to the best move; past half the planned time it stops
+deepening. Some of this state carries over from move to move. Esper adds one
+safeguard: under a second on the clock it never plans to use more than half of it.
 
 ### Opening book
 

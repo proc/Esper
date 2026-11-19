@@ -35,13 +35,19 @@ pub struct TT {
 unsafe impl Send for TT {}
 unsafe impl Sync for TT {}
 
+/// Stored depths are offset so that qsearch entries (depth 0) and entries that only
+/// hold a static evaluation (`DEPTH_UNSEARCHED`) stay distinct, as in Stockfish.
+const DEPTH_OFFSET: i32 = 3;
+/// Depth of an entry that only records the static evaluation.
+pub const DEPTH_UNSEARCHED: i32 = -2;
+
 // data layout (low to high): move:16 score:16 eval:16 depth:8 bound:2 pv:1 gen:5
 #[inline(always)]
 fn pack(mv: Move, score: i32, eval: i32, depth: i32, bound: u8, pv: bool, gen: u8) -> u64 {
     (mv.0 as u64)
         | ((score as i16 as u16 as u64) << 16)
         | ((eval as i16 as u16 as u64) << 32)
-        | ((depth.clamp(0, 255) as u64) << 48)
+        | (((depth + DEPTH_OFFSET).clamp(0, 255) as u64) << 48)
         | ((bound as u64) << 56)
         | ((pv as u64) << 58)
         | ((gen as u64 & GEN_MASK) << 59)
@@ -53,7 +59,7 @@ fn unpack(d: u64) -> TtData {
         mv: Move(d as u16),
         score: (d >> 16) as u16 as i16 as i32,
         eval: (d >> 32) as u16 as i16 as i32,
-        depth: ((d >> 48) & 0xFF) as i32,
+        depth: ((d >> 48) & 0xFF) as i32 - DEPTH_OFFSET,
         bound: ((d >> 56) & 3) as u8,
         pv: (d >> 58) & 1 != 0,
     }
@@ -142,22 +148,31 @@ impl TT {
                 break;
             }
             let old = unpack(data);
+            let old_gen = (data >> 59) as u8;
             if b.0[2 * i].load(Relaxed) ^ data == key {
+                // Stockfish keeps a deeper entry from the same search unless the new
+                // result is exact; even then a new move replaces the stored one.
+                let keep = bound != BOUND_EXACT && old_gen == gen && depth + 2 * pv as i32 <= old.depth - 4;
+                if keep {
+                    let decisive = old.score.abs() >= crate::search::MATE_BOUND && old.score.abs() < crate::search::INF;
+                    // Mate scores that keep being bypassed age out slowly.
+                    let new_depth = if old.depth >= 5 && old.bound != BOUND_EXACT && decisive { old.depth - 1 } else { old.depth };
+                    let new_mv = if mv.is_none() { old.mv } else { mv };
+                    if new_mv != old.mv || new_depth != old.depth {
+                        let d = pack(new_mv, old.score, old.eval, new_depth, old.bound, old.pv, old_gen);
+                        b.0[2 * i].store(key ^ d, Relaxed);
+                        b.0[2 * i + 1].store(d, Relaxed);
+                    }
+                    return;
+                }
                 if mv.is_none() {
                     mv = old.mv;
-                }
-                // Keep deeper results from the same search unless this one is exact.
-                if bound != BOUND_EXACT
-                    && (depth + 4 <= old.depth || (depth == 0 && old.depth > 0))
-                    && ((data >> 59) as u8) == gen
-                {
-                    return;
                 }
                 victim = i;
                 break;
             }
-            let age = (gen.wrapping_sub((data >> 59) as u8) & GEN_MASK as u8) as i32;
-            let quality = old.depth - 8 * age;
+            let age = (gen.wrapping_sub(old_gen) & GEN_MASK as u8) as i32;
+            let quality = old.depth + DEPTH_OFFSET - 8 * age;
             if quality < worst {
                 worst = quality;
                 victim = i;
@@ -166,6 +181,21 @@ impl TT {
         let data = pack(mv, score, eval, depth, bound, pv, gen);
         b.0[2 * victim].store(key ^ data, Relaxed);
         b.0[2 * victim + 1].store(data, Relaxed);
+    }
+
+    /// Lower the stored depth of `key`'s entry (Stockfish's TTWriter::penalize).
+    pub fn penalize(&self, key: u64, amount: i32) {
+        let b = self.bucket(key);
+        for i in 0..ENTRIES_PER_BUCKET {
+            let data = b.0[2 * i + 1].load(Relaxed);
+            if data != 0 && b.0[2 * i].load(Relaxed) ^ data == key {
+                let e = unpack(data);
+                let d = pack(e.mv, e.score, e.eval, (e.depth - amount).max(-DEPTH_OFFSET), e.bound, e.pv, (data >> 59) as u8);
+                b.0[2 * i].store(key ^ d, Relaxed);
+                b.0[2 * i + 1].store(d, Relaxed);
+                return;
+            }
+        }
     }
 
     /// Permille of the table used by the current search.
