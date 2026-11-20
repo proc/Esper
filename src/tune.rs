@@ -65,6 +65,12 @@ params! {
     T_SingularMargin = 59, 20, 120;
     T_DoubleExtMargin = -2, -100, 100;
     T_TripleExtMargin = 70, 0, 200;
+    // LMR / LMP / Fortress / Time management
+    T_LmrCutNode = 4026, 2000, 6000;
+    T_LmpScale = 1024, 600, 1600;
+    T_FortressRule50 = 28, 16, 60;
+    T_TimeFalling = 230, 100, 400;
+    T_TimeInstability = 2229, 1000, 3500;
 }
 
 /// Set a parameter by its UCI name; returns false if there is none of that name.

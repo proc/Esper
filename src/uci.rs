@@ -1,12 +1,13 @@
 //! UCI protocol front end.
 
 use crate::book::{self, Book};
+use crate::exp::Experience;
 use crate::movegen::{legal_moves, parse_move, parse_san, perft, to_san};
 use crate::nnue::{Network, NnueState, DEFAULT_NET_NAME};
 use crate::position::*;
 use crate::search::{self, Limits, Shared, ThreadPool};
 use crate::tb::{self, TbConfig};
-use crate::tt::TT;
+use crate::tt::{BOUND_EXACT, TT};
 use std::io::BufRead;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Condvar, Mutex};
@@ -41,6 +42,10 @@ struct SearchTask {
     overhead: u64,
     tb_cfg: TbConfig,
     show_wdl: bool,
+    contempt: i32,
+    exp: Arc<Mutex<Experience>>,
+    exp_file: String,
+    exp_write: bool,
     silent: bool,
     shared: Arc<Shared>,
 }
@@ -71,6 +76,10 @@ pub struct Engine {
     multipv: usize,
     overhead: u64,
     show_wdl: bool,
+    contempt: i32,
+    exp: Arc<Mutex<Experience>>,
+    exp_file: String,
+    exp_write: bool,
     tb: TbConfig,
     /// Play from the opening book (`OwnBook`); off by default.
     own_book: bool,
@@ -134,6 +143,10 @@ impl Engine {
                             overhead,
                             tb_cfg,
                             show_wdl,
+                            contempt,
+                            exp,
+                            exp_file,
+                            exp_write,
                             silent,
                             shared,
                         } = *task;
@@ -174,8 +187,38 @@ impl Engine {
                             }
                             println!("bestmove {}", r.mv.to_uci());
                         } else {
-                            let (best, ponder, _) =
-                                pool.run(&pos, &keys, &limits, multipv, overhead, tb_cfg, silent, show_wdl, &shared);
+                            if !silent {
+                                if let Some(entry) = exp.lock().unwrap().probe(pos.key) {
+                                    if entry.depth >= 8 && pos.is_pseudo_legal(entry.mv) {
+                                        pool.main.tt.store(
+                                            pos.key,
+                                            entry.mv,
+                                            entry.score as i32,
+                                            search::NONE,
+                                            entry.depth as i32,
+                                            BOUND_EXACT,
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                            let (best, ponder, _) = pool.run(
+                                &pos,
+                                &keys,
+                                &limits,
+                                multipv,
+                                overhead,
+                                tb_cfg,
+                                silent,
+                                show_wdl,
+                                contempt,
+                                &shared,
+                            );
+                            if exp_write && !silent && pool.main.completed_depth >= 10 && !best.is_none() {
+                                let mut guard = exp.lock().unwrap();
+                                guard.record(pos.key, best, pool.main.best_score, pool.main.completed_depth);
+                                let _ = guard.save(&exp_file);
+                            }
                             if !silent {
                                 if best.is_none() {
                                     println!(
@@ -213,6 +256,10 @@ impl Engine {
             multipv: 1,
             overhead: 25,
             show_wdl: false,
+            contempt: 0,
+            exp: Arc::new(Mutex::new(Experience::empty())),
+            exp_file: String::new(),
+            exp_write: false,
             tb: TbConfig::DEFAULT,
             own_book: false,
             book_file: book::EMBEDDED_NAME.to_string(),
@@ -406,6 +453,10 @@ impl Engine {
             overhead: self.overhead,
             tb_cfg: self.tb,
             show_wdl: self.show_wdl,
+            contempt: self.contempt * search::NORMALIZE_PAWN / 100,
+            exp: self.exp.clone(),
+            exp_file: self.exp_file.clone(),
+            exp_write: self.exp_write,
             silent,
             shared: self.shared.clone(),
         });
@@ -462,6 +513,27 @@ impl Engine {
                 }
             }
             "uci_showwdl" => self.show_wdl = value.trim().eq_ignore_ascii_case("true"),
+            "contempt" => {
+                if let Ok(n) = value.parse::<i32>() {
+                    self.contempt = n.clamp(-100, 100);
+                }
+            }
+            "experiencefile" => {
+                let v = value.trim();
+                self.exp_file = if v.is_empty() || v == "<empty>" { String::new() } else { v.to_string() };
+                if self.exp_file.is_empty() {
+                    *self.exp.lock().unwrap() = Experience::empty();
+                } else {
+                    match Experience::load(&self.exp_file) {
+                        Ok(e) => {
+                            println!("info string experience {} loaded: {} entries", self.exp_file, e.len());
+                            *self.exp.lock().unwrap() = e;
+                        }
+                        Err(err) => println!("info string could not load experience: {err}"),
+                    }
+                }
+            }
+            "experiencewrite" => self.exp_write = value.trim().eq_ignore_ascii_case("true"),
             "clear hash" => self.new_game(),
             "syzygypath" => {
                 let n = tb::init(&value);
@@ -852,6 +924,9 @@ impl Engine {
                 println!("option name Move Overhead type spin default 25 min 0 max 5000");
                 println!("option name Ponder type check default false");
                 println!("option name UCI_ShowWDL type check default false");
+                println!("option name Contempt type spin default 0 min -100 max 100");
+                println!("option name ExperienceFile type string default <empty>");
+                println!("option name ExperienceWrite type check default false");
                 println!("option name EvalFile type string default <embedded>");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name SyzygyProbeDepth type spin default 1 min 1 max 100");

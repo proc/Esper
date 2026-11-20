@@ -264,7 +264,8 @@ pub struct Searcher {
     tb_cardinality: u32,
     seldepth: usize,
     stopped: bool,
-    completed_depth: i32,
+    pub completed_depth: i32,
+    tactical_helper: bool,
     root_excluded: Vec<Move>,
     /// Move to try first at the root (the current line's previous best).
     root_move: Move,
@@ -297,6 +298,7 @@ pub struct Searcher {
     hard_ms: u64,
     pub silent: bool,
     pub show_wdl: bool,
+    pub contempt: i32,
     // results
     pub best_move: Move,
     pub ponder_move: Move,
@@ -944,6 +946,7 @@ impl Searcher {
             seldepth: 0,
             stopped: false,
             completed_depth: 0,
+            tactical_helper: threads >= 4 && id >= 2 && id % 4 == 3,
             root_excluded: Vec::new(),
             root_move: Move::NONE,
             pv_idx: 0,
@@ -965,6 +968,7 @@ impl Searcher {
             hard_ms: u64::MAX,
             silent: false,
             show_wdl: false,
+            contempt: 0,
             best_move: Move::NONE,
             ponder_move: Move::NONE,
             best_score: 0,
@@ -1138,6 +1142,12 @@ impl Searcher {
         let material = 521 * popcount(pos.by_type[PAWN]) as i32 + npm;
         v += (material as i64 * v as i64 / 90649) as i32;
         v -= v * pos.rule50.min(100) as i32 / 189;
+        // Fortress / shuffling damping: long reversible sequences pull the score toward 0.
+        let fortress_thresh = tune::T_FortressRule50.get();
+        let r50 = pos.rule50.min(100) as i32;
+        if r50 > fortress_thresh {
+            v -= v * (r50 - fortress_thresh) / (144 - fortress_thresh).max(16);
+        }
         v.clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
     }
 
@@ -1452,8 +1462,15 @@ impl Searcher {
     }
 
     #[inline(always)]
-    fn draw_score(&self) -> i32 {
-        -1 + (self.nodes & 2) as i32
+    fn draw_score(&self, ply: usize) -> i32 {
+        let jitter = -1 + (self.nodes & 2) as i32;
+        if self.contempt == 0 {
+            jitter
+        } else if ply & 1 == 0 {
+            -self.contempt + jitter
+        } else {
+            self.contempt + jitter
+        }
     }
 
     fn check_time(&mut self) {
@@ -1507,7 +1524,7 @@ impl Searcher {
             return if in_check { 0 } else { self.evaluate(ply) };
         }
         if SF_UPCOMING_REP && alpha < 0 && cuckoo::upcoming_repetition(&pos, &self.keys, ply) {
-            alpha = self.draw_score();
+            alpha = self.draw_score(ply);
             if alpha >= beta {
                 return alpha;
             }
@@ -1668,11 +1685,11 @@ impl Searcher {
         if !root {
             let draw = self.is_draw(ply);
             if draw == DrawState::Draw {
-                return self.draw_score();
+                return self.draw_score(ply);
             }
             near_rep = draw == DrawState::NearRep;
             if ply >= MAX_PLY {
-                return if in_check { self.draw_score() } else { self.evaluate(ply) };
+                return if in_check { self.draw_score(ply) } else { self.evaluate(ply) };
             }
             alpha = alpha.max(-MATE + ply as i32);
             beta = beta.min(MATE - ply as i32 - 1);
@@ -1681,7 +1698,7 @@ impl Searcher {
             }
             // The side to move can repeat a position: a draw is the least it gets.
             if SF_UPCOMING_REP && alpha < 0 && cuckoo::upcoming_repetition(&pos, &self.keys, ply) {
-                alpha = self.draw_score();
+                alpha = self.draw_score(ply);
                 if alpha >= beta {
                     return alpha;
                 }
@@ -2117,7 +2134,11 @@ impl Searcher {
             // Shallow-depth pruning
             if !root && best > -MATE_BOUND && has_pieces {
                 // Move-count pruning: later quiet moves are skipped, this one still counts.
-                if move_count >= (3 + depth * depth) / (2 - improving as i32) {
+                let mut lmp_limit = (3 + depth * depth) * tune::T_LmpScale.get() / (1024 * (2 - improving as i32));
+                if self.tactical_helper {
+                    lmp_limit = lmp_limit * 3 / 2;
+                }
+                if move_count >= lmp_limit.max(1) {
                     skip_quiets = true;
                 }
                 let mut lmr_depth = new_depth_base - r / 1024;
@@ -2243,7 +2264,10 @@ impl Searcher {
             r -= move_count * 65;
             r -= corr_raw.abs() / 26310;
             if cut_node {
-                r += 4026 + 933 * tt_move.is_none() as i32;
+                r += tune::T_LmrCutNode.get() + 933 * tt_move.is_none() as i32;
+            }
+            if self.tactical_helper {
+                r -= 1024;
             }
             if tt_capture {
                 r += 1079;
@@ -2666,14 +2690,16 @@ impl Searcher {
                 && !self.shared.stop_on_ponderhit.0.load(Relaxed)
             {
                 let prev_avg = if self.prev_avg_score == NONE { INF } else { self.prev_avg_score };
-                let falling = ((11.48 + 2.30 * (prev_avg - best) as f64 + 1.1 * (iter_values[iter_idx] - best) as f64)
+                let falling_w = tune::T_TimeFalling.get() as f64 / 100.0;
+                let falling = ((11.48 + falling_w * (prev_avg - best) as f64 + 1.1 * (iter_values[iter_idx] - best) as f64)
                     / 100.0)
                     .clamp(0.576, 1.728);
                 time_reduction =
                     interpolate((depth - last_best_depth) as f64, 4.96, 18.79, 0.639, 1.712).clamp(0.629, 1.544);
                 let reduction = (1.468 + self.prev_time_reduction) / (2.284 * time_reduction);
                 tot_changes = tot_changes / 2.0 + self.shared.best_move_changes.0.swap(0, Relaxed) as f64;
-                let instability = 1.077 + 2.229 * tot_changes / self.threads as f64;
+                let instab_w = tune::T_TimeInstability.get() as f64 / 1000.0;
+                let instability = 1.077 + instab_w * tot_changes / self.threads as f64;
                 let effort = (self.root_stat(self.best_move).2 * 100000 / self.nodes.max(1)) as f64;
                 let high_effort = interpolate(effort, 75800.0, 104510.0, 0.969, 0.714).clamp(0.693, 0.838);
                 let mut total = self.soft_ms as f64 * falling * reduction * instability * high_effort;
@@ -2789,6 +2815,7 @@ enum WorkerJob {
         overhead: u64,
         tb: TbConfig,
         show_wdl: bool,
+        contempt: i32,
     },
     Clear,
     ClearTT(Arc<TT>),
@@ -2851,10 +2878,11 @@ impl ThreadPool {
                         };
                         let result = match job {
                             WorkerJob::Idle => None,
-                            WorkerJob::Search { pos, keys, limits, overhead, tb, show_wdl } => {
+                            WorkerJob::Search { pos, keys, limits, overhead, tb, show_wdl, contempt } => {
                                 searcher.prepare(&pos, &keys, &limits, 1, overhead, tb);
                                 searcher.silent = true;
                                 searcher.show_wdl = show_wdl;
+                                searcher.contempt = contempt;
                                 searcher.iterate();
                                 Some(ThreadResult::from_searcher(&searcher))
                             }
@@ -2944,6 +2972,7 @@ impl ThreadPool {
         tb: TbConfig,
         silent: bool,
         show_wdl: bool,
+        contempt: i32,
         shared: &Arc<Shared>,
     ) -> (Move, Move, u64) {
         for n in shared.nodes[..self.threads].iter().chain(&shared.tb_hits[..self.threads]) {
@@ -2954,6 +2983,7 @@ impl ThreadPool {
         self.main.prepare(pos, keys, limits, multipv, overhead, tb);
         self.main.silent = silent;
         self.main.show_wdl = show_wdl;
+        self.main.contempt = contempt;
 
         shared.increase_depth.0.store(true, Relaxed);
         shared.stop_on_ponderhit.0.store(false, Relaxed);
@@ -2965,6 +2995,7 @@ impl ThreadPool {
             overhead,
             tb,
             show_wdl,
+            contempt,
         });
 
         self.main.iterate();

@@ -396,6 +396,11 @@ impl Network {
         let o = self.tp_off + idx as usize * L1;
         self.data[o..o + L1].try_into().unwrap()
     }
+    /// A threat row, or a piece-square row when `idx` carries `PSQ_FLAG`.
+    #[inline(always)]
+    fn any_row(&self, idx: u32) -> &[u8; L1] {
+        if idx & PSQ_FLAG != 0 { self.psq_row(idx & !PSQ_FLAG) } else { self.tp_row(idx) }
+    }
     #[inline(always)]
     fn psq_row(&self, idx: u32) -> &[u8; L1] {
         let o = self.psq_off + idx as usize * L1;
@@ -626,7 +631,7 @@ fn threat_code(from: usize, to: usize, attacker: u8, attacked: u8) -> u32 {
 /// target) go to `with`; threats that exist only while `sq` is empty (sliders
 /// seeing past it) go to `without`.
 #[inline]
-fn piece_threats(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<MAX_THREATS>, without: &mut IdxList<MAX_THREATS>) {
+fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<N>, without: &mut IdxList<N>) {
     let pt = piece_type(pc);
     let occ = tb.occ;
     let t = &tb.by_type;
@@ -673,7 +678,7 @@ fn piece_threats(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<MAX_THR
 /// Threat changes from `p0` to `p1`, worked out from the pieces that left and
 /// arrived rather than by rescanning both boards. A threat can appear in both
 /// lists; the accumulator arithmetic is linear, so that is harmless.
-fn threat_changes_inc(p0: &Position, p1: &Position, added: &mut IdxList<MAX_THREATS>, removed: &mut IdxList<MAX_THREATS>) {
+fn threat_changes_inc<const N: usize>(p0: &Position, p1: &Position, added: &mut IdxList<N>, removed: &mut IdxList<N>) {
     let mut tb = ThreatBoard::new(p0);
     let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
     for pt in PAWN..=KING {
@@ -992,12 +997,21 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
 
 /// Largest possible change lists: up to 256 threats plus 120 pawn pairs.
 const TP_LIST: usize = 512;
+/// After a refresh, also compute the accumulators back to the refresh boundary
+/// (see `fill_back`).
+const BACKWARD_FILL: bool = true;
+/// Use Stockfish's hybrid update for king moves (see `hybrid`).
+const HYBRID: bool = true;
+/// Stockfish only takes the hybrid route with this many pieces on the board.
+const HYBRID_MIN_PIECES: u32 = 15;
+/// Marks a piece-square row index in a combined update list.
+const PSQ_FLAG: u32 = 1 << 31;
 
 struct Entry {
-    psq: [Acc; 2],
-    tp: [Acc; 2],
-    psq_ok: [bool; 2],
-    tp_ok: [bool; 2],
+    /// Piece-square plus threat contributions, one accumulator per perspective
+    /// (as Stockfish keeps it): an update is one pass, the output reads one array.
+    acc: [Acc; 2],
+    acc_ok: [bool; 2],
     /// The step from the previous ply cannot be done incrementally.
     psq_refresh: [bool; 2],
     tp_refresh: [bool; 2],
@@ -1027,6 +1041,8 @@ pub struct NnueState {
     /// Threat accumulator cache, indexed `[perspective][king on files e-h]`: the
     /// last threat accumulator built for that orientation and its position.
     tp_cache: Vec<Option<(Acc, Position)>>,
+    /// Work space for rebuilding a threat cache entry without copying it.
+    scratch: Box<Acc>,
 }
 
 /// Above this many changed squares a threat refresh starts from scratch rather
@@ -1094,16 +1110,16 @@ fn threat_changes(p0: &Position, p1: &Position, added: &mut IdxList<MAX_THREATS>
 /// Feature rows to add and subtract for perspective `p` (oriented by `orient`),
 /// given the threat changes and the pawns before and after.
 #[allow(clippy::too_many_arguments)]
-fn tp_rows(
+fn tp_rows<const N: usize, const M: usize>(
     net: &Network,
     p: usize,
     orient: usize,
-    added: &IdxList<MAX_THREATS>,
-    removed: &IdxList<MAX_THREATS>,
+    added: &IdxList<N>,
+    removed: &IdxList<N>,
     (w0, b0): (u64, u64),
     (w1, b1): (u64, u64),
-    adds: &mut IdxList<TP_LIST>,
-    subs: &mut IdxList<TP_LIST>,
+    adds: &mut IdxList<M>,
+    subs: &mut IdxList<M>,
 ) {
     for &t in added.as_slice() {
         let idx = net.luts.threat_index(t, p, orient);
@@ -1162,10 +1178,8 @@ impl NnueState {
         let mut entries = Vec::with_capacity(max_ply);
         for _ in 0..max_ply {
             entries.push(Entry {
-                psq: [Acc([0; L1]); 2],
-                tp: [Acc([0; L1]); 2],
-                psq_ok: [false; 2],
-                tp_ok: [false; 2],
+                acc: [Acc([0; L1]); 2],
+                acc_ok: [false; 2],
                 psq_refresh: [true; 2],
                 tp_refresh: [true; 2],
                 threats_ok: false,
@@ -1183,14 +1197,13 @@ impl NnueState {
         for _ in 0..2 * 3 * 64 {
             cache.push(CacheEntry { acc: net.biases, by_color: [0; 2], by_type: [0; 7] });
         }
-        NnueState { net, entries, cache, tp_cache: vec![None; 4] }
+        NnueState { net, entries, cache, tp_cache: vec![None; 4], scratch: Box::new(Acc([0; L1])) }
     }
 
     /// Start a new stack: the position at ply 0 is unrelated to anything before.
     pub fn reset(&mut self) {
         let e = &mut self.entries[0];
-        e.psq_ok = [false; 2];
-        e.tp_ok = [false; 2];
+        e.acc_ok = [false; 2];
         e.psq_refresh = [true; 2];
         e.tp_refresh = [true; 2];
         e.threats_ok = false;
@@ -1203,8 +1216,7 @@ impl NnueState {
     pub fn push(&mut self, stack: &[Position], j: usize) {
         let cur = &mut self.entries[j];
         let (p0, p1) = (&stack[j - 1], &stack[j]);
-        cur.psq_ok = [false; 2];
-        cur.tp_ok = [false; 2];
+        cur.acc_ok = [false; 2];
         cur.threats_ok = false;
         cur.psq_diff_ok = [false; 2];
         cur.tp_diff_ok = false;
@@ -1236,72 +1248,43 @@ impl NnueState {
         }
     }
 
+    /// Rebuild the accumulator of `persp` at `ply` from the caches: the piece-square
+    /// part from the per-king-square cache, the threat part from the per-side
+    /// threat cache, each brought up to date with `pos` and then added together.
     #[inline(never)]
-    fn refresh_psq(&mut self, pos: &Position, ply: usize, persp: usize) {
+    fn refresh(&mut self, pos: &Position, ply: usize, persp: usize) {
         let net = &*self.net;
+        // Piece-square part, written straight into the entry and copied back to the cache.
         let ksq = pos.king_sq(persp);
         let block = psq_block(pos, persp);
         let c = &mut self.cache[(persp * 3 + block) * 64 + ksq];
         let (mut adds, mut subs) = (IdxList::<64>::new(), IdxList::<64>::new());
         psq_diff(persp, ksq, block, (&c.by_color, &c.by_type), (&pos.by_color, &pos.by_type), &mut adds, &mut subs);
+        let e = &mut self.entries[ply];
         if adds.n + subs.n > 0 {
             for &i in adds.as_slice().iter().chain(subs.as_slice()) {
                 prefetch_row(net.psq_row(i));
             }
-            let src = c.acc;
-            apply_rows(&mut c.acc, &src, |i| net.psq_row(i), adds.as_slice(), subs.as_slice());
+            apply_rows(&mut e.acc[persp], &c.acc, |i| net.psq_row(i), adds.as_slice(), subs.as_slice());
+            c.acc = e.acc[persp];
             c.by_color = pos.by_color;
             c.by_type = pos.by_type;
+        } else {
+            e.acc[persp] = c.acc;
         }
-        let e = &mut self.entries[ply];
-        e.psq[persp] = c.acc;
-        e.psq_ok[persp] = true;
-    }
 
-    #[inline(never)]
-    fn ensure_psq(&mut self, stack: &[Position], ply: usize, persp: usize) {
-        let mut k = ply;
-        while !self.entries[k].psq_ok[persp] {
-            if k == 0 || self.entries[k].psq_refresh[persp] {
-                return self.refresh_psq(&stack[ply], ply, persp);
-            }
-            k -= 1;
-        }
-        let net = &*self.net;
-        for j in k + 1..=ply {
-            let (lo, hi) = self.entries.split_at_mut(j);
-            let (prev, cur) = (&lo[j - 1], &mut hi[0]);
-            if !cur.psq_diff_ok[persp] {
-                compute_psq_diff(cur, &stack[j - 1], &stack[j], persp);
-            }
-            for &i in cur.psq_adds[persp].as_slice().iter().chain(cur.psq_subs[persp].as_slice()) {
-                prefetch_row(net.psq_row(i));
-            }
-            apply_rows(
-                &mut cur.psq[persp],
-                &prev.psq[persp],
-                |i| net.psq_row(i),
-                cur.psq_adds[persp].as_slice(),
-                cur.psq_subs[persp].as_slice(),
-            );
-            cur.psq_ok[persp] = true;
-        }
-    }
-
-    #[inline(never)]
-    fn refresh_tp(&mut self, pos: &Position, ply: usize, persp: usize) {
-        let net = &*self.net;
-        let ksq = pos.king_sq(persp);
+        // Threat part: bring the cache entry for this board side up to date.
         let orient = orientation(persp, ksq);
         let slot = persp * 2 + ((ksq >> 2) & 1);
-        // Start from the cached accumulator of the same orientation when the
-        // boards are close: only the threat changes between them need applying.
-        if let Some((acc, cpos)) = &self.tp_cache[slot] {
+        let mut updated = false;
+        if let Some((cacc, cpos)) = &mut self.tp_cache[slot] {
             let mut changed = (cpos.by_color[0] ^ pos.by_color[0]) | (cpos.by_color[1] ^ pos.by_color[1]);
             for pt in PAWN..=KING {
                 changed |= cpos.by_type[pt] ^ pos.by_type[pt];
             }
-            if popcount(changed) <= TP_CACHE_MAX_CHANGED {
+            if changed == 0 {
+                updated = true;
+            } else if popcount(changed) <= TP_CACHE_MAX_CHANGED {
                 let mut added = IdxList::<MAX_THREATS>::new();
                 let mut removed = IdxList::<MAX_THREATS>::new();
                 threat_changes(cpos, pos, &mut added, &mut removed);
@@ -1313,62 +1296,183 @@ impl NnueState {
                 for &i in adds.as_slice().iter().chain(subs.as_slice()) {
                     prefetch_row(net.tp_row(i));
                 }
-                let src = *acc;
-                let e = &mut self.entries[ply];
-                apply_rows(&mut e.tp[persp], &src, |i| net.tp_row(i), adds.as_slice(), subs.as_slice());
-                e.tp_ok[persp] = true;
-                self.tp_cache[slot] = Some((e.tp[persp], *pos));
-                return;
+                apply_rows(&mut self.scratch, cacc, |i| net.tp_row(i), adds.as_slice(), subs.as_slice());
+                std::mem::swap(cacc, &mut *self.scratch);
+                *cpos = *pos;
+                updated = true;
             }
         }
+        if !updated {
+            if !e.threats_ok {
+                e.n_threats = gen_threats(pos, &mut e.threats);
+                e.threats_ok = true;
+            }
+            let mut adds = IdxList::<TP_LIST>::new();
+            for &t in &e.threats[..e.n_threats] {
+                let idx = net.luts.threat_index(t, persp, orient);
+                adds.push_if(idx, (idx as usize) < THREAT_DIMS);
+            }
+            let (w, b) = (pos.pieces(WHITE, PAWN), pos.pieces(BLACK, PAWN));
+            net.luts.pair_indices(persp, orient, w | b, w, b, &mut adds);
+            for &i in adds.as_slice() {
+                prefetch_row(net.tp_row(i));
+            }
+            let zero = Acc([0; L1]);
+            apply_rows(&mut self.scratch, &zero, |i| net.tp_row(i), adds.as_slice(), &[]);
+            self.tp_cache[slot] = Some((*self.scratch, *pos));
+        }
+        let (tacc, _) = self.tp_cache[slot].as_ref().unwrap();
         let e = &mut self.entries[ply];
-        if !e.threats_ok {
-            e.n_threats = gen_threats(pos, &mut e.threats);
-            e.threats_ok = true;
+        for (d, t) in e.acc[persp].0.iter_mut().zip(tacc.0.iter()) {
+            *d = d.wrapping_add(*t);
         }
-        let mut adds = IdxList::<TP_LIST>::new();
-        for &t in &e.threats[..e.n_threats] {
-            let idx = net.luts.threat_index(t, persp, orient);
-            adds.push_if(idx, (idx as usize) < THREAT_DIMS);
+        e.acc_ok[persp] = true;
+    }
+
+    /// After a refresh at `ply`, undo the moves back to `boundary` (the ply whose
+    /// move forced the refresh), so the accumulators in between are computed too
+    /// and later positions below `boundary` update incrementally instead of
+    /// refreshing again (Stockfish's backward_update_incremental).
+    fn fill_back(&mut self, stack: &[Position], ply: usize, boundary: usize, persp: usize) {
+        let net = &*self.net;
+        for t in (boundary + 1..=ply).rev() {
+            let (lo, hi) = self.entries.split_at_mut(t);
+            let (prev, cur) = (&mut lo[t - 1], &mut hi[0]);
+            if !cur.psq_diff_ok[persp] {
+                compute_psq_diff(cur, &stack[t - 1], &stack[t], persp);
+            }
+            if !cur.tp_diff_ok {
+                compute_tp_diff(net, cur, &stack[t - 1], &stack[t]);
+            }
+            // The step from t-1 to t, reversed: its additions are subtracted.
+            let mut adds = IdxList::<{ TP_LIST + 8 }>::new();
+            let mut subs = IdxList::<{ TP_LIST + 8 }>::new();
+            for &i in cur.tp_subs[persp].as_slice() {
+                adds.push(i);
+            }
+            for &i in cur.psq_subs[persp].as_slice() {
+                adds.push(i | PSQ_FLAG);
+            }
+            for &i in cur.tp_adds[persp].as_slice() {
+                subs.push(i);
+            }
+            for &i in cur.psq_adds[persp].as_slice() {
+                subs.push(i | PSQ_FLAG);
+            }
+            for &i in adds.as_slice().iter().chain(subs.as_slice()) {
+                prefetch_row(net.any_row(i));
+            }
+            apply_rows(&mut prev.acc[persp], &cur.acc[persp], |i| net.any_row(i), adds.as_slice(), subs.as_slice());
+            prev.acc_ok[persp] = true;
         }
-        let (w, b) = (pos.pieces(WHITE, PAWN), pos.pieces(BLACK, PAWN));
-        net.luts.pair_indices(persp, orient, w | b, w, b, &mut adds);
-        for &i in adds.as_slice() {
+    }
+
+    /// Make the accumulator of `persp` at `ply` current: incrementally from the
+    /// nearest computed ply when no refresh lies in between, otherwise rebuilt.
+    /// Bring the piece-square cache entry for `pos`'s king square and block up to
+    /// date with `pos`; returns its index.
+    fn sync_psq_cache(&mut self, pos: &Position, persp: usize) -> usize {
+        let net = &*self.net;
+        let ksq = pos.king_sq(persp);
+        let block = psq_block(pos, persp);
+        let idx = (persp * 3 + block) * 64 + ksq;
+        let c = &mut self.cache[idx];
+        let (mut adds, mut subs) = (IdxList::<64>::new(), IdxList::<64>::new());
+        psq_diff(persp, ksq, block, (&c.by_color, &c.by_type), (&pos.by_color, &pos.by_type), &mut adds, &mut subs);
+        if adds.n + subs.n > 0 {
+            for &i in adds.as_slice().iter().chain(subs.as_slice()) {
+                prefetch_row(net.psq_row(i));
+            }
+            apply_rows(&mut self.scratch, &c.acc, |i| net.psq_row(i), adds.as_slice(), subs.as_slice());
+            std::mem::swap(&mut c.acc, &mut *self.scratch);
+            c.by_color = pos.by_color;
+            c.by_type = pos.by_type;
+        }
+        idx
+    }
+
+    /// Stockfish's hybrid update for a king move that stays on the same side of
+    /// the board: the threat part changes incrementally as usual, and the
+    /// piece-square part is swapped wholesale (old king square's sum out, new
+    /// one's in, both from the cache), avoiding a threat refresh.
+    fn hybrid(&mut self, stack: &[Position], ply: usize, persp: usize) {
+        let old = self.sync_psq_cache(&stack[ply - 1], persp);
+        let new = self.sync_psq_cache(&stack[ply], persp);
+        let net = &*self.net;
+        let (lo, hi) = self.entries.split_at_mut(ply);
+        let (prev, cur) = (&lo[ply - 1], &mut hi[0]);
+        if !cur.tp_diff_ok {
+            compute_tp_diff(net, cur, &stack[ply - 1], &stack[ply]);
+        }
+        for &i in cur.tp_adds[persp].as_slice().iter().chain(cur.tp_subs[persp].as_slice()) {
             prefetch_row(net.tp_row(i));
         }
-        let zero = Acc([0; L1]);
-        apply_rows(&mut e.tp[persp], &zero, |i| net.tp_row(i), adds.as_slice(), &[]);
-        e.tp_ok[persp] = true;
-        self.tp_cache[slot] = Some((e.tp[persp], *pos));
+        apply_rows(&mut cur.acc[persp], &prev.acc[persp], |i| net.tp_row(i), cur.tp_adds[persp].as_slice(), cur.tp_subs[persp].as_slice());
+        let (a, b) = (&self.cache[old].acc.0, &self.cache[new].acc.0);
+        for ((d, &o), &n) in cur.acc[persp].0.iter_mut().zip(a.iter()).zip(b.iter()) {
+            *d = d.wrapping_sub(o).wrapping_add(n);
+        }
+        cur.acc_ok[persp] = true;
     }
 
     #[inline(never)]
-    fn ensure_tp(&mut self, stack: &[Position], ply: usize, persp: usize) {
+    fn ensure(&mut self, stack: &[Position], ply: usize, persp: usize) {
+        // A king move on the same side of the board, straight after a computed ply.
+        if HYBRID && ply > 0 {
+            let e = &self.entries[ply];
+            if !e.acc_ok[persp]
+                && e.psq_refresh[persp]
+                && !e.tp_refresh[persp]
+                && self.entries[ply - 1].acc_ok[persp]
+                && stack[ply - 1].king_sq(persp) != stack[ply].king_sq(persp)
+                && popcount(stack[ply].occ()) >= HYBRID_MIN_PIECES
+            {
+                return self.hybrid(stack, ply, persp);
+            }
+        }
         let mut k = ply;
-        while !self.entries[k].tp_ok[persp] {
-            if k == 0 || self.entries[k].tp_refresh[persp] {
-                return self.refresh_tp(&stack[ply], ply, persp);
+        while !self.entries[k].acc_ok[persp] {
+            let e = &self.entries[k];
+            if k == 0 || e.psq_refresh[persp] || e.tp_refresh[persp] {
+                self.refresh(&stack[ply], ply, persp);
+                if BACKWARD_FILL {
+                    self.fill_back(stack, ply, k, persp);
+                }
+                return;
             }
             k -= 1;
         }
         let net = &*self.net;
         for j in k + 1..=ply {
             let (lo, hi) = self.entries.split_at_mut(j);
-            let (prev, cur) = (&mut lo[j - 1], &mut hi[0]);
+            let (prev, cur) = (&lo[j - 1], &mut hi[0]);
+            if !cur.psq_diff_ok[persp] {
+                compute_psq_diff(cur, &stack[j - 1], &stack[j], persp);
+            }
             if !cur.tp_diff_ok {
                 compute_tp_diff(net, cur, &stack[j - 1], &stack[j]);
             }
-            for &i in cur.tp_adds[persp].as_slice().iter().chain(cur.tp_subs[persp].as_slice()) {
-                prefetch_row(net.tp_row(i));
+            // Threat and piece-square rows in one list; piece-square indices carry
+            // PSQ_FLAG so a single pass applies both.
+            let mut adds = IdxList::<{ TP_LIST + 8 }>::new();
+            let mut subs = IdxList::<{ TP_LIST + 8 }>::new();
+            for &i in cur.tp_adds[persp].as_slice() {
+                adds.push(i);
             }
-            apply_rows(
-                &mut cur.tp[persp],
-                &prev.tp[persp],
-                |i| net.tp_row(i),
-                cur.tp_adds[persp].as_slice(),
-                cur.tp_subs[persp].as_slice(),
-            );
-            cur.tp_ok[persp] = true;
+            for &i in cur.psq_adds[persp].as_slice() {
+                adds.push(i | PSQ_FLAG);
+            }
+            for &i in cur.tp_subs[persp].as_slice() {
+                subs.push(i);
+            }
+            for &i in cur.psq_subs[persp].as_slice() {
+                subs.push(i | PSQ_FLAG);
+            }
+            for &i in adds.as_slice().iter().chain(subs.as_slice()) {
+                prefetch_row(net.any_row(i));
+            }
+            apply_rows(&mut cur.acc[persp], &prev.acc[persp], |i| net.any_row(i), adds.as_slice(), subs.as_slice());
+            cur.acc_ok[persp] = true;
         }
     }
 
@@ -1377,8 +1481,7 @@ impl NnueState {
     /// every ply after the root registered through `push`.
     pub fn evaluate(&mut self, stack: &[Position], ply: usize) -> i32 {
         for persp in 0..2 {
-            self.ensure_psq(stack, ply, persp);
-            self.ensure_tp(stack, ply, persp);
+            self.ensure(stack, ply, persp);
         }
         let pos = &stack[ply];
         let e = &self.entries[ply];
@@ -1395,8 +1498,7 @@ impl NnueState {
         for p in 0..2 {
             let c = pos.stm ^ p;
             transform(
-                &e.psq[c],
-                &e.tp[c],
+                &e.acc[c],
                 (&mut ft_ref.0[p * (L1 / 2)..(p + 1) * (L1 / 2)]).try_into().unwrap(),
                 (p * (L1 / 8)) as u16,
                 &mut nnz,
@@ -1447,12 +1549,11 @@ fn push_nnz8(mask: usize, base: u16, nnz: &mut [u16; L1 / 4 + 8], n: &mut usize)
     *n += mask.count_ones() as usize;
 }
 
-/// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is the
-/// sum of the two accumulator components, while recording non-zero 4-byte groups.
+/// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is
+/// the accumulator, while recording non-zero 4-byte groups.
 #[inline(always)]
 fn transform(
-    psq: &Acc,
-    tp: &Acc,
+    acc: &Acc,
     out: &mut [u8; L1 / 2],
     base_group: u16,
     nnz: &mut [u16; L1 / 4 + 8],
@@ -1464,10 +1565,10 @@ fn transform(
         use std::arch::aarch64::*;
         const BITS: [u32; 4] = [1, 2, 4, 8];
         let bits = vld1q_u32(BITS.as_ptr());
-        let (a, b) = (psq.0.as_ptr(), tp.0.as_ptr());
+        let a = acc.0.as_ptr();
         let step8 = |j: usize| {
-            let x = vaddq_s16(vld1q_s16(a.add(j)), vld1q_s16(b.add(j)));
-            let y = vaddq_s16(vld1q_s16(a.add(j + H)), vld1q_s16(b.add(j + H)));
+            let x = vld1q_s16(a.add(j));
+            let y = vld1q_s16(a.add(j + H));
             let prod = vmull_u8(vqmovun_s16(x), vqmovun_s16(y));
             vshrn_n_u16::<8>(vshrq_n_u16::<1>(prod))
         };
@@ -1486,13 +1587,13 @@ fn transform(
     #[cfg(simd_avx2)]
     unsafe {
         use std::arch::x86_64::*;
-        let (a, b) = (psq.0.as_ptr(), tp.0.as_ptr());
+        let a = acc.0.as_ptr();
         let zero = _mm256_setzero_si256();
         let max = _mm256_set1_epi16(255);
         let ld = |p: *const i16| _mm256_loadu_si256(p as *const __m256i);
         let step16 = |j: usize| {
-            let x = _mm256_add_epi16(ld(a.add(j)), ld(b.add(j)));
-            let y = _mm256_add_epi16(ld(a.add(j + H)), ld(b.add(j + H)));
+            let x = ld(a.add(j));
+            let y = ld(a.add(j + H));
             let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), max);
             let y = _mm256_min_epi16(_mm256_max_epi16(y, zero), max);
             let p = _mm256_srli_epi16::<9>(_mm256_mullo_epi16(x, y));
@@ -1508,14 +1609,14 @@ fn transform(
     #[cfg(simd_avx512)]
     unsafe {
         use std::arch::x86_64::*;
-        let (a, b) = (psq.0.as_ptr(), tp.0.as_ptr());
+        let a = acc.0.as_ptr();
         let zero = _mm512_setzero_si512();
         let zero256 = _mm256_setzero_si256();
         let max = _mm512_set1_epi16(255);
         let ld = |p: *const i16| _mm512_loadu_si512(p as *const _);
         for j in (0..H).step_by(32) {
-            let x = _mm512_add_epi16(ld(a.add(j)), ld(b.add(j)));
-            let y = _mm512_add_epi16(ld(a.add(j + H)), ld(b.add(j + H)));
+            let x = ld(a.add(j));
+            let y = ld(a.add(j + H));
             let x = _mm512_min_epi16(_mm512_max_epi16(x, zero), max);
             let y = _mm512_min_epi16(_mm512_max_epi16(y, zero), max);
             let p = _mm512_srli_epi16::<9>(_mm512_mullo_epi16(x, y));
@@ -1527,12 +1628,12 @@ fn transform(
     }
     #[cfg(simd_none)]
     {
-        let (a, b) = (&psq.0, &tp.0);
+        let a = &acc.0;
         for j in (0..H).step_by(4) {
             let mut any = 0u8;
             for k in 0..4 {
-                let x = a[j + k].wrapping_add(b[j + k]).clamp(0, 255) as u32;
-                let y = a[j + k + H].wrapping_add(b[j + k + H]).clamp(0, 255) as u32;
+                let x = a[j + k].clamp(0, 255) as u32;
+                let y = a[j + k + H].clamp(0, 255) as u32;
                 let v = ((x * y) >> 9) as u8;
                 out[j + k] = v;
                 any |= v;
