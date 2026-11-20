@@ -214,10 +214,13 @@ impl Engine {
                                 contempt,
                                 &shared,
                             );
-                            if exp_write && !silent && pool.main.completed_depth >= 10 && !best.is_none() {
+                            if exp_write && !silent && pool.main.completed_depth >= 6 && !best.is_none() {
+                                let target = if exp_file.is_empty() { "esper.exp" } else { exp_file.as_str() };
                                 let mut guard = exp.lock().unwrap();
                                 guard.record(pos.key, best, pool.main.best_score, pool.main.completed_depth);
-                                let _ = guard.save(&exp_file);
+                                if let Err(err) = guard.save(target) {
+                                    println!("info string could not save experience: {err}");
+                                }
                             }
                             if !silent {
                                 if best.is_none() {
@@ -258,7 +261,7 @@ impl Engine {
             show_wdl: false,
             contempt: 0,
             exp: Arc::new(Mutex::new(Experience::empty())),
-            exp_file: String::new(),
+            exp_file: "esper.exp".to_string(),
             exp_write: false,
             tb: TbConfig::DEFAULT,
             own_book: false,
@@ -533,7 +536,14 @@ impl Engine {
                     }
                 }
             }
-            "experiencewrite" => self.exp_write = value.trim().eq_ignore_ascii_case("true"),
+            "experiencewrite" => {
+                self.exp_write = value.trim().eq_ignore_ascii_case("true");
+                if self.exp_write && !self.exp_file.is_empty() {
+                    if let Ok(e) = Experience::load(&self.exp_file) {
+                        *self.exp.lock().unwrap() = e;
+                    }
+                }
+            }
             "clear hash" => self.new_game(),
             "syzygypath" => {
                 let n = tb::init(&value);
@@ -925,7 +935,7 @@ impl Engine {
                 println!("option name Ponder type check default false");
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name Contempt type spin default 0 min -100 max 100");
-                println!("option name ExperienceFile type string default <empty>");
+                println!("option name ExperienceFile type string default esper.exp");
                 println!("option name ExperienceWrite type check default false");
                 println!("option name EvalFile type string default <embedded>");
                 println!("option name SyzygyPath type string default <empty>");

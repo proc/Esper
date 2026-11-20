@@ -38,6 +38,8 @@ const LOW_PLY_SIZE: usize = 5;
 const GOOD_QUIET_THRESHOLD: i32 = -14000;
 const KILLER_ORDERING: bool = true;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
+/// Prefetch the child's hash entry when a move is picked (see `prefetch_after`).
+const EARLY_TT_PREFETCH: bool = true;
 const SF_NMP: bool = true;
 // Further Stockfish-derived techniques.
 const SF_EVAL_SCALE: bool = true;
@@ -518,10 +520,14 @@ enum Stage {
     Done,
 }
 
+/// A scored move. The explicit padding makes it a plain 8 bytes, so moving one
+/// while sorting is a single 64-bit copy rather than separate field copies.
 #[derive(Clone, Copy)]
+#[repr(C, align(8))]
 struct Ext {
-    m: Move,
     v: i32,
+    m: Move,
+    _pad: u16,
 }
 
 struct Picker {
@@ -600,7 +606,7 @@ impl Picker {
             // En passant lands on an empty square: no victim, as in Stockfish.
             let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
             let v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
-            self.buf[at + i].write(Ext { m, v });
+            self.buf[at + i].write(Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -674,7 +680,7 @@ impl Picker {
                 } else {
                     1 << 24
                 };
-                self.buf[at + i].write(Ext { m, v });
+                self.buf[at + i].write(Ext { v, m, _pad: 0 });
                 continue;
             }
             let (from, to) = (m.from(), m.to());
@@ -705,7 +711,7 @@ impl Picker {
             if ply < LOW_PLY_SIZE {
                 v += 8 * s.low_ply_hist[ply][m.from_to()] as i32 / (1 + ply as i32);
             }
-            self.buf[at + i].write(Ext { m, v });
+            self.buf[at + i].write(Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -722,7 +728,7 @@ impl Picker {
                 let idx = pos.board[m.from()] as usize * 64 + m.to();
                 s.butterfly[pos.stm][m.from_to()] as i32 + s.cont_score(ply, 1, idx)
             };
-            self.buf[at + i].write(Ext { m, v });
+            self.buf[at + i].write(Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -1323,6 +1329,18 @@ impl Searcher {
         let pc = pos.board[m.from()] as usize;
         let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
         hist_update(&mut self.capture_hist[pc][m.to()][victim], bonus, CAPTURE_HIST_LIMIT);
+    }
+
+    /// Start loading the hash entry of the position after `m` as soon as the move
+    /// is picked, so the load overlaps the pruning decisions and the move itself
+    /// rather than stalling the child's probe. Castling, en passant and
+    /// promotions are skipped: their key needs a full move.
+    #[inline(always)]
+    fn prefetch_after(&self, pos: &Position, m: Move) {
+        let f = m.flag();
+        if EARLY_TT_PREFETCH && !(f == FLAG_EP || f == FLAG_KCASTLE || f == FLAG_QCASTLE || m.is_promo()) {
+            self.tt.prefetch(pos.key_after(m));
+        }
     }
 
     #[inline(always)]
@@ -2086,6 +2104,8 @@ impl Searcher {
 
         let mut picker = Picker::new(tt_move, false, depth);
         let has_pieces = pos.has_non_pawn_material(pos.stm);
+        // Built when a second move is searched: most nodes cut off on the first.
+        let mut ci: Option<CheckInfo> = None;
         let mut best = if pv_node { tb_floor } else { -INF };
         let mut best_move = Move::NONE;
         let mut move_count = 0;
@@ -2112,9 +2132,14 @@ impl Searcher {
             if !pos.is_legal(m) {
                 continue;
             }
+            self.prefetch_after(&pos, m);
             move_count += 1;
             let capture = m.is_capture_stage();
-            let gives_check = pos.gives_check(m);
+            let gives_check = if move_count == 1 {
+                pos.gives_check(m)
+            } else {
+                pos.gives_check_ci(m, ci.get_or_insert_with(|| pos.check_info()))
+            };
             let pc = pos.board[m.from()] as usize;
             let idx = pc * 64 + m.to();
             // En passant targets an empty square: no victim, as in Stockfish.
@@ -3022,6 +3047,8 @@ impl ThreadPool {
         if best != 0 {
             self.main.best_move = r.best_pv[0];
             self.main.ponder_move = r.best_pv.get(1).copied().unwrap_or(Move::NONE);
+            self.main.best_score = r.best_score;
+            self.main.completed_depth = r.completed_depth;
             if !silent {
                 let line = Line { score: r.best_score, seldepth: r.best_seldepth, pv: r.best_pv.clone() };
                 self.main.print_info(r.completed_depth, 0, &line, "");

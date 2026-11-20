@@ -66,7 +66,7 @@ impl Experience {
 
     /// Record a completed root search result, keeping the deeper entry.
     pub fn record(&mut self, key: u64, mv: Move, score: i32, depth: i32) {
-        if mv.is_none() || depth < 10 {
+        if mv.is_none() || depth < 6 {
             return;
         }
         let score = score.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
@@ -99,6 +99,11 @@ impl Experience {
             buf.extend_from_slice(&e.score.to_le_bytes());
             buf.extend_from_slice(&e.depth.to_le_bytes());
             buf.extend_from_slice(&e.count.to_le_bytes());
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
+            }
         }
         let mut f = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
         f.write_all(&buf).map_err(|e| format!("{path}: {e}"))?;

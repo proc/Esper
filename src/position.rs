@@ -177,6 +177,14 @@ static CASTLE_MASK: [u8; 64] = make_castle_masks();
 // Position
 // ---------------------------------------------------------------------------
 
+/// Per-node data for fast check detection; see `Position::check_info`.
+#[derive(Clone, Copy)]
+pub struct CheckInfo {
+    squares: [u64; 7],
+    blockers: u64,
+    ksq: usize,
+}
+
 #[derive(Clone, Copy)]
 pub struct Position {
     /// Indexed by piece type (1..=6); index 0 is unused.
@@ -573,9 +581,12 @@ impl Position {
         let pt = if m.is_promo() { m.promo_type() } else { piece_type(self.board[from]) };
         let occ = (self.occ() ^ bit(from)) | bit(to);
         let kb = bit(ksq);
+        // A slider can only give check along a line through the king; `line` is
+        // zero for unaligned squares, which skips the attack lookups.
         let direct = match pt {
             PAWN => pawn_attacks(us, to) & kb,
             KNIGHT => knight_attacks(to) & kb,
+            _ if line(to, ksq) == 0 => 0,
             BISHOP => bishop_attacks(to, occ) & kb,
             ROOK => rook_attacks(to, occ) & kb,
             QUEEN => (bishop_attacks(to, occ) | rook_attacks(to, occ)) & kb,
@@ -584,11 +595,56 @@ impl Position {
         if direct != 0 {
             return true;
         }
-        // Discovered check: one of our sliders now sees the king. A slider standing
-        // on `to` would be a captured enemy piece, hence the colour mask.
+        // Discovered check: one of our sliders now sees the king through `from`.
+        // A slider standing on `to` would be a captured enemy piece, hence the
+        // colour mask.
+        if line(from, ksq) == 0 {
+            return false;
+        }
         let ours = self.by_color[us] & !bit(from);
         (rook_attacks(ksq, occ) & ours & (self.by_type[ROOK] | self.by_type[QUEEN])) != 0
             || (bishop_attacks(ksq, occ) & ours & (self.by_type[BISHOP] | self.by_type[QUEEN])) != 0
+    }
+
+    /// What `gives_check` needs, worked out once per node (Stockfish's check
+    /// squares and discovered-check blockers).
+    #[inline]
+    pub fn check_info(&self) -> CheckInfo {
+        let us = self.stm;
+        let ksq = self.king_sq(us ^ 1);
+        let occ = self.occ();
+        let ours = self.by_color[us];
+        let mut squares = [0u64; 7];
+        squares[PAWN] = pawn_attacks(us ^ 1, ksq);
+        squares[KNIGHT] = knight_attacks(ksq);
+        squares[BISHOP] = bishop_attacks(ksq, occ);
+        squares[ROOK] = rook_attacks(ksq, occ);
+        squares[QUEEN] = squares[BISHOP] | squares[ROOK];
+        // Our pieces that alone stand between one of our sliders and their king.
+        let t = tables();
+        let mut snipers = (t.rook_empty[ksq] & ours & (self.by_type[ROOK] | self.by_type[QUEEN]))
+            | (t.bishop_empty[ksq] & ours & (self.by_type[BISHOP] | self.by_type[QUEEN]));
+        let mut blockers = 0u64;
+        while snipers != 0 {
+            let sq = pop_lsb(&mut snipers);
+            let b = between(sq, ksq) & occ;
+            if b != 0 && b & (b - 1) == 0 {
+                blockers |= b & ours;
+            }
+        }
+        CheckInfo { squares, blockers, ksq }
+    }
+
+    /// `gives_check` using precomputed `ci`.
+    #[inline(always)]
+    pub fn gives_check_ci(&self, m: Move, ci: &CheckInfo) -> bool {
+        let f = m.flag();
+        if f == FLAG_EP || f == FLAG_KCASTLE || f == FLAG_QCASTLE || m.is_promo() {
+            return self.gives_check(m);
+        }
+        let (from, to) = (m.from(), m.to());
+        let pt = piece_type(self.board[from]);
+        ci.squares[pt] & bit(to) != 0 || (ci.blockers & bit(from) != 0 && line(from, ci.ksq) & bit(to) == 0)
     }
 
     /// Static exchange evaluation: is the exchange started by `m` worth at least `threshold`?
