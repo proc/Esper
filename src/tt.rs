@@ -1,48 +1,47 @@
 //! Lock-free shared transposition table.
 //!
-//! Stockfish's density: 32-byte clusters of three entries, each a 64-bit data
-//! word plus a 16-bit check, so 10.7 bytes per entry instead of 16. The check is
-//! the key's low 16 bits XOR a 16-bit fold of the data, so a key and data word
-//! torn apart by racing threads fail it (as the old full-width `key ^ data`
-//! scheme did) and no locking is needed. Like Stockfish, a 16-bit check lets an
-//! unrelated position match about once in 65536 probes of a full cluster; moves
-//! taken from the table are validated before use.
+//! 64-byte clusters of five entries, each a 64-bit data word plus a 32-bit check:
+//! 12.8 bytes per entry, 1.25x the positions of the old 16-byte entries. The
+//! check is the key's low 32 bits XOR a 32-bit fold of the data, so a key and
+//! data word torn apart by racing threads fail it and no locking is needed.
+//! (Stockfish's 10.7-byte entries with a 16-bit check tested 15 Elo weaker here:
+//! its false matches cost more than the extra room.)
 
 use crate::position::Move;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 
 pub const BOUND_UPPER: u8 = 1;
 pub const BOUND_LOWER: u8 = 2;
 pub const BOUND_EXACT: u8 = 3;
 
-const ENTRIES_PER_BUCKET: usize = 3;
+const ENTRIES_PER_BUCKET: usize = 5;
 const GEN_MASK: u64 = 31;
 
-#[repr(C, align(32))]
+#[repr(C, align(64))]
 struct Bucket {
     data: [AtomicU64; ENTRIES_PER_BUCKET],
-    check: [AtomicU16; ENTRIES_PER_BUCKET],
-    _pad: u16,
+    check: [AtomicU32; ENTRIES_PER_BUCKET],
+    _pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Bucket>() == 32);
+const _: () = assert!(std::mem::size_of::<Bucket>() == 64);
 
-/// The 16-bit check stored for `key` with `data`.
+/// The 32-bit check stored for `key` with `data`.
 #[inline(always)]
-fn check16(key: u64, data: u64) -> u16 {
-    (key as u16) ^ (data as u16) ^ ((data >> 16) as u16) ^ ((data >> 32) as u16) ^ ((data >> 48) as u16)
+fn check32(key: u64, data: u64) -> u32 {
+    (key as u32) ^ (data as u32) ^ ((data >> 32) as u32)
 }
 
 impl Bucket {
     #[inline(always)]
     fn matches(&self, i: usize, key: u64, data: u64) -> bool {
-        data != 0 && self.check[i].load(Relaxed) == check16(key, data)
+        data != 0 && self.check[i].load(Relaxed) == check32(key, data)
     }
 
     #[inline(always)]
     fn write(&self, i: usize, key: u64, data: u64) {
         self.data[i].store(data, Relaxed);
-        self.check[i].store(check16(key, data), Relaxed);
+        self.check[i].store(check32(key, data), Relaxed);
     }
 }
 
@@ -271,7 +270,7 @@ mod tests {
     #[test]
     fn store_probe_and_density() {
         let tt = TT::new(1);
-        assert_eq!(tt.len() * ENTRIES_PER_BUCKET, 3 * 32768);
+        assert_eq!(tt.len() * ENTRIES_PER_BUCKET, 5 * 16384);
         let key = 0x1234_5678_9abc_def0u64;
         assert!(tt.probe(key).is_none());
         tt.store(key, Move(0x0abc), 123, -45, 9, BOUND_EXACT, true);

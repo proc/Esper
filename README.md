@@ -169,7 +169,7 @@ and countermove ordering, and the switches below).
   with its next move, so a draw is known to be available before it is played.
 - **Correction histories** keyed by pawns, non-pawns, minor pieces and the
   continuation, which adjust the static evaluation from search results.
-- **Transposition table**: lock-free, four entries per 64-byte bucket, shared by
+- **Transposition table**: lock-free, five entries per 64-byte bucket with 32-bit checks, shared by
   all threads, with Stockfish's replacement and aging rules.
 - **Root**: each root move keeps effort-weighted averages of its scores, which
   centre the aspiration window and set the evaluation's optimism.
