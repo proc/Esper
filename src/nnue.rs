@@ -47,6 +47,9 @@ struct LayerStack {
     w0: [[i8; 4 * L2]; L1 / 4],
     b0: [i32; L2],
     w1: [[i8; 2 * L2]; L3],
+    /// `w1` re-laid out by groups of 4 inputs, `w1c[input / 4][output * 4 + input % 4]`,
+    /// so all outputs accumulate in registers (no per-output horizontal sums).
+    w1c: [[i8; 4 * L3]; 2 * L2 / 4],
     b1: [i32; L3],
     w2: [i8; 2 * L2 + 2 * L3],
     b2: i32,
@@ -277,7 +280,7 @@ impl Network {
         for _ in 0..stored {
             let _hash = r.u32();
             let mut s =
-                LayerStack { w0: [[0; 4 * L2]; L1 / 4], b0: [0; L2], w1: [[0; 2 * L2]; L3], b1: [0; L3], w2: [0; 128], b2: 0 };
+                LayerStack { w0: [[0; 4 * L2]; L1 / 4], b0: [0; L2], w1: [[0; 2 * L2]; L3], w1c: [[0; 4 * L3]; 2 * L2 / 4], b1: [0; L3], w2: [0; 128], b2: 0 };
             for b in s.b0.iter_mut() {
                 *b = r.i32();
             }
@@ -292,6 +295,7 @@ impl Network {
             for o in 0..L3 {
                 for i in 0..2 * L2 {
                     s.w1[o][i] = r.i8();
+                    s.w1c[i / 4][o * 4 + i % 4] = s.w1[o][i];
                 }
             }
             s.b2 = r.i32();
@@ -611,18 +615,6 @@ impl ThreatBoard {
 }
 
 #[inline(always)]
-fn piece_attacks(pc: u8, sq: usize, occ: u64) -> u64 {
-    match piece_type(pc) {
-        PAWN => pawn_attacks(piece_color(pc), sq),
-        KNIGHT => knight_attacks(sq),
-        BISHOP => bishop_attacks(sq, occ),
-        ROOK => rook_attacks(sq, occ),
-        QUEEN => bishop_attacks(sq, occ) | rook_attacks(sq, occ),
-        _ => 0,
-    }
-}
-
-#[inline(always)]
 fn threat_code(from: usize, to: usize, attacker: u8, attacked: u8) -> u32 {
     ((from as u32) << 14) | ((to as u32) << 8) | ((attacker as u32) << 4) | attacked as u32
 }
@@ -635,25 +627,34 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
     let pt = piece_type(pc);
     let occ = tb.occ;
     let t = &tb.by_type;
+    // Slider rays from `sq`, shared by every part below.
+    let diag = bishop_attacks(sq, occ);
+    let ortho = rook_attacks(sq, occ);
     // What the piece attacks.
-    let mut att = piece_attacks(pc, sq, occ) & tb.targets(pt);
+    let own = match pt {
+        PAWN => pawn_attacks(piece_color(pc), sq),
+        KNIGHT => knight_attacks(sq),
+        BISHOP => diag,
+        ROOK => ortho,
+        QUEEN => diag | ortho,
+        _ => 0,
+    };
+    let mut att = own & tb.targets(pt);
     while att != 0 {
         let to = pop_lsb(&mut att);
         with.push(threat_code(sq, to, pc, tb.board[to]));
     }
-    if pt == KING {
-        // Kings neither attack nor get attacked, but they do block lines.
-    } else {
-        // What attacks the piece.
-        let diag = bishop_attacks(sq, occ);
-        let ortho = rook_attacks(sq, occ);
+    let diag_sliders = diag & (t[BISHOP] | t[QUEEN]);
+    let ortho_sliders = ortho & (t[ROOK] | t[QUEEN]);
+    if pt != KING {
+        // What attacks the piece (kings neither attack nor get attacked, but block lines).
         let mut attackers = (knight_attacks(sq) & t[KNIGHT]) | ((diag | ortho) & t[QUEEN]);
         if pt != QUEEN {
             attackers |= (diag & t[BISHOP]) | (ortho & t[ROOK]);
         }
         if pt == KNIGHT || pt == ROOK {
-            let white = tb.by_type[PAWN] & tb.by_color[WHITE];
-            let black = tb.by_type[PAWN] & tb.by_color[BLACK];
+            let white = t[PAWN] & tb.by_color[WHITE];
+            let black = t[PAWN] & tb.by_color[BLACK];
             attackers |= (pawn_attacks(BLACK, sq) & white) | (pawn_attacks(WHITE, sq) & black);
         }
         while attackers != 0 {
@@ -661,13 +662,15 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
             with.push(threat_code(from, sq, tb.board[from], pc));
         }
     }
-    // Sliders whose line runs through `sq` see one piece further when it is empty.
-    let mut sliders = (bishop_attacks(sq, occ) & (t[BISHOP] | t[QUEEN])) | (rook_attacks(sq, occ) & (t[ROOK] | t[QUEEN]));
-    let open = occ ^ bit(sq);
+    // Sliders whose line runs through `sq` see one piece further when it is
+    // empty: the first piece past `sq` on that line, which `sq`'s own ray in the
+    // same direction already found.
+    let mut sliders = diag_sliders | ortho_sliders;
     while sliders != 0 {
         let from = pop_lsb(&mut sliders);
         let spc = tb.board[from];
-        let mut beyond = piece_attacks(spc, from, open) & !piece_attacks(spc, from, occ) & open & tb.targets(piece_type(spc));
+        let ray = if (diag_sliders >> from) & 1 != 0 { diag } else { ortho };
+        let mut beyond = ray & line(from, sq) & !between(from, sq) & !bit(from) & tb.targets(piece_type(spc));
         while beyond != 0 {
             let to = pop_lsb(&mut beyond);
             without.push(threat_code(from, to, spc, tb.board[to]));
@@ -705,6 +708,10 @@ fn threat_changes_inc<const N: usize>(p0: &Position, p1: &Position, added: &mut 
         }
     }
     // Drop threats that were both lost and regained: each costs two row updates.
+    // (Turning this off cost about 2% in cycles: the duplicate rows cost more.)
+    if !CANCEL_DUPLICATE_THREATS {
+        return;
+    }
     let mut i = 0;
     while i < added.n {
         let x = added.as_slice()[i];
@@ -819,6 +826,22 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
         return;
     }
     const TILE: usize = 128; // 16 registers of 8 lanes
+    // Row addresses are looked up once, not once per row per tile.
+    const MAXR: usize = TP_LIST + 16;
+    // Left uninitialised: zero-filling these on every call cost more than it saved.
+    let mut add_buf = [std::mem::MaybeUninit::<*const i8>::uninit(); MAXR];
+    let mut sub_buf = [std::mem::MaybeUninit::<*const i8>::uninit(); MAXR];
+    let (na, ns) = (adds.len().min(MAXR), subs.len().min(MAXR));
+    debug_assert!(adds.len() <= MAXR && subs.len() <= MAXR);
+    for (p, &i) in add_buf.iter_mut().zip(adds) {
+        p.write(row(i).as_ptr() as *const i8);
+    }
+    for (p, &i) in sub_buf.iter_mut().zip(subs) {
+        p.write(row(i).as_ptr() as *const i8);
+    }
+    // SAFETY: the first `na` / `ns` slots were just written.
+    let add_ptrs: &[*const i8] = unsafe { std::slice::from_raw_parts(add_buf.as_ptr() as *const *const i8, na) };
+    let sub_ptrs: &[*const i8] = unsafe { std::slice::from_raw_parts(sub_buf.as_ptr() as *const *const i8, ns) };
     // SAFETY: all pointers stay within the 1024-element arrays.
     unsafe {
         let mut off = 0;
@@ -828,16 +851,16 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = vld1q_s16(s.add(k * 8));
             }
-            for &i in adds {
-                let w = row(i).as_ptr().add(off) as *const i8;
+            for &p in add_ptrs {
+                let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
                     regs[2 * k] = vaddw_s8(regs[2 * k], vget_low_s8(v));
                     regs[2 * k + 1] = vaddw_high_s8(regs[2 * k + 1], v);
                 }
             }
-            for &i in subs {
-                let w = row(i).as_ptr().add(off) as *const i8;
+            for &p in sub_ptrs {
+                let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
                     regs[2 * k] = vsubw_s8(regs[2 * k], vget_low_s8(v));
@@ -997,6 +1020,9 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
 
 /// Largest possible change lists: up to 256 threats plus 120 pawn pairs.
 const TP_LIST: usize = 512;
+/// Refresh as Stockfish does: cached piece-square sums plus all active threats in
+/// one pass (otherwise: separate piece-square and threat caches, summed).
+const SF_REFRESH: bool = true;
 /// After a refresh, also compute the accumulators back to the refresh boundary
 /// (see `fill_back`).
 const BACKWARD_FILL: bool = true;
@@ -1135,6 +1161,157 @@ fn tp_rows<const N: usize, const M: usize>(
     }
 }
 
+/// `dst = src + rows(adds) - rows(subs)` with the rows given as addresses.
+#[cfg(simd_neon)]
+fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+    use std::arch::aarch64::*;
+    const TILE: usize = 128; // 16 registers of 8 lanes
+    // SAFETY: every address points at a row of L1 weights.
+    unsafe {
+        let mut off = 0;
+        while off < L1 {
+            let mut regs = [vdupq_n_s16(0); TILE / 8];
+            let s = src.0.as_ptr().add(off);
+            for (k, r) in regs.iter_mut().enumerate() {
+                *r = vld1q_s16(s.add(k * 8));
+            }
+            for &p in adds {
+                let w = p.add(off);
+                for k in 0..TILE / 16 {
+                    let v = vld1q_s8(w.add(k * 16));
+                    regs[2 * k] = vaddw_s8(regs[2 * k], vget_low_s8(v));
+                    regs[2 * k + 1] = vaddw_high_s8(regs[2 * k + 1], v);
+                }
+            }
+            for &p in subs {
+                let w = p.add(off);
+                for k in 0..TILE / 16 {
+                    let v = vld1q_s8(w.add(k * 16));
+                    regs[2 * k] = vsubw_s8(regs[2 * k], vget_low_s8(v));
+                    regs[2 * k + 1] = vsubw_high_s8(regs[2 * k + 1], v);
+                }
+            }
+            let d = dst.0.as_mut_ptr().add(off);
+            for (k, r) in regs.iter().enumerate() {
+                vst1q_s16(d.add(k * 8), *r);
+            }
+            off += TILE;
+        }
+    }
+}
+
+#[cfg(not(simd_neon))]
+fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+    let row = |i: u32| -> &[u8; L1] {
+        let p = if (i as usize) < adds.len() { adds[i as usize] } else { subs[i as usize - adds.len()] };
+        // SAFETY: every address points at a row of L1 weights.
+        unsafe { &*(p as *const [u8; L1]) }
+    };
+    let ai: Vec<u32> = (0..adds.len() as u32).collect();
+    let si: Vec<u32> = (adds.len() as u32..(adds.len() + subs.len()) as u32).collect();
+    apply_rows(dst, src, row, &ai, &si);
+}
+
+/// Row addresses for an incremental step: threat rows then piece-square rows.
+#[inline(always)]
+fn row_ptrs<'a>(
+    net: &Network,
+    tp: &[u32],
+    psq: &[u32],
+    buf: &'a mut [std::mem::MaybeUninit<*const i8>; TP_LIST + 8],
+) -> &'a [*const i8] {
+    let n = tp.len() + psq.len();
+    debug_assert!(n <= TP_LIST + 8);
+    for (d, &i) in buf.iter_mut().zip(tp) {
+        let r = net.tp_row(i);
+        prefetch_row(r);
+        d.write(r.as_ptr() as *const i8);
+    }
+    for (d, &i) in buf[tp.len()..].iter_mut().zip(psq) {
+        let r = net.psq_row(i);
+        prefetch_row(r);
+        d.write(r.as_ptr() as *const i8);
+    }
+    // SAFETY: the first `n` slots were just written.
+    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const *const i8, n) }
+}
+
+/// One-pass refresh (Stockfish's update_accumulator_refresh_cache): per tile,
+/// `cache += psq rows`, stored back to the cache, then `+ threat rows`, stored to
+/// `out`. Rows are given as addresses.
+#[cfg(simd_neon)]
+fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+    use std::arch::aarch64::*;
+    const TILE: usize = 128;
+    // SAFETY: every row holds L1 weights and the accumulators L1 lanes.
+    unsafe {
+        let mut off = 0;
+        while off < L1 {
+            let mut regs = [vdupq_n_s16(0); TILE / 8];
+            let c = cache.0.as_mut_ptr().add(off);
+            for (k, r) in regs.iter_mut().enumerate() {
+                *r = vld1q_s16(c.add(k * 8));
+            }
+            for &p in padds {
+                let w = p.add(off);
+                for k in 0..TILE / 16 {
+                    let v = vld1q_s8(w.add(k * 16));
+                    regs[2 * k] = vaddw_s8(regs[2 * k], vget_low_s8(v));
+                    regs[2 * k + 1] = vaddw_high_s8(regs[2 * k + 1], v);
+                }
+            }
+            for &p in psubs {
+                let w = p.add(off);
+                for k in 0..TILE / 16 {
+                    let v = vld1q_s8(w.add(k * 16));
+                    regs[2 * k] = vsubw_s8(regs[2 * k], vget_low_s8(v));
+                    regs[2 * k + 1] = vsubw_high_s8(regs[2 * k + 1], v);
+                }
+            }
+            if !padds.is_empty() || !psubs.is_empty() {
+                for (k, r) in regs.iter().enumerate() {
+                    vst1q_s16(c.add(k * 8), *r);
+                }
+            }
+            for &p in tadds {
+                let w = p.add(off);
+                for k in 0..TILE / 16 {
+                    let v = vld1q_s8(w.add(k * 16));
+                    regs[2 * k] = vaddw_s8(regs[2 * k], vget_low_s8(v));
+                    regs[2 * k + 1] = vaddw_high_s8(regs[2 * k + 1], v);
+                }
+            }
+            let d = out.0.as_mut_ptr().add(off);
+            for (k, r) in regs.iter().enumerate() {
+                vst1q_s16(d.add(k * 8), *r);
+            }
+            off += TILE;
+        }
+    }
+}
+
+#[cfg(not(simd_neon))]
+fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+    // Portable fallback: plain loops over the addresses.
+    for j in 0..L1 {
+        let mut v = cache.0[j];
+        for &p in padds {
+            v = v.wrapping_add(unsafe { *p.add(j) } as i16);
+        }
+        for &p in psubs {
+            v = v.wrapping_sub(unsafe { *p.add(j) } as i16);
+        }
+        cache.0[j] = v;
+        for &p in tadds {
+            v = v.wrapping_add(unsafe { *p.add(j) } as i16);
+        }
+        out.0[j] = v;
+    }
+}
+
+/// Search the added and removed threat lists for pairs that cancel out.
+const CANCEL_DUPLICATE_THREATS: bool = true;
+
 /// Compute a move's feature changes when it is made rather than when the
 /// position is evaluated. Off: many made positions are never evaluated, and the
 /// wasted work cost 6% in cycles per node despite the earlier prefetch.
@@ -1166,10 +1343,27 @@ fn compute_tp_diff(net: &Network, cur: &mut Entry, p0: &Position, p1: &Position)
 fn compute_psq_diff(cur: &mut Entry, p0: &Position, p1: &Position, persp: usize) {
     let k1 = p1.king_sq(persp);
     let block = psq_block(p1, persp);
+    let base = psq_base(persp, k1, block);
+    let orient = orientation(persp, k1);
     let (adds, subs) = (&mut cur.psq_adds[persp], &mut cur.psq_subs[persp]);
     adds.clear();
     subs.clear();
-    psq_diff(persp, k1, block, (&p0.by_color, &p0.by_type), (&p1.by_color, &p1.by_type), adds, subs);
+    // Only the squares the move touched can differ: read the old and new piece
+    // there instead of comparing all twelve piece bitboards.
+    let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
+    for pt in PAWN..=KING {
+        changed |= p0.by_type[pt] ^ p1.by_type[pt];
+    }
+    while changed != 0 {
+        let sq = pop_lsb(&mut changed);
+        let (old, new) = (p0.board[sq], p1.board[sq]);
+        if old != 0 {
+            subs.push((base + psq_piece_offset(persp, piece_color(old), piece_type(old)) + (sq ^ orient)) as u32);
+        }
+        if new != 0 {
+            adds.push((base + psq_piece_offset(persp, piece_color(new), piece_type(new)) + (sq ^ orient)) as u32);
+        }
+    }
     cur.psq_diff_ok[persp] = true;
 }
 
@@ -1248,11 +1442,66 @@ impl NnueState {
         }
     }
 
+    /// Rebuild the accumulator of `persp` at `ply` as Stockfish does: the cached
+    /// piece-square sums for this king square, brought up to date with `pos`,
+    /// plus every active threat and pawn-pair row, all applied in one pass.
+    #[inline(never)]
+    fn refresh(&mut self, pos: &Position, ply: usize, persp: usize) {
+        if !SF_REFRESH {
+            return self.refresh_cached(pos, ply, persp);
+        }
+        let net = &*self.net;
+        let ksq = pos.king_sq(persp);
+        let block = psq_block(pos, persp);
+        let orient = orientation(persp, ksq);
+        let ci = (persp * 3 + block) * 64 + ksq;
+        let c = &mut self.cache[ci];
+        let (mut padds, mut psubs) = (IdxList::<64>::new(), IdxList::<64>::new());
+        psq_diff(persp, ksq, block, (&c.by_color, &c.by_type), (&pos.by_color, &pos.by_type), &mut padds, &mut psubs);
+        let e = &mut self.entries[ply];
+        if !e.threats_ok {
+            e.n_threats = gen_threats(pos, &mut e.threats);
+            e.threats_ok = true;
+        }
+        // Row addresses: piece-square changes and every active threat and
+        // pawn-pair feature; then one pass updates the cache and builds `out`.
+        let mut tidx = IdxList::<TP_LIST>::new();
+        for &t in &e.threats[..e.n_threats] {
+            let idx = net.luts.threat_index(t, persp, orient);
+            tidx.push_if(idx, (idx as usize) < THREAT_DIMS);
+        }
+        let (w, b) = (pos.pieces(WHITE, PAWN), pos.pieces(BLACK, PAWN));
+        net.luts.pair_indices(persp, orient, w | b, w, b, &mut tidx);
+        let mut pa = [std::ptr::null::<i8>(); 64];
+        let mut ps = [std::ptr::null::<i8>(); 64];
+        let mut ta = [std::mem::MaybeUninit::<*const i8>::uninit(); TP_LIST];
+        for (d, &i) in pa.iter_mut().zip(padds.as_slice()) {
+            *d = net.psq_row(i).as_ptr() as *const i8;
+            prefetch_row(net.psq_row(i));
+        }
+        for (d, &i) in ps.iter_mut().zip(psubs.as_slice()) {
+            *d = net.psq_row(i).as_ptr() as *const i8;
+            prefetch_row(net.psq_row(i));
+        }
+        for (d, &i) in ta.iter_mut().zip(tidx.as_slice()) {
+            d.write(net.tp_row(i).as_ptr() as *const i8);
+            prefetch_row(net.tp_row(i));
+        }
+        // SAFETY: the first `tidx.n` slots were just written.
+        let ta = unsafe { std::slice::from_raw_parts(ta.as_ptr() as *const *const i8, tidx.n) };
+        refresh_rows(&mut c.acc, &mut e.acc[persp], &pa[..padds.n], &ps[..psubs.n], ta);
+        if padds.n + psubs.n > 0 {
+            c.by_color = pos.by_color;
+            c.by_type = pos.by_type;
+        }
+        e.acc_ok[persp] = true;
+    }
+
     /// Rebuild the accumulator of `persp` at `ply` from the caches: the piece-square
     /// part from the per-king-square cache, the threat part from the per-side
     /// threat cache, each brought up to date with `pos` and then added together.
     #[inline(never)]
-    fn refresh(&mut self, pos: &Position, ply: usize, persp: usize) {
+    fn refresh_cached(&mut self, pos: &Position, ply: usize, persp: usize) {
         let net = &*self.net;
         // Piece-square part, written straight into the entry and copied back to the cache.
         let ksq = pos.king_sq(persp);
@@ -1452,26 +1701,13 @@ impl NnueState {
             if !cur.tp_diff_ok {
                 compute_tp_diff(net, cur, &stack[j - 1], &stack[j]);
             }
-            // Threat and piece-square rows in one list; piece-square indices carry
-            // PSQ_FLAG so a single pass applies both.
-            let mut adds = IdxList::<{ TP_LIST + 8 }>::new();
-            let mut subs = IdxList::<{ TP_LIST + 8 }>::new();
-            for &i in cur.tp_adds[persp].as_slice() {
-                adds.push(i);
-            }
-            for &i in cur.psq_adds[persp].as_slice() {
-                adds.push(i | PSQ_FLAG);
-            }
-            for &i in cur.tp_subs[persp].as_slice() {
-                subs.push(i);
-            }
-            for &i in cur.psq_subs[persp].as_slice() {
-                subs.push(i | PSQ_FLAG);
-            }
-            for &i in adds.as_slice().iter().chain(subs.as_slice()) {
-                prefetch_row(net.any_row(i));
-            }
-            apply_rows(&mut cur.acc[persp], &prev.acc[persp], |i| net.any_row(i), adds.as_slice(), subs.as_slice());
+            // Threat and piece-square rows go straight to address lists and are
+            // applied in one pass.
+            let mut abuf = [std::mem::MaybeUninit::uninit(); TP_LIST + 8];
+            let mut sbuf = [std::mem::MaybeUninit::uninit(); TP_LIST + 8];
+            let adds = row_ptrs(net, cur.tp_adds[persp].as_slice(), cur.psq_adds[persp].as_slice(), &mut abuf);
+            let subs = row_ptrs(net, cur.tp_subs[persp].as_slice(), cur.psq_subs[persp].as_slice(), &mut sbuf);
+            apply_ptrs(&mut cur.acc[persp], &prev.acc[persp], adds, subs);
             cur.acc_ok[persp] = true;
         }
     }
@@ -1495,6 +1731,7 @@ impl NnueState {
         let ft_ref = unsafe { &mut *ft.as_mut_ptr() };
         let mut nnz = [0u16; L1 / 4 + 8];
         let mut n_nnz = 0usize;
+        let mut bits = [0u8; L1 / 32];
         for p in 0..2 {
             let c = pos.stm ^ p;
             transform(
@@ -1503,33 +1740,23 @@ impl NnueState {
                 (p * (L1 / 8)) as u16,
                 &mut nnz,
                 &mut n_nnz,
+                &mut bits,
             );
         }
 
         let s = &net.stacks[net.stack_index[layer_stack(pos)] as usize];
-        let h0 = layer0(s, &ft_ref.0, &nnz[..n_nnz]);
+        let h0 = layer0(s, &ft_ref.0, &nnz[..n_nnz], &bits);
 
         // Squared and linear clipped activations. Clamping first keeps the square
         // inside i32 without changing the (saturated) result.
         #[repr(C, align(64))]
         struct Act([u8; 2 * L2 + 2 * L3]);
         let mut act = Act([0; 2 * L2 + 2 * L3]);
-        for i in 0..L2 {
-            let c = h0[i].clamp(-16384, 16384);
-            act.0[i] = ((c * c) >> 21).min(127) as u8;
-            act.0[L2 + i] = (h0[i] >> 7).clamp(0, 127) as u8;
-        }
+        activate::<21, 7>(&h0, &mut act.0[..2 * L2]);
 
         // Layer 1
-        let mut h1 = s.b1;
-        for o in 0..L3 {
-            h1[o] += dot_u8_i8(&act.0[..2 * L2], &s.w1[o]);
-        }
-        for i in 0..L3 {
-            let c = h1[i].clamp(-16384, 16384);
-            act.0[2 * L2 + i] = ((c * c) >> 19).min(127) as u8;
-            act.0[2 * L2 + L3 + i] = (h1[i] >> 6).clamp(0, 127) as u8;
-        }
+        let h1 = layer1(s, (&act.0[..2 * L2]).try_into().unwrap());
+        activate::<19, 6>(&h1, &mut act.0[2 * L2..]);
 
         // Output layer (sees both hidden layers) plus a skip connection.
         let out = s.b2 + dot_u8_i8(&act.0, &s.w2) + h0[L2 - 2] - h0[L2 - 1];
@@ -1540,6 +1767,7 @@ impl NnueState {
 
 /// Append up to 8 non-zero group indices described by `mask` starting at `base`.
 #[inline(always)]
+#[cfg_attr(simd_neon_dot, allow(dead_code))]
 fn push_nnz8(mask: usize, base: u16, nnz: &mut [u16; L1 / 4 + 8], n: &mut usize) {
     let lut = &NNZ_LUT[mask];
     let dst = unsafe { nnz.as_mut_ptr().add(*n) };
@@ -1558,30 +1786,53 @@ fn transform(
     base_group: u16,
     nnz: &mut [u16; L1 / 4 + 8],
     n_nnz: &mut usize,
+    bits: &mut [u8; L1 / 32],
 ) {
     const H: usize = L1 / 2;
+    let _ = &bits;
     #[cfg(simd_neon)]
     unsafe {
         use std::arch::aarch64::*;
         const BITS: [u32; 4] = [1, 2, 4, 8];
-        let bits = vld1q_u32(BITS.as_ptr());
+        let bit4 = vld1q_u32(BITS.as_ptr());
         let a = acc.0.as_ptr();
-        let step8 = |j: usize| {
-            let x = vld1q_s16(a.add(j));
-            let y = vld1q_s16(a.add(j + H));
-            let prod = vmull_u8(vqmovun_s16(x), vqmovun_s16(y));
-            vshrn_n_u16::<8>(vshrq_n_u16::<1>(prod))
+        // 16 outputs: two widening multiplies, then the high bytes of all 16
+        // products in one de-interleave and a byte shift: (x * y) >> 9, as
+        // Stockfish's NEON transform does it.
+        let step16 = |j: usize| {
+            let x0 = vqmovun_s16(vld1q_s16(a.add(j)));
+            let x1 = vqmovun_s16(vld1q_s16(a.add(j + 8)));
+            let y0 = vqmovun_s16(vld1q_s16(a.add(j + H)));
+            let y1 = vqmovun_s16(vld1q_s16(a.add(j + H + 8)));
+            let m0 = vreinterpretq_u8_u16(vmull_u8(x0, y0));
+            let m1 = vreinterpretq_u8_u16(vmull_u8(x1, y1));
+            vshrq_n_u8::<1>(vuzp2q_u8(m0, m1))
         };
         for j in (0..H).step_by(32) {
-            let q0 = vcombine_u8(step8(j), step8(j + 8));
-            let q1 = vcombine_u8(step8(j + 16), step8(j + 24));
+            let q0 = step16(j);
+            let q1 = step16(j + 16);
             vst1q_u8(out.as_mut_ptr().add(j), q0);
             vst1q_u8(out.as_mut_ptr().add(j + 16), q1);
             let u0 = vreinterpretq_u32_u8(q0);
             let u1 = vreinterpretq_u32_u8(q1);
-            let lo = vaddvq_u32(vandq_u32(vtstq_u32(u0, u0), bits));
-            let hi = vaddvq_u32(vandq_u32(vtstq_u32(u1, u1), bits));
-            push_nnz8((lo | (hi << 4)) as usize, base_group + (j / 4) as u16, nnz, n_nnz);
+            #[cfg(simd_neon_dot)]
+            {
+                // Stockfish's recording: one byte per 8 groups, bit g for group g,
+                // from a single horizontal add.
+                const MASK8: [u16; 8] = [1, 16, 2, 32, 4, 64, 8, 128];
+                let t0 = vreinterpretq_u16_u32(vtstq_u32(u0, u0));
+                let t1 = vreinterpretq_u16_u32(vtstq_u32(u1, u1));
+                let packed = vtrn1q_u16(t0, t1);
+                let byte = vaddvq_u16(vandq_u16(packed, vld1q_u16(MASK8.as_ptr())));
+                *bits.get_unchecked_mut(base_group as usize / 8 + j / 32) = byte as u8;
+                let _ = (&nnz, &n_nnz, &bit4);
+            }
+            #[cfg(not(simd_neon_dot))]
+            {
+                let lo = vaddvq_u32(vandq_u32(vtstq_u32(u0, u0), bit4));
+                let hi = vaddvq_u32(vandq_u32(vtstq_u32(u1, u1), bit4));
+                push_nnz8((lo | (hi << 4)) as usize, base_group + (j / 4) as u16, nnz, n_nnz);
+            }
         }
     }
     #[cfg(simd_avx2)]
@@ -1647,6 +1898,7 @@ fn transform(
 }
 
 /// For every 8-bit mask, the positions of its set bits (padded with zeros).
+#[cfg_attr(simd_neon_dot, allow(dead_code))]
 static NNZ_LUT: [[u16; 8]; 256] = {
     let mut t = [[0u16; 8]; 256];
     let mut m = 0;
@@ -1706,8 +1958,75 @@ fn dot_u8_i8(a: &[u8], w: &[i8]) -> i32 {
 
 /// First (sparse-input) affine layer: only groups of four inputs that are not all
 /// zero are visited.
+/// Squared and linear clipped ReLU of 32 values: `out[i] = min(clamp(h,±16384)^2 >> SQ, 127)`
+/// and `out[32 + i] = clamp(h >> LIN, 0, 127)`.
+#[inline(always)]
+fn activate<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
+    debug_assert!(out.len() >= 2 * L2);
+    #[cfg(simd_neon)]
+    unsafe {
+        use std::arch::aarch64::*;
+        let (lo, hi, top) = (vdupq_n_s32(-16384), vdupq_n_s32(16384), vdupq_n_s32(127));
+        let zero = vdupq_n_s32(0);
+        for k in (0..L2).step_by(8) {
+            let (a, b) = (vld1q_s32(h.as_ptr().add(k)), vld1q_s32(h.as_ptr().add(k + 4)));
+            let (ca, cb) = (vmaxq_s32(vminq_s32(a, hi), lo), vmaxq_s32(vminq_s32(b, hi), lo));
+            let sa = vminq_s32(vshlq_s32(vmulq_s32(ca, ca), vdupq_n_s32(-SQ)), top);
+            let sb = vminq_s32(vshlq_s32(vmulq_s32(cb, cb), vdupq_n_s32(-SQ)), top);
+            let la = vmaxq_s32(vminq_s32(vshlq_s32(a, vdupq_n_s32(-LIN)), top), zero);
+            let lb = vmaxq_s32(vminq_s32(vshlq_s32(b, vdupq_n_s32(-LIN)), top), zero);
+            let sq8 = vqmovn_u16(vcombine_u16(vqmovun_s32(sa), vqmovun_s32(sb)));
+            let li8 = vqmovn_u16(vcombine_u16(vqmovun_s32(la), vqmovun_s32(lb)));
+            vst1_u8(out.as_mut_ptr().add(k), sq8);
+            vst1_u8(out.as_mut_ptr().add(L2 + k), li8);
+        }
+    }
+    #[cfg(not(simd_neon))]
+    for i in 0..L2 {
+        let c = h[i].clamp(-16384, 16384);
+        out[i] = ((c * c) >> SQ).min(127) as u8;
+        out[L2 + i] = (h[i] >> LIN).clamp(0, 127) as u8;
+    }
+}
+
+/// Second layer: 64 activations to 32 outputs.
+#[inline(always)]
+fn layer1(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
+    #[cfg(simd_neon_dot)]
+    unsafe {
+        use std::arch::aarch64::*;
+        // Input-group-major weights: each group of 4 activations feeds all 32
+        // outputs through 8 dot products, with no horizontal sums.
+        let mut acc = [vdupq_n_s32(0); L3 / 4];
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a = vld1q_s32(s.b1.as_ptr().add(k * 4));
+        }
+        for c in 0..2 * L2 / 4 {
+            let input = vreinterpretq_s8_u32(vdupq_n_u32(std::ptr::read_unaligned(act.as_ptr().add(c * 4) as *const u32)));
+            let w = s.w1c.get_unchecked(c).as_ptr();
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a = vdotq_s32(*a, vld1q_s8(w.add(k * 16)), input);
+            }
+        }
+        let mut h = [0i32; L3];
+        for (k, a) in acc.iter().enumerate() {
+            vst1q_s32(h.as_mut_ptr().add(k * 4), *a);
+        }
+        h
+    }
+    #[cfg(not(simd_neon_dot))]
+    {
+        let mut h = s.b1;
+        for o in 0..L3 {
+            h[o] += dot_u8_i8(act, &s.w1[o]);
+        }
+        h
+    }
+}
+
 #[inline(never)]
-fn layer0(s: &LayerStack, ft: &[u8; L1], nnz: &[u16]) -> [i32; L2] {
+fn layer0(s: &LayerStack, ft: &[u8; L1], nnz: &[u16], bits: &[u8; L1 / 32]) -> [i32; L2] {
+    let _ = (&nnz, &bits);
     let group = |c: usize| unsafe { std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const u32) };
 
     #[cfg(simd_neon_dot)]
@@ -1717,12 +2036,17 @@ fn layer0(s: &LayerStack, ft: &[u8; L1], nnz: &[u16]) -> [i32; L2] {
         for (k, a) in acc.iter_mut().enumerate() {
             *a = vld1q_s32(s.b0.as_ptr().add(k * 4));
         }
-        for &c in nnz {
-            let c = c as usize;
-            let input = vreinterpretq_s8_u32(vdupq_n_u32(group(c)));
-            let w = s.w0.get_unchecked(c).as_ptr();
-            for (k, a) in acc.iter_mut().enumerate() {
-                *a = vdotq_s32(*a, vld1q_s8(w.add(k * 16)), input);
+        // Walk the non-zero groups straight from the bitset (Stockfish's way).
+        for word in 0..L1 / 4 / 64 {
+            let mut b = u64::from_le_bytes(*(bits.as_ptr().add(word * 8) as *const [u8; 8]));
+            while b != 0 {
+                let c = word * 64 + b.trailing_zeros() as usize;
+                b &= b - 1;
+                let input = vreinterpretq_s8_u32(vdupq_n_u32(group(c)));
+                let w = s.w0.get_unchecked(c).as_ptr();
+                for (k, a) in acc.iter_mut().enumerate() {
+                    *a = vdotq_s32(*a, vld1q_s8(w.add(k * 16)), input);
+                }
             }
         }
         let mut h0 = [0i32; L2];
