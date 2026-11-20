@@ -214,14 +214,6 @@ impl Engine {
                                 contempt,
                                 &shared,
                             );
-                            if exp_write && !silent && pool.main.completed_depth >= 6 && !best.is_none() {
-                                let target = if exp_file.is_empty() { "esper.exp" } else { exp_file.as_str() };
-                                let mut guard = exp.lock().unwrap();
-                                guard.record(pos.key, best, pool.main.best_score, pool.main.completed_depth);
-                                if let Err(err) = guard.save(target) {
-                                    println!("info string could not save experience: {err}");
-                                }
-                            }
                             if !silent {
                                 if best.is_none() {
                                     println!(
@@ -233,6 +225,14 @@ impl Engine {
                                     println!("bestmove {}", best.to_uci());
                                 } else {
                                     println!("bestmove {} ponder {}", best.to_uci(), ponder.to_uci());
+                                }
+                            }
+                            if exp_write && !silent && pool.main.completed_depth >= 6 && !best.is_none() {
+                                let target = if exp_file.is_empty() { "esper.exp" } else { exp_file.as_str() };
+                                let mut guard = exp.lock().unwrap();
+                                guard.record(pos.key, best, pool.main.best_score, pool.main.completed_depth);
+                                if let Err(err) = guard.save(target) {
+                                    println!("info string could not save experience: {err}");
                                 }
                             }
                         }

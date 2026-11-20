@@ -1060,31 +1060,36 @@ impl Searcher {
         self.hard_ms = u64::MAX;
         self.time_managed = false;
         self.soft_deadline = u64::MAX;
-        self.movetime = limits.movetime;
+        self.movetime = limits.movetime.map(|mt| mt.saturating_sub(overhead).max(1));
         let us = root.stm;
-        // Stockfish's TimeManagement::init.
-        if let Some(time) = limits.time[us].filter(|&t| t > 0) {
+        // Stockfish's TimeManagement::init, with stricter low-time safety caps.
+        if let Some(time) = limits.time[us] {
             self.time_managed = true;
+            if time <= overhead {
+                self.hard_ms = 1;
+                self.soft_ms = 1;
+                return;
+            }
             let t = time as f64;
             let inc = limits.inc[us] as f64;
             let overhead = overhead as f64;
             let ply = (2 * (root.fullmove as i64 - 1) + (us == BLACK) as i64) as f64;
             let mut mtg = limits.movestogo.map_or(50, |m| m.min(50)) as f64;
             if t < 1000.0 && limits.movestogo.is_none() {
-                mtg = (t * 0.05).floor();
+                mtg = (t * 0.05).floor().max(1.0);
             }
             let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
             let (mut opt_scale, max_scale);
             if limits.movestogo.is_none() {
                 if self.orig_time_adjust < 0.0 {
-                    self.orig_time_adjust = 0.3272 * time_left.log10() - 0.4141;
+                    self.orig_time_adjust = (0.3272 * time_left.log10() - 0.4141).max(0.5);
                 }
                 let log_t = (t / 1000.0).log10();
                 let opt_c = (0.0029869 + 0.00033554 * log_t).min(0.004905);
                 let max_c = (3.3744 + 3.0608 * log_t).max(3.1441);
                 opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_c).min(0.19404 * t / time_left)
                     * self.orig_time_adjust;
-                max_scale = (max_c + ply / 12.352).min(6.873);
+                max_scale = (max_c + ply / 12.352).min(5.0);
             } else {
                 opt_scale = ((0.88 + ply / 116.4) / mtg).min(0.88 * t / time_left);
                 max_scale = 1.3 + 0.11 * mtg;
@@ -1096,13 +1101,16 @@ impl Searcher {
                 opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
             }
             let mut soft = (opt_scale * time_left).max(1.0);
-            let mut hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
-            // Esper's reserve when short of time: the engine, GUI and OS can all
-            // stall for a few milliseconds, and losing on time costs the game.
+            let mut hard = soft.max((0.65 * t - overhead).min(max_scale * soft));
+            // Tighter reserve in time scrambles so the engine never flags.
             if t < 1000.0 {
-                hard = hard.min(0.5 * t - overhead);
+                hard = hard.min(0.35 * t - overhead);
+                soft = soft.min(0.20 * t);
+            } else if t < 3000.0 && inc == 0.0 {
+                hard = hard.min(0.45 * t - overhead);
             }
-            hard = hard.min(t - 2.0 * overhead).max(1.0);
+            let reserve = (2.0 * overhead).max(50.0);
+            hard = hard.min(t - reserve).max(1.0);
             if limits.ponder_option {
                 soft += soft / 4.0;
             }
@@ -1507,12 +1515,12 @@ impl Searcher {
             return;
         }
         let elapsed = self.start.elapsed().as_millis() as u64;
-        let mut stop = (self.time_managed && elapsed > self.hard_ms)
+        let mut stop = (self.time_managed && elapsed >= self.hard_ms)
             || self.movetime.is_some_and(|mt| elapsed >= mt)
             || self.shared.stop_on_ponderhit.0.load(Relaxed)
             // Esper's addition: well past the planned time, an iteration that has
             // neither failed low nor changed its mind is not worth finishing.
-            || (TM_SOFT_STOP && self.time_managed && elapsed > self.soft_deadline && !self.iter_unstable);
+            || (TM_SOFT_STOP && self.time_managed && elapsed >= self.soft_deadline && !self.iter_unstable);
         if let Some(n) = self.limits.nodes {
             stop |= self.shared.total_nodes(self.threads) >= n;
         }
