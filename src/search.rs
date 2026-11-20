@@ -530,7 +530,11 @@ struct Ext {
     _pad: u16,
 }
 
+static DUP: AtomicU64 = AtomicU64::new(0);
+static LOST: AtomicU64 = AtomicU64::new(0);
+static DONE: AtomicU64 = AtomicU64::new(0);
 struct Picker {
+    audit: Option<(Vec<Move>, bool, Position)>,
     stage: Stage,
     tt_move: Move,
     depth: i32,
@@ -566,6 +570,7 @@ fn partial_insertion_sort(list: &mut [Ext], limit: i32) {
 impl Picker {
     fn new(tt_move: Move, noisy_only: bool, depth: i32) -> Picker {
         Picker {
+            audit: None,
             stage: if tt_move.is_none() { Stage::Init } else { Stage::TtMove },
             tt_move,
             depth,
@@ -734,6 +739,23 @@ impl Picker {
     }
 
     fn next(&mut self, s: &Searcher, ply: usize, skip_quiets: bool) -> Move {
+        if self.audit.is_none() { self.audit = Some((Vec::new(), false, s.pos[ply])); }
+        let m = self.next_inner(s, ply, skip_quiets);
+        let a = self.audit.as_mut().unwrap();
+        a.1 |= skip_quiets;
+        if !m.is_none() {
+            if a.0.contains(&m) { DUP.fetch_add(1, Relaxed); } else { a.0.push(m); }
+        } else if !a.1 && !self.noisy_only {
+            let mut list = crate::movegen::MoveList::new();
+            crate::movegen::generate(&a.2, &mut list, true, true);
+            let n = list.as_slice().iter().filter(|x| !a.0.contains(x)).count();
+            if n > 0 { LOST.fetch_add(1, Relaxed); }
+            let c = DONE.fetch_add(1, Relaxed) + 1;
+            if c % 5_000 == 0 { eprintln!("complete pickers {c} with duplicates {} with lost moves {}", DUP.load(Relaxed), LOST.load(Relaxed)); }
+        }
+        m
+    }
+    fn next_inner(&mut self, s: &Searcher, ply: usize, skip_quiets: bool) -> Move {
         let pos = &s.pos[ply];
         loop {
             match self.stage {
