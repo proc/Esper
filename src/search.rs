@@ -1089,10 +1089,10 @@ impl Searcher {
                 let max_c = (3.3744 + 3.0608 * log_t).max(3.1441);
                 opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_c).min(0.19404 * t / time_left)
                     * self.orig_time_adjust;
-                max_scale = (max_c + ply / 12.352).min(5.0);
+                max_scale = (max_c + ply / 12.352).min(3.0);
             } else {
                 opt_scale = ((0.88 + ply / 116.4) / mtg).min(0.88 * t / time_left);
-                max_scale = 1.3 + 0.11 * mtg;
+                max_scale = (1.3 + 0.11 * mtg).min(3.0);
             }
             // Behind on the clock, plan less time.
             if limits.movestogo != Some(1) {
@@ -1101,13 +1101,13 @@ impl Searcher {
                 opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
             }
             let mut soft = (opt_scale * time_left).max(1.0);
-            let mut hard = soft.max((0.65 * t - overhead).min(max_scale * soft));
+            let mut hard = soft.max((0.40 * t - overhead).min(max_scale * soft));
             // Tighter reserve in time scrambles so the engine never flags.
             if t < 1000.0 {
-                hard = hard.min(0.35 * t - overhead);
-                soft = soft.min(0.20 * t);
+                hard = hard.min(0.25 * t - overhead);
+                soft = soft.min(0.15 * t);
             } else if t < 3000.0 && inc == 0.0 {
-                hard = hard.min(0.45 * t - overhead);
+                hard = hard.min(0.35 * t - overhead);
             }
             let reserve = (2.0 * overhead).max(50.0);
             hard = hard.min(t - reserve).max(1.0);
@@ -1535,7 +1535,7 @@ impl Searcher {
     fn qsearch(&mut self, ply: usize, mut alpha: i32, beta: i32) -> i32 {
         let pv_node = beta - alpha > 1;
         self.pv_len[ply] = 0;
-        if self.nodes & 511 == 0 {
+        if self.nodes & 255 == 0 {
             self.check_time();
         }
         if self.stopped {
@@ -1699,7 +1699,7 @@ impl Searcher {
         let pv_node = beta - alpha > 1;
         let root = ply == 0;
         self.pv_len[ply] = 0;
-        if self.nodes & 511 == 0 {
+        if self.nodes & 255 == 0 {
             self.check_time();
         }
         if self.stopped {
@@ -2641,7 +2641,7 @@ impl Searcher {
                         break s;
                     }
                     let label = if s <= alpha { " upperbound" } else { " lowerbound" };
-                    if s <= alpha {
+                    if s <= alpha && alpha > -INF {
                         beta = alpha;
                         alpha = (s - delta).max(-INF);
                         fail_highs = 0;
@@ -2649,7 +2649,7 @@ impl Searcher {
                         if main {
                             self.shared.stop_on_ponderhit.0.store(false, Relaxed);
                         }
-                    } else if s >= beta {
+                    } else if s >= beta && beta < INF {
                         alpha = (beta - delta).max(alpha);
                         beta = (s + delta).min(INF);
                         fail_highs += 1;
@@ -2667,6 +2667,10 @@ impl Searcher {
                         self.print_info(depth, pv_idx, &line, label);
                     }
                     delta += 47 * delta / 128;
+                    if delta > 1500 {
+                        alpha = -INF;
+                        beta = INF;
+                    }
                 };
                 if fail_highs > 0 && pv_idx == 0 {
                     self.fail_high_recovery = (fail_highs + 1) / 2 + 2;
@@ -2725,7 +2729,7 @@ impl Searcher {
                 && !self.shared.stop.0.load(Relaxed)
                 && !self.shared.stop_on_ponderhit.0.load(Relaxed)
             {
-                let prev_avg = if self.prev_avg_score == NONE { INF } else { self.prev_avg_score };
+                let prev_avg = if self.prev_avg_score == NONE { best } else { self.prev_avg_score };
                 let falling_w = tune::T_TimeFalling.get() as f64 / 100.0;
                 let falling = ((11.48 + falling_w * (prev_avg - best) as f64 + 1.1 * (iter_values[iter_idx] - best) as f64)
                     / 100.0)
@@ -2735,20 +2739,21 @@ impl Searcher {
                 let reduction = (1.468 + self.prev_time_reduction) / (2.284 * time_reduction);
                 tot_changes = tot_changes / 2.0 + self.shared.best_move_changes.0.swap(0, Relaxed) as f64;
                 let instab_w = tune::T_TimeInstability.get() as f64 / 1000.0;
-                let instability = 1.077 + instab_w * tot_changes / self.threads as f64;
+                let instability = (1.077 + instab_w * tot_changes / self.threads as f64).min(2.5);
                 let effort = (self.root_stat(self.best_move).2 * 100000 / self.nodes.max(1)) as f64;
                 let high_effort = interpolate(effort, 75800.0, 104510.0, 0.969, 0.714).clamp(0.693, 0.838);
                 let mut total = self.soft_ms as f64 * falling * reduction * instability * high_effort;
                 if root_moves.len() == 1 {
-                    total = total.min(500.0);
+                    total = total.min(100.0);
                 }
-                self.soft_deadline = (2.0 * total).min(self.hard_ms as f64) as u64;
+                self.soft_deadline = (1.25 * total).min(self.hard_ms as f64) as u64;
                 tm_trace = format!(
                     "depth {depth} falling {falling:.2} reduction {reduction:.2} instability {instability:.2} effort {:.0}k/{high_effort:.2} total {total:.0}",
                     effort / 1000.0
                 );
                 let elapsed = self.start.elapsed().as_millis() as f64;
-                if elapsed > total.min(self.hard_ms as f64)
+                let stop_limit = if self.iter_unstable { total } else { total * 0.70 };
+                if elapsed > stop_limit.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
                     || lines[0].score == -(MATE - 2)
                 {
