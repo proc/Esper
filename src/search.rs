@@ -38,13 +38,13 @@ const LOW_PLY_SIZE: usize = 5;
 const GOOD_QUIET_THRESHOLD: i32 = -14000;
 const KILLER_ORDERING: bool = true;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
-const SF_NMP: bool = false;
+const SF_NMP: bool = true;
 // Further Stockfish-derived techniques.
 const SF_EVAL_SCALE: bool = true;
 const SF_CORRECTION: bool = true;
 const SF_TT_CUTOFF: bool = true;
 const SF_SMALL_PROBCUT: bool = true;
-const SF_SEEK_MATE: bool = false;
+const SF_SEEK_MATE: bool = true;
 const SF_SHUFFLING: bool = true;
 /// Range of the Stockfish-style correction history entries.
 const SF_CORR_LIMIT: i32 = 1024;
@@ -65,6 +65,10 @@ const SF_PARITY: bool = true;
 const SF_CHECK_EXT: bool = false;
 /// Esper's guard against the deeper LMR re-search chaining down long lines.
 const DEEPER_PLY_GUARD: bool = false;
+/// Re-search a failed-high root move first, as Stockfish's root-move sort does.
+const TM_RESEARCH_FIRST: bool = true;
+/// Cut a stable iteration short once twice the planned time has passed.
+const TM_SOFT_STOP: bool = true;
 /// Searched moves remembered for history maluses (Stockfish's SEARCHEDLIST_CAPACITY).
 const SEARCHED_CAP: usize = 32;
 /// Extra null-move reduction (plies) granted when the evaluation is far above beta.
@@ -199,6 +203,12 @@ fn lmr_divisor(depth: i32) -> i32 {
     3000 + 7 * (d - 8) * (d - 8)
 }
 
+/// `ESPER_DEBUG_TIME` set in the environment: print each move's time decisions to stderr.
+fn debug_time() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ESPER_DEBUG_TIME").is_some())
+}
+
 /// Running statistics of one root move (Stockfish's RootMove fields).
 #[derive(Clone, Copy)]
 struct RootStat {
@@ -273,6 +283,10 @@ pub struct Searcher {
     movetime: Option<u64>,
     /// Average score of the best root move, for the next move's time management.
     pub avg_score: i32,
+    /// Twice the latest planned time; past it a stable iteration is cut short.
+    soft_deadline: u64,
+    /// The current iteration failed low or changed the best move.
+    iter_unstable: bool,
     root_nodes: Box<[u64; 4096]>,
     nmp_min_ply: usize,
     // limits / time management (used by the main thread)
@@ -506,7 +520,6 @@ enum Stage {
 struct Ext {
     m: Move,
     v: i32,
-    hist: i32,
 }
 
 struct Picker {
@@ -515,8 +528,6 @@ struct Picker {
     depth: i32,
     /// Captures / promotions only (quiescence, ProbCut); ignored when in check.
     noisy_only: bool,
-    last_hist: i32,
-    has_last_hist: bool,
     buf: [std::mem::MaybeUninit<Ext>; MAX_MOVES],
     cur: usize,
     end_cur: usize,
@@ -551,8 +562,6 @@ impl Picker {
             tt_move,
             depth,
             noisy_only,
-            last_hist: 0,
-            has_last_hist: false,
             buf: [std::mem::MaybeUninit::uninit(); MAX_MOVES],
             cur: 0,
             end_cur: 0,
@@ -589,7 +598,7 @@ impl Picker {
             // En passant lands on an empty square: no victim, as in Stockfish.
             let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
             let v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
-            self.buf[at + i].write(Ext { m, v, hist: 0 });
+            self.buf[at + i].write(Ext { m, v });
         }
         at + list.len
     }
@@ -663,7 +672,7 @@ impl Picker {
                 } else {
                     1 << 24
                 };
-                self.buf[at + i].write(Ext { m, v, hist: 0 });
+                self.buf[at + i].write(Ext { m, v });
                 continue;
             }
             let (from, to) = (m.from(), m.to());
@@ -694,7 +703,7 @@ impl Picker {
             if ply < LOW_PLY_SIZE {
                 v += 8 * s.low_ply_hist[ply][m.from_to()] as i32 / (1 + ply as i32);
             }
-            self.buf[at + i].write(Ext { m, v, hist });
+            self.buf[at + i].write(Ext { m, v });
         }
         at + list.len
     }
@@ -711,14 +720,13 @@ impl Picker {
                 let idx = pos.board[m.from()] as usize * 64 + m.to();
                 s.butterfly[pos.stm][m.from_to()] as i32 + s.cont_score(ply, 1, idx)
             };
-            self.buf[at + i].write(Ext { m, v, hist: 0 });
+            self.buf[at + i].write(Ext { m, v });
         }
         at + list.len
     }
 
     fn next(&mut self, s: &Searcher, ply: usize, skip_quiets: bool) -> Move {
         let pos = &s.pos[ply];
-        self.has_last_hist = false;
         loop {
             match self.stage {
                 Stage::TtMove => {
@@ -822,8 +830,6 @@ impl Picker {
                                 continue;
                             }
                             if e.v > GOOD_QUIET_THRESHOLD {
-                                self.last_hist = e.hist;
-                                self.has_last_hist = true;
                                 return e.m;
                             }
                             self.buf[self.end_bad].write(e);
@@ -848,10 +854,6 @@ impl Picker {
                                 && (e.m == killers[0] || e.m == killers[1] || e.m == counter))
                         {
                             continue;
-                        }
-                        if self.cur > self.end_bad_caps {
-                            self.last_hist = e.hist;
-                            self.has_last_hist = true;
                         }
                         return e.m;
                     }
@@ -952,6 +954,8 @@ impl Searcher {
             time_managed: false,
             movetime: None,
             avg_score: -INF,
+            soft_deadline: u64::MAX,
+            iter_unstable: false,
             root_nodes: vec![0u64; 4096].into_boxed_slice().try_into().unwrap(),
             nmp_min_ply: 0,
             limits: Limits::default(),
@@ -1042,6 +1046,7 @@ impl Searcher {
         self.soft_ms = u64::MAX;
         self.hard_ms = u64::MAX;
         self.time_managed = false;
+        self.soft_deadline = u64::MAX;
         self.movetime = limits.movetime;
         let us = root.stm;
         // Stockfish's TimeManagement::init.
@@ -1466,7 +1471,10 @@ impl Searcher {
         let elapsed = self.start.elapsed().as_millis() as u64;
         let mut stop = (self.time_managed && elapsed > self.hard_ms)
             || self.movetime.is_some_and(|mt| elapsed >= mt)
-            || self.shared.stop_on_ponderhit.0.load(Relaxed);
+            || self.shared.stop_on_ponderhit.0.load(Relaxed)
+            // Esper's addition: well past the planned time, an iteration that has
+            // neither failed low nor changed its mind is not worth finishing.
+            || (TM_SOFT_STOP && self.time_managed && elapsed > self.soft_deadline && !self.iter_unstable);
         if let Some(n) = self.limits.nodes {
             stop |= self.shared.total_nodes(self.threads) >= n;
         }
@@ -2320,6 +2328,7 @@ impl Searcher {
                 if score + inc > alpha {
                     if root && move_count > 1 && self.pv_idx == 0 {
                         self.shared.best_move_changes.0.fetch_add(1, Relaxed);
+                        self.iter_unstable = true;
                     }
                     best_move = m;
                     if pv_node {
@@ -2529,6 +2538,7 @@ impl Searcher {
         let mut iter_idx = 0;
         let mut time_reduction = 1.0f64;
         let mut tot_changes = 0.0f64;
+        let mut tm_trace = String::new();
         self.search_again = 0;
         self.fail_high_recovery = 0;
 
@@ -2536,6 +2546,7 @@ impl Searcher {
             if !self.shared.increase_depth.0.load(Relaxed) {
                 self.search_again += 1;
             }
+            self.iter_unstable = false;
             let mut lines: Vec<Line> = Vec::with_capacity(multipv);
             self.root_excluded.clear();
             for pv_idx in 0..multipv {
@@ -2574,6 +2585,7 @@ impl Searcher {
                         beta = alpha;
                         alpha = (s - delta).max(-INF);
                         fail_highs = 0;
+                        self.iter_unstable = true;
                         if main {
                             self.shared.stop_on_ponderhit.0.store(false, Relaxed);
                         }
@@ -2581,6 +2593,12 @@ impl Searcher {
                         alpha = (beta - delta).max(alpha);
                         beta = (s + delta).min(INF);
                         fail_highs += 1;
+                        // The move that failed high leads the re-search, as Stockfish's
+                        // stable sort of the root moves arranges; otherwise it has to beat
+                        // the old best again, counting another best-move change each time.
+                        if TM_RESEARCH_FIRST && self.pv_len[0] > 0 {
+                            self.root_move = self.pv[0][0];
+                        }
                     } else {
                         break s;
                     }
@@ -2662,6 +2680,11 @@ impl Searcher {
                 if root_moves.len() == 1 {
                     total = total.min(500.0);
                 }
+                self.soft_deadline = (2.0 * total).min(self.hard_ms as f64) as u64;
+                tm_trace = format!(
+                    "depth {depth} falling {falling:.2} reduction {reduction:.2} instability {instability:.2} effort {:.0}k/{high_effort:.2} total {total:.0}",
+                    effort / 1000.0
+                );
                 let elapsed = self.start.elapsed().as_millis() as f64;
                 if elapsed > total.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
@@ -2683,6 +2706,15 @@ impl Searcher {
                     break;
                 }
             }
+        }
+        if main && self.time_managed && debug_time() {
+            eprintln!(
+                "time: optimum {} maximum {} used {} | {}",
+                self.soft_ms,
+                self.hard_ms,
+                self.start.elapsed().as_millis(),
+                tm_trace
+            );
         }
         if main {
             self.prev_time_reduction = time_reduction;

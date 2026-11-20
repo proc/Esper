@@ -766,6 +766,53 @@ impl ThreatLuts {
 #[inline]
 fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
     use std::arch::aarch64::*;
+    if adds.is_empty() && subs.is_empty() {
+        *dst = *src;
+        return;
+    }
+    // Fast fused paths for the common 1-add/1-sub (quiet) and 1-add/2-sub (capture) updates.
+    if adds.len() == 1 && subs.len() == 1 {
+        let a0 = row(adds[0]).as_ptr() as *const i8;
+        let s0 = row(subs[0]).as_ptr() as *const i8;
+        let src_p = src.0.as_ptr();
+        let dst_p = dst.0.as_mut_ptr();
+        unsafe {
+            for off in (0..L1).step_by(16) {
+                let va = vld1q_s8(a0.add(off));
+                let vs = vld1q_s8(s0.add(off));
+                let r0 = vsubw_s8(vaddw_s8(vld1q_s16(src_p.add(off)), vget_low_s8(va)), vget_low_s8(vs));
+                let r1 = vsubw_high_s8(vaddw_high_s8(vld1q_s16(src_p.add(off + 8)), va), vs);
+                vst1q_s16(dst_p.add(off), r0);
+                vst1q_s16(dst_p.add(off + 8), r1);
+            }
+        }
+        return;
+    }
+    if adds.len() == 1 && subs.len() == 2 {
+        let a0 = row(adds[0]).as_ptr() as *const i8;
+        let s0 = row(subs[0]).as_ptr() as *const i8;
+        let s1 = row(subs[1]).as_ptr() as *const i8;
+        let src_p = src.0.as_ptr();
+        let dst_p = dst.0.as_mut_ptr();
+        unsafe {
+            for off in (0..L1).step_by(16) {
+                let va = vld1q_s8(a0.add(off));
+                let vs0 = vld1q_s8(s0.add(off));
+                let vs1 = vld1q_s8(s1.add(off));
+                let r0 = vsubw_s8(
+                    vsubw_s8(vaddw_s8(vld1q_s16(src_p.add(off)), vget_low_s8(va)), vget_low_s8(vs0)),
+                    vget_low_s8(vs1),
+                );
+                let r1 = vsubw_high_s8(
+                    vsubw_high_s8(vaddw_high_s8(vld1q_s16(src_p.add(off + 8)), va), vs0),
+                    vs1,
+                );
+                vst1q_s16(dst_p.add(off), r0);
+                vst1q_s16(dst_p.add(off + 8), r1);
+            }
+        }
+        return;
+    }
     const TILE: usize = 128; // 16 registers of 8 lanes
     // SAFETY: all pointers stay within the 1024-element arrays.
     unsafe {
@@ -805,6 +852,43 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
 #[inline]
 fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
     use std::arch::x86_64::*;
+    if adds.is_empty() && subs.is_empty() {
+        *dst = *src;
+        return;
+    }
+    if adds.len() == 1 && subs.len() == 1 {
+        let a0 = row(adds[0]).as_ptr();
+        let s0 = row(subs[0]).as_ptr();
+        let src_p = src.0.as_ptr();
+        let dst_p = dst.0.as_mut_ptr();
+        unsafe {
+            for off in (0..L1).step_by(16) {
+                let r = _mm256_loadu_si256(src_p.add(off) as *const __m256i);
+                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0.add(off) as *const __m128i));
+                let vs = _mm256_cvtepi8_epi16(_mm_loadu_si128(s0.add(off) as *const __m128i));
+                _mm256_storeu_si256(dst_p.add(off) as *mut __m256i, _mm256_sub_epi16(_mm256_add_epi16(r, va), vs));
+            }
+        }
+        return;
+    }
+    if adds.len() == 1 && subs.len() == 2 {
+        let a0 = row(adds[0]).as_ptr();
+        let s0 = row(subs[0]).as_ptr();
+        let s1 = row(subs[1]).as_ptr();
+        let src_p = src.0.as_ptr();
+        let dst_p = dst.0.as_mut_ptr();
+        unsafe {
+            for off in (0..L1).step_by(16) {
+                let r = _mm256_loadu_si256(src_p.add(off) as *const __m256i);
+                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0.add(off) as *const __m128i));
+                let vs0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(s0.add(off) as *const __m128i));
+                let vs1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(s1.add(off) as *const __m128i));
+                let res = _mm256_sub_epi16(_mm256_sub_epi16(_mm256_add_epi16(r, va), vs0), vs1);
+                _mm256_storeu_si256(dst_p.add(off) as *mut __m256i, res);
+            }
+        }
+        return;
+    }
     const REGS: usize = 8; // of 16 lanes each
     const TILE: usize = REGS * 16;
     // SAFETY: all pointers stay within the 1024-element arrays.

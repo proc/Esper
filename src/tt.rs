@@ -1,20 +1,50 @@
 //! Lock-free shared transposition table.
 //!
-//! Each entry is two atomic words: `key ^ data` and `data`. A torn write from a
-//! racing thread simply fails the key check on probe, so no locking is needed.
+//! Stockfish's density: 32-byte clusters of three entries, each a 64-bit data
+//! word plus a 16-bit check, so 10.7 bytes per entry instead of 16. The check is
+//! the key's low 16 bits XOR a 16-bit fold of the data, so a key and data word
+//! torn apart by racing threads fail it (as the old full-width `key ^ data`
+//! scheme did) and no locking is needed. Like Stockfish, a 16-bit check lets an
+//! unrelated position match about once in 65536 probes of a full cluster; moves
+//! taken from the table are validated before use.
 
 use crate::position::Move;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering::Relaxed};
 
 pub const BOUND_UPPER: u8 = 1;
 pub const BOUND_LOWER: u8 = 2;
 pub const BOUND_EXACT: u8 = 3;
 
-const ENTRIES_PER_BUCKET: usize = 4;
+const ENTRIES_PER_BUCKET: usize = 3;
 const GEN_MASK: u64 = 31;
 
-#[repr(C, align(64))]
-struct Bucket([AtomicU64; 2 * ENTRIES_PER_BUCKET]);
+#[repr(C, align(32))]
+struct Bucket {
+    data: [AtomicU64; ENTRIES_PER_BUCKET],
+    check: [AtomicU16; ENTRIES_PER_BUCKET],
+    _pad: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<Bucket>() == 32);
+
+/// The 16-bit check stored for `key` with `data`.
+#[inline(always)]
+fn check16(key: u64, data: u64) -> u16 {
+    (key as u16) ^ (data as u16) ^ ((data >> 16) as u16) ^ ((data >> 32) as u16) ^ ((data >> 48) as u16)
+}
+
+impl Bucket {
+    #[inline(always)]
+    fn matches(&self, i: usize, key: u64, data: u64) -> bool {
+        data != 0 && self.check[i].load(Relaxed) == check16(key, data)
+    }
+
+    #[inline(always)]
+    fn write(&self, i: usize, key: u64, data: u64) {
+        self.data[i].store(data, Relaxed);
+        self.check[i].store(check16(key, data), Relaxed);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct TtData {
@@ -110,8 +140,9 @@ impl TT {
     pub fn clear_range(&self, start: usize, end: usize) {
         for i in start..end.min(self.len) {
             let b = unsafe { &*self.buckets.add(i) };
-            for w in &b.0 {
-                w.store(0, Relaxed);
+            for i in 0..ENTRIES_PER_BUCKET {
+                b.data[i].store(0, Relaxed);
+                b.check[i].store(0, Relaxed);
             }
         }
     }
@@ -137,8 +168,8 @@ impl TT {
     pub fn probe(&self, key: u64) -> Option<TtData> {
         let b = self.bucket(key);
         for i in 0..ENTRIES_PER_BUCKET {
-            let data = b.0[2 * i + 1].load(Relaxed);
-            if data != 0 && b.0[2 * i].load(Relaxed) ^ data == key {
+            let data = b.data[i].load(Relaxed);
+            if b.matches(i, key, data) {
                 return Some(unpack(data));
             }
         }
@@ -152,14 +183,14 @@ impl TT {
         let mut victim = 0;
         let mut worst = i32::MAX;
         for i in 0..ENTRIES_PER_BUCKET {
-            let data = b.0[2 * i + 1].load(Relaxed);
+            let data = b.data[i].load(Relaxed);
             if data == 0 {
                 victim = i;
                 break;
             }
             let old = unpack(data);
             let old_gen = (data >> 59) as u8;
-            if b.0[2 * i].load(Relaxed) ^ data == key {
+            if b.matches(i, key, data) {
                 // Stockfish keeps a deeper entry from the same search unless the new
                 // result is exact; even then a new move replaces the stored one.
                 let keep = bound != BOUND_EXACT && old_gen == gen && depth + 2 * pv as i32 <= old.depth - 4;
@@ -170,8 +201,7 @@ impl TT {
                     let new_mv = if mv.is_none() { old.mv } else { mv };
                     if new_mv != old.mv || new_depth != old.depth {
                         let d = pack(new_mv, old.score, old.eval, new_depth, old.bound, old.pv, old_gen);
-                        b.0[2 * i].store(key ^ d, Relaxed);
-                        b.0[2 * i + 1].store(d, Relaxed);
+                        b.write(i, key, d);
                     }
                     return;
                 }
@@ -189,20 +219,18 @@ impl TT {
             }
         }
         let data = pack(mv, score, eval, depth, bound, pv, gen);
-        b.0[2 * victim].store(key ^ data, Relaxed);
-        b.0[2 * victim + 1].store(data, Relaxed);
+        b.write(victim, key, data);
     }
 
     /// Lower the stored depth of `key`'s entry (Stockfish's TTWriter::penalize).
     pub fn penalize(&self, key: u64, amount: i32) {
         let b = self.bucket(key);
         for i in 0..ENTRIES_PER_BUCKET {
-            let data = b.0[2 * i + 1].load(Relaxed);
-            if data != 0 && b.0[2 * i].load(Relaxed) ^ data == key {
+            let data = b.data[i].load(Relaxed);
+            if b.matches(i, key, data) {
                 let e = unpack(data);
                 let d = pack(e.mv, e.score, e.eval, (e.depth - amount).max(-DEPTH_OFFSET), e.bound, e.pv, (data >> 59) as u8);
-                b.0[2 * i].store(key ^ d, Relaxed);
-                b.0[2 * i + 1].store(d, Relaxed);
+                b.write(i, key, d);
                 return;
             }
         }
@@ -211,12 +239,12 @@ impl TT {
     /// Permille of the table used by the current search.
     pub fn hashfull(&self) -> usize {
         let gen = self.gen.load(Relaxed);
-        let n = self.len.min(250);
+        let n = self.len.min(1000);
         let mut used = 0;
         for i in 0..n {
             let b = unsafe { &*self.buckets.add(i) };
             for e in 0..ENTRIES_PER_BUCKET {
-                let data = b.0[2 * e + 1].load(Relaxed);
+                let data = b.data[e].load(Relaxed);
                 if data != 0 && (data >> 59) as u8 == gen {
                     used += 1;
                 }
@@ -233,5 +261,28 @@ impl Drop for TT {
         }
         let layout = std::alloc::Layout::array::<Bucket>(self.len).unwrap();
         unsafe { std::alloc::dealloc(self.buckets as *mut u8, layout) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_probe_and_density() {
+        let tt = TT::new(1);
+        assert_eq!(tt.len() * ENTRIES_PER_BUCKET, 3 * 32768);
+        let key = 0x1234_5678_9abc_def0u64;
+        assert!(tt.probe(key).is_none());
+        tt.store(key, Move(0x0abc), 123, -45, 9, BOUND_EXACT, true);
+        let e = tt.probe(key).expect("stored entry");
+        assert_eq!((e.mv.0, e.score, e.eval, e.depth, e.bound, e.pv), (0x0abc, 123, -45, 9, BOUND_EXACT, true));
+        // Same cluster, different check bits: no match.
+        assert!(tt.probe(key ^ 1).is_none());
+        // A torn pair (data rewritten without its check) is rejected.
+        let b = tt.bucket(key);
+        let i = (0..ENTRIES_PER_BUCKET).find(|&i| b.matches(i, key, b.data[i].load(Relaxed))).unwrap();
+        b.data[i].store(pack(Move(1), 7, 7, 3, BOUND_LOWER, false, 0), Relaxed);
+        assert!(tt.probe(key).is_none());
     }
 }

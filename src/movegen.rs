@@ -115,14 +115,22 @@ pub fn generate(pos: &Position, list: &mut MoveList, noisy: bool, quiet: bool) {
                 push_promos(list, from, pop_lsb(&mut att), true);
             }
         }
-        // Captures
-        let mut op = other_pawns;
-        while op != 0 {
-            let from = pop_lsb(&mut op);
-            let mut att = pawn_attacks(us, from) & theirs & target;
-            while att != 0 {
-                list.push(Move::new(from, pop_lsb(&mut att), FLAG_CAPTURE));
-            }
+        // Captures (bitboard-parallel shifts)
+        let cap_target = theirs & target;
+        let (mut cap_l, mut cap_r) = if us == WHITE {
+            (((other_pawns & !FILE_A) << 7) & cap_target, ((other_pawns & !FILE_H) << 9) & cap_target)
+        } else {
+            (((other_pawns & !FILE_A) >> 9) & cap_target, ((other_pawns & !FILE_H) >> 7) & cap_target)
+        };
+        while cap_l != 0 {
+            let to = pop_lsb(&mut cap_l);
+            let from = if us == WHITE { to - 7 } else { to + 9 };
+            list.push(Move::new(from, to, FLAG_CAPTURE));
+        }
+        while cap_r != 0 {
+            let to = pop_lsb(&mut cap_r);
+            let from = if us == WHITE { to - 9 } else { to + 7 };
+            list.push(Move::new(from, to, FLAG_CAPTURE));
         }
         // En passant
         if pos.ep != NO_SQ {
