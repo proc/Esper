@@ -1062,60 +1062,52 @@ impl Searcher {
         self.soft_deadline = u64::MAX;
         self.movetime = limits.movetime.map(|mt| mt.saturating_sub(overhead).max(1));
         let us = root.stm;
-        // Stockfish's TimeManagement::init, with stricter low-time safety caps.
+        // Snappy, flag-proof time allocation.
         if let Some(time) = limits.time[us] {
             self.time_managed = true;
-            if time <= overhead {
+            let reserve = (2 * overhead).max(50);
+            if time <= reserve {
                 self.hard_ms = 1;
                 self.soft_ms = 1;
                 return;
             }
-            let t = time as f64;
+            let usable = (time - reserve) as f64;
             let inc = limits.inc[us] as f64;
-            let overhead = overhead as f64;
-            let ply = (2 * (root.fullmove as i64 - 1) + (us == BLACK) as i64) as f64;
-            let mut mtg = limits.movestogo.map_or(50, |m| m.min(50)) as f64;
-            if t < 1000.0 && limits.movestogo.is_none() {
-                mtg = (t * 0.05).floor().max(1.0);
-            }
-            let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
-            let (mut opt_scale, max_scale);
-            if limits.movestogo.is_none() {
-                if self.orig_time_adjust < 0.0 {
-                    self.orig_time_adjust = (0.3272 * time_left.log10() - 0.4141).max(0.5);
+            let ply = (2 * (root.fullmove as i64 - 1) + (us == BLACK) as i64).max(0) as f64;
+            let (mut soft, mut hard) = match limits.movestogo {
+                Some(mtg) => {
+                    let m = mtg.max(1) as f64;
+                    let s = (usable / (m + 1.5) + inc * 0.70).min(usable * 0.50);
+                    let h = (s * 2.5).min(usable * 0.70);
+                    (s, h)
                 }
-                let log_t = (t / 1000.0).log10();
-                let opt_c = (0.0029869 + 0.00033554 * log_t).min(0.004905);
-                let max_c = (3.3744 + 3.0608 * log_t).max(3.1441);
-                opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_c).min(0.19404 * t / time_left)
-                    * self.orig_time_adjust;
-                max_scale = (max_c + ply / 12.352).min(3.0);
-            } else {
-                opt_scale = ((0.88 + ply / 116.4) / mtg).min(0.88 * t / time_left);
-                max_scale = (1.3 + 0.11 * mtg).min(3.0);
-            }
-            // Behind on the clock, plan less time.
+                None => {
+                    // Assume 40 moves remaining early, tapering to 25 later in the game.
+                    let mtg = (40.0 - (ply * 0.25).min(15.0)).max(25.0);
+                    let s = (usable / mtg + inc * 0.70).min(usable * 0.10);
+                    let h = (s * 2.5).min(usable * 0.25);
+                    (s, h)
+                }
+            };
+            // Behind on the clock, play faster.
             if limits.movestogo != Some(1) {
                 let theirs = limits.time[us ^ 1].unwrap_or(0) as f64;
-                let advantage = (t - theirs) / (1.0 + t + theirs);
-                opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
+                if theirs > 0.0 && (time as f64) < theirs {
+                    let ratio = ((time as f64) / theirs).clamp(0.5, 1.0);
+                    soft *= ratio;
+                    hard *= ratio;
+                }
             }
-            let mut soft = (opt_scale * time_left).max(1.0);
-            let mut hard = soft.max((0.40 * t - overhead).min(max_scale * soft));
-            // Tighter reserve in time scrambles so the engine never flags.
-            if t < 1000.0 {
-                hard = hard.min(0.25 * t - overhead);
-                soft = soft.min(0.15 * t);
-            } else if t < 3000.0 && inc == 0.0 {
-                hard = hard.min(0.35 * t - overhead);
+            // Extra safety in sudden-death time scrambles.
+            if inc == 0.0 && time < 2000 {
+                soft = soft.min(usable * 0.04);
+                hard = hard.min(usable * 0.12);
             }
-            let reserve = (2.0 * overhead).max(50.0);
-            hard = hard.min(t - reserve).max(1.0);
             if limits.ponder_option {
-                soft += soft / 4.0;
+                soft *= 1.15;
             }
-            self.hard_ms = hard as u64;
-            self.soft_ms = (soft as u64).min(self.hard_ms).max(1);
+            self.hard_ms = (hard.min(usable).max(1.0)) as u64;
+            self.soft_ms = (soft.max(1.0) as u64).min(self.hard_ms);
         }
     }
 
@@ -1511,16 +1503,15 @@ impl Searcher {
             self.stopped = true;
             return;
         }
-        if self.id != 0 || self.completed_depth == 0 || self.shared.pondering.0.load(Relaxed) {
+        if self.id != 0 || self.shared.pondering.0.load(Relaxed) {
             return;
         }
         let elapsed = self.start.elapsed().as_millis() as u64;
         let mut stop = (self.time_managed && elapsed >= self.hard_ms)
             || self.movetime.is_some_and(|mt| elapsed >= mt)
-            || self.shared.stop_on_ponderhit.0.load(Relaxed)
-            // Esper's addition: well past the planned time, an iteration that has
-            // neither failed low nor changed its mind is not worth finishing.
-            || (TM_SOFT_STOP && self.time_managed && elapsed >= self.soft_deadline && !self.iter_unstable);
+            || (self.completed_depth > 0
+                && (self.shared.stop_on_ponderhit.0.load(Relaxed)
+                    || (TM_SOFT_STOP && self.time_managed && elapsed >= self.soft_deadline && !self.iter_unstable)));
         if let Some(n) = self.limits.nodes {
             stop |= self.shared.total_nodes(self.threads) >= n;
         }
@@ -2746,13 +2737,13 @@ impl Searcher {
                 if root_moves.len() == 1 {
                     total = total.min(100.0);
                 }
-                self.soft_deadline = (1.25 * total).min(self.hard_ms as f64) as u64;
+                self.soft_deadline = (1.15 * total).min(self.hard_ms as f64) as u64;
                 tm_trace = format!(
                     "depth {depth} falling {falling:.2} reduction {reduction:.2} instability {instability:.2} effort {:.0}k/{high_effort:.2} total {total:.0}",
                     effort / 1000.0
                 );
                 let elapsed = self.start.elapsed().as_millis() as f64;
-                let stop_limit = if self.iter_unstable { total } else { total * 0.70 };
+                let stop_limit = if self.iter_unstable { total } else { total * 0.65 };
                 if elapsed > stop_limit.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
                     || lines[0].score == -(MATE - 2)
