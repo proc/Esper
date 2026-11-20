@@ -530,11 +530,7 @@ struct Ext {
     _pad: u16,
 }
 
-static DUP: AtomicU64 = AtomicU64::new(0);
-static LOST: AtomicU64 = AtomicU64::new(0);
-static DONE: AtomicU64 = AtomicU64::new(0);
 struct Picker {
-    audit: Option<(Vec<Move>, bool, Position)>,
     stage: Stage,
     tt_move: Move,
     depth: i32,
@@ -546,6 +542,11 @@ struct Picker {
     /// Deferred moves live at the front of the buffer: bad captures, then bad quiets.
     end_bad: usize,
     end_bad_caps: usize,
+    /// The killers and countermove actually returned by their own stages, so
+    /// the later stages skip exactly those. (Reading the tables again there
+    /// could see a countermove updated meanwhile by a deeper node: the move
+    /// tried earlier would come back a second time and the new one be lost.)
+    tried: [Move; 3],
 }
 
 /// Sort descending all entries with a value of at least `limit` to the front;
@@ -570,7 +571,6 @@ fn partial_insertion_sort(list: &mut [Ext], limit: i32) {
 impl Picker {
     fn new(tt_move: Move, noisy_only: bool, depth: i32) -> Picker {
         Picker {
-            audit: None,
             stage: if tt_move.is_none() { Stage::Init } else { Stage::TtMove },
             tt_move,
             depth,
@@ -580,6 +580,7 @@ impl Picker {
             end_cur: 0,
             end_bad: 0,
             end_bad_caps: 0,
+            tried: [Move::NONE; 3],
         }
     }
 
@@ -739,23 +740,6 @@ impl Picker {
     }
 
     fn next(&mut self, s: &Searcher, ply: usize, skip_quiets: bool) -> Move {
-        if self.audit.is_none() { self.audit = Some((Vec::new(), false, s.pos[ply])); }
-        let m = self.next_inner(s, ply, skip_quiets);
-        let a = self.audit.as_mut().unwrap();
-        a.1 |= skip_quiets;
-        if !m.is_none() {
-            if a.0.contains(&m) { DUP.fetch_add(1, Relaxed); } else { a.0.push(m); }
-        } else if !a.1 && !self.noisy_only {
-            let mut list = crate::movegen::MoveList::new();
-            crate::movegen::generate(&a.2, &mut list, true, true);
-            let n = list.as_slice().iter().filter(|x| !a.0.contains(x)).count();
-            if n > 0 { LOST.fetch_add(1, Relaxed); }
-            let c = DONE.fetch_add(1, Relaxed) + 1;
-            if c % 5_000 == 0 { eprintln!("complete pickers {c} with duplicates {} with lost moves {}", DUP.load(Relaxed), LOST.load(Relaxed)); }
-        }
-        m
-    }
-    fn next_inner(&mut self, s: &Searcher, ply: usize, skip_quiets: bool) -> Move {
         let pos = &s.pos[ply];
         loop {
             match self.stage {
@@ -803,6 +787,7 @@ impl Picker {
                     if !skip_quiets {
                         let k = s.ss[ply].killers[0];
                         if !k.is_none() && k != self.tt_move && !k.is_noisy() && pos.is_pseudo_legal(k) {
+                            self.tried[0] = k;
                             return k;
                         }
                     }
@@ -810,9 +795,9 @@ impl Picker {
                 Stage::Killer1 => {
                     self.stage = Stage::Counter;
                     if !skip_quiets {
-                        let killers = s.ss[ply].killers;
-                        let k = killers[1];
-                        if !k.is_none() && k != self.tt_move && k != killers[0] && !k.is_noisy() && pos.is_pseudo_legal(k) {
+                        let k = s.ss[ply].killers[1];
+                        if !k.is_none() && k != self.tt_move && k != self.tried[0] && !k.is_noisy() && pos.is_pseudo_legal(k) {
+                            self.tried[1] = k;
                             return k;
                         }
                     }
@@ -820,15 +805,15 @@ impl Picker {
                 Stage::Counter => {
                     self.stage = Stage::GenQuiet;
                     if !skip_quiets {
-                        let killers = s.ss[ply].killers;
                         let c = s.counter_move(ply);
                         if !c.is_none()
                             && c != self.tt_move
-                            && c != killers[0]
-                            && c != killers[1]
+                            && c != self.tried[0]
+                            && c != self.tried[1]
                             && !c.is_noisy()
                             && pos.is_pseudo_legal(c)
                         {
+                            self.tried[2] = c;
                             return c;
                         }
                     }
@@ -851,12 +836,11 @@ impl Picker {
                         // Drop the remaining quiets, including those already deferred.
                         self.end_bad = self.end_bad_caps;
                     } else {
-                        let killers = s.ss[ply].killers;
-                        let counter = s.counter_move(ply);
+                        let [k0, k1, counter] = self.tried;
                         while self.cur < self.end_cur {
                             let e = self.get(self.cur);
                             self.cur += 1;
-                            if e.m == self.tt_move || e.m == killers[0] || e.m == killers[1] || e.m == counter {
+                            if e.m == self.tt_move || e.m == k0 || e.m == k1 || e.m == counter {
                                 continue;
                             }
                             if e.v > GOOD_QUIET_THRESHOLD {
@@ -874,14 +858,11 @@ impl Picker {
                     if skip_quiets && self.end_cur > self.end_bad_caps {
                         self.end_cur = self.end_bad_caps;
                     }
-                    let killers = s.ss[ply].killers;
-                    let counter = s.counter_move(ply);
+                    let [k0, k1, counter] = self.tried;
                     while self.cur < self.end_cur {
                         let e = self.get(self.cur);
                         self.cur += 1;
-                        if e.m == self.tt_move
-                            || (self.cur > self.end_bad_caps
-                                && (e.m == killers[0] || e.m == killers[1] || e.m == counter))
+                        if e.m == self.tt_move || (self.cur > self.end_bad_caps && (e.m == k0 || e.m == k1 || e.m == counter))
                         {
                             continue;
                         }
