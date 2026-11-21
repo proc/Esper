@@ -37,6 +37,8 @@ const LOW_PLY_SIZE: usize = 5;
 /// Quiet moves scoring at or below this are tried after everything else.
 const GOOD_QUIET_THRESHOLD: i32 = -14000;
 const KILLER_ORDERING: bool = true;
+/// Esper's killer and countermove stages (Stockfish has neither).
+const KILLERS: bool = false;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
 /// Prefetch the child's hash entry when a move is picked (see `prefetch_after`).
 const EARLY_TT_PREFETCH: bool = true;
@@ -678,7 +680,7 @@ impl Picker {
         for (i, &m) in list.as_slice().iter().enumerate() {
             // Killers and the countermove get lighter reductions in this search, so
             // they are also tried first among the quiet moves.
-            if KILLER_ORDERING && (m == killers[0] || m == killers[1] || m == counter) {
+            if KILLERS && KILLER_ORDERING && (m == killers[0] || m == killers[1] || m == counter) {
                 let v = if m == killers[0] {
                     3 << 24
                 } else if m == killers[1] {
@@ -779,7 +781,7 @@ impl Picker {
                         self.end_cur = self.end_bad;
                         self.stage = Stage::Bad;
                     } else {
-                        self.stage = Stage::Killer0;
+                        self.stage = if KILLERS { Stage::Killer0 } else { Stage::GenQuiet };
                     }
                 }
                 Stage::Killer0 => {
@@ -1151,12 +1153,6 @@ impl Searcher {
         let material = 521 * popcount(pos.by_type[PAWN]) as i32 + npm;
         v += (material as i64 * v as i64 / 90649) as i32;
         v -= v * pos.rule50.min(100) as i32 / 189;
-        // Fortress / shuffling damping: long reversible sequences pull the score toward 0.
-        let fortress_thresh = tune::T_FortressRule50.get();
-        let r50 = pos.rule50.min(100) as i32;
-        if r50 > fortress_thresh {
-            v -= v * (r50 - fortress_thresh) / (144 - fortress_thresh).max(16);
-        }
         v.clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
     }
 
@@ -1330,7 +1326,8 @@ impl Searcher {
 
     fn update_capture(&mut self, pos: &Position, m: Move, bonus: i32) {
         let pc = pos.board[m.from()] as usize;
-        let victim = if m.flag() == FLAG_EP { PAWN } else { piece_type(pos.board[m.to()]) };
+        // En passant lands on an empty square: slot 0, as Stockfish's piece_on(to).
+        let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
         hist_update(&mut self.capture_hist[pc][m.to()][victim], bonus, CAPTURE_HIST_LIMIT);
     }
 
@@ -1523,8 +1520,9 @@ impl Searcher {
 
     // -- quiescence search ----------------------------------------------------
 
-    fn qsearch(&mut self, ply: usize, mut alpha: i32, beta: i32) -> i32 {
-        let pv_node = beta - alpha > 1;
+    /// `pv_node` is the node type the caller chose, as Stockfish's template
+    /// argument (not inferred from the window, which a PV node can narrow).
+    fn qsearch(&mut self, ply: usize, mut alpha: i32, beta: i32, pv_node: bool) -> i32 {
         self.pv_len[ply] = 0;
         if self.nodes & 255 == 0 {
             self.check_time();
@@ -1601,7 +1599,9 @@ impl Searcher {
             futility_base = static_eval + tune::T_QsFutBase.get();
         }
 
-        if !(pos.is_pseudo_legal(tt_move) && (in_check || tt_move.is_noisy())) {
+        // As Stockfish, a quiet hash move is kept: it counts toward the move-count
+        // pruning below before being skipped as a non-capture.
+        if !pos.is_pseudo_legal(tt_move) {
             tt_move = Move::NONE;
         }
         let prev_to = if ply > 0 && !self.ss[ply - 1].mv.is_none() { Some(self.ss[ply - 1].mv.to()) } else { None };
@@ -1643,7 +1643,7 @@ impl Searcher {
                 }
             }
             self.make(ply, m);
-            let score = -self.qsearch(ply + 1, -beta, -alpha);
+            let score = -self.qsearch(ply + 1, -beta, -alpha, pv_node);
             self.unmake();
             if self.stopped {
                 return 0;
@@ -1683,11 +1683,11 @@ impl Searcher {
 
     // -- main search ------------------------------------------------------------
 
-    fn search(&mut self, ply: usize, mut alpha: i32, mut beta: i32, mut depth: i32, cut_node: bool) -> i32 {
+    #[allow(clippy::too_many_arguments)]
+    fn search(&mut self, ply: usize, mut alpha: i32, mut beta: i32, mut depth: i32, cut_node: bool, pv_node: bool) -> i32 {
         if depth <= 0 {
-            return self.qsearch(ply, alpha, beta);
+            return self.qsearch(ply, alpha, beta, pv_node);
         }
-        let pv_node = beta - alpha > 1;
         let root = ply == 0;
         self.pv_len[ply] = 0;
         if self.nodes & 255 == 0 {
@@ -1804,9 +1804,7 @@ impl Searcher {
             let corr = if SF_CORRECTION { corr_raw / 131072 } else { self.correction(&self.pos[ply]) };
             static_eval = (raw_eval + corr).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
             eval = static_eval;
-            if tt_score != NONE
-                && tt_score.abs() < MATE_BOUND
-                && tt_bound & (if tt_score > eval { BOUND_LOWER } else { BOUND_UPPER }) != 0
+            if tt_score != NONE && tt_bound & (if tt_score > eval { BOUND_LOWER } else { BOUND_UPPER }) != 0
             {
                 eval = tt_score;
             }
@@ -1942,7 +1940,7 @@ impl Searcher {
 
             // Razoring
             if all_node && eval < alpha - 342 * depth && !self.seek_mate {
-                return self.qsearch(ply, alpha, beta);
+                return self.qsearch(ply, alpha, beta, false);
             }
 
             // Reverse futility pruning (static null move)
@@ -1989,7 +1987,7 @@ impl Searcher {
                 // Searching for a mate, null-move cutoffs are less trustworthy.
                 let r = if self.seek_mate { r - r / 2 } else { r };
                 self.make_null(ply);
-                let v = -self.search(ply + 1, -beta, -beta + 1, depth - r, if SF_NMP { false } else { !cut_node });
+                let v = -self.search(ply + 1, -beta, -beta + 1, depth - r, if SF_NMP { false } else { !cut_node }, false);
                 self.unmake();
                 if self.stopped {
                     return 0;
@@ -2002,7 +2000,7 @@ impl Searcher {
                     }
                     // Verification search at high depth guards against zugzwang.
                     self.nmp_min_ply = ply + 3 * (depth - r).max(0) as usize / 4;
-                    let verify = self.search(ply, beta - 1, beta, depth - r, false);
+                    let verify = self.search(ply, beta - 1, beta, depth - r, false, false);
                     self.nmp_min_ply = 0;
                     if self.stopped {
                         return 0;
@@ -2042,9 +2040,9 @@ impl Searcher {
                         continue;
                     }
                     self.make(ply, m);
-                    let mut v = -self.qsearch(ply + 1, -pc_beta, -pc_beta + 1);
+                    let mut v = -self.qsearch(ply + 1, -pc_beta, -pc_beta + 1, false);
                     if v >= pc_beta && pc_depth > 0 {
-                        v = -self.search(ply + 1, -pc_beta, -pc_beta + 1, pc_depth, !cut_node);
+                        v = -self.search(ply + 1, -pc_beta, -pc_beta + 1, pc_depth, !cut_node, false);
                     }
                     self.unmake();
                     if self.stopped {
@@ -2074,7 +2072,7 @@ impl Searcher {
                     }
                     tried += 1;
                     self.make(ply, m);
-                    let v = -self.search(ply + 1, -beta, -beta + 1, depth - 4, false);
+                    let v = -self.search(ply + 1, -beta, -beta + 1, depth - 4, false, false);
                     self.unmake();
                     if self.stopped {
                         return 0;
@@ -2230,7 +2228,7 @@ impl Searcher {
                 let margin = (tune::T_SingularMargin.get() + 66 * (tt_pv && !pv_node) as i32) * depth / 63;
                 let s_beta = tt_score - margin;
                 self.ss[ply].excluded = m;
-                let v = self.search(ply, s_beta - 1, s_beta, (depth - 1) / 2, cut_node);
+                let v = self.search(ply, s_beta - 1, s_beta, (depth - 1) / 2, cut_node, false);
                 self.ss[ply].excluded = Move::NONE;
                 if self.stopped {
                     return 0;
@@ -2264,8 +2262,12 @@ impl Searcher {
 
             // Stockfish's statScore: how well this move has done before.
             let stat_score = if capture {
-                let captured = if m.flag() == FLAG_EP { PAWN } else { victim };
-                873 * PIECE_VALUE[captured] / 128 + capt_hist
+                // Stockfish reads the captured piece here, a pawn for en passant.
+                if m.flag() == FLAG_EP {
+                    873 * PIECE_VALUE[PAWN] / 128 + self.capture_hist[pc][m.to()][PAWN] as i32
+                } else {
+                    873 * PIECE_VALUE[victim] / 128 + capt_hist
+                }
             } else {
                 (2252 * self.butterfly[pos.stm][m.from_to()] as i32
                     + 1126 * self.cont_score(ply, 1, idx)
@@ -2320,14 +2322,14 @@ impl Searcher {
                 let cap = if (ply as i32) < 2 * self.root_depth { 2 } else { 0 };
                 let d = (new_depth + (-r / 1024).min(cap)).max(1) + pv_node as i32;
                 self.ss[ply].reduction = new_depth - d;
-                score = -self.search(ply + 1, -alpha - 1, -alpha, d, true);
+                score = -self.search(ply + 1, -alpha - 1, -alpha, d, true, false);
                 self.ss[ply].reduction = 0;
                 if score > alpha {
                     let deeper = d < new_depth && score > best + 53 && (!DEEPER_PLY_GUARD || (ply as i32) < 2 * self.root_depth);
                     let shallower = score < best + 8;
                     new_depth += deeper as i32 - shallower as i32;
                     if new_depth > d {
-                        score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node);
+                        score = -self.search(ply + 1, -alpha - 1, -alpha, new_depth, !cut_node, false);
                     }
                     // The move did better than its late position suggested.
                     self.update_cont(ply, in_check, idx, 1334);
@@ -2338,7 +2340,7 @@ impl Searcher {
                     r += 1127;
                 }
                 let d = new_depth - (r > 5234) as i32 - (r > 5487 && new_depth > 2) as i32;
-                score = -self.search(ply + 1, -alpha - 1, -alpha, d, !cut_node);
+                score = -self.search(ply + 1, -alpha - 1, -alpha, d, !cut_node, false);
             } else {
                 score = alpha + 1;
             }
@@ -2347,7 +2349,7 @@ impl Searcher {
                 if m == tt_move && ((tt_score != NONE && tt_score.abs() >= MATE_BOUND && tt_depth > 0) || tt_depth > 1) {
                     new_depth = new_depth.max(1);
                 }
-                score = -self.search(ply + 1, -beta, -alpha, new_depth, false);
+                score = -self.search(ply + 1, -beta, -alpha, new_depth, false, true);
             }
             self.unmake();
             if self.stopped {
@@ -2432,7 +2434,7 @@ impl Searcher {
             let malus = stat_malus(depth);
             if !best_move.is_capture_stage() {
                 // Killers and the countermove are Esper's own, kept on quiet cutoffs.
-                if best >= beta {
+                if KILLERS && best >= beta {
                     let k = &mut self.ss[ply].killers;
                     if k[0] != best_move {
                         k[1] = k[0];
@@ -2627,7 +2629,7 @@ impl Searcher {
                 let score = loop {
                     let adjusted =
                         (depth - fail_highs - self.fail_high_recovery - 3 * (self.search_again + 1) / 4).max(1);
-                    let s = self.search(0, alpha, beta, adjusted, false);
+                    let s = self.search(0, alpha, beta, adjusted, false, true);
                     if self.stopped {
                         break s;
                     }

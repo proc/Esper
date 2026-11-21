@@ -647,6 +647,31 @@ impl Position {
         ci.squares[pt] & bit(to) != 0 || (ci.blockers & bit(from) != 0 && line(from, ci.ksq) & bit(to) == 0)
     }
 
+    /// For the king of `color`: the pieces (of either colour) that alone block an
+    /// enemy slider's line to it, and the enemy sliders pinning a piece of
+    /// `color` that way (Stockfish's blockersForKing and the opponent's pinners).
+    pub fn slider_blockers(&self, color: usize) -> (u64, u64) {
+        let ksq = self.king_sq(color);
+        let t = tables();
+        let them = self.by_color[color ^ 1];
+        let occ = self.occ();
+        let mut snipers = ((t.rook_empty[ksq] & (self.by_type[ROOK] | self.by_type[QUEEN]))
+            | (t.bishop_empty[ksq] & (self.by_type[BISHOP] | self.by_type[QUEEN])))
+            & them;
+        let (mut blockers, mut pinners) = (0u64, 0u64);
+        while snipers != 0 {
+            let sq = pop_lsb(&mut snipers);
+            let b = between(sq, ksq) & occ;
+            if b != 0 && b & (b - 1) == 0 {
+                blockers |= b;
+                if b & self.by_color[color] != 0 {
+                    pinners |= bit(sq);
+                }
+            }
+        }
+        (blockers, pinners)
+    }
+
     /// Static exchange evaluation: is the exchange started by `m` worth at least `threshold`?
     pub fn see_ge(&self, m: Move, threshold: i32) -> bool {
         // Like Stockfish, special moves (castling, en passant, promotions) count as
@@ -681,8 +706,14 @@ impl Position {
         let orth = self.by_type[ROOK] | self.by_type[QUEEN];
         let mut attackers = self.attackers_to(to, occ) & occ;
         let mut stm = self.stm ^ 1;
+        // Stockfish's pin rule: a piece pinned to its king may not recapture
+        // while the pinner is still on the board.
+        let pins = [self.slider_blockers(WHITE), self.slider_blockers(BLACK)];
         loop {
-            let mine = attackers & self.by_color[stm];
+            let mut mine = attackers & self.by_color[stm];
+            if pins[stm].1 & occ != 0 {
+                mine &= !pins[stm].0;
+            }
             if mine == 0 {
                 break;
             }
@@ -870,3 +901,25 @@ impl Position {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::movegen::parse_move;
+
+    fn see(fen: &str, mv: &str, threshold: i32) -> bool {
+        crate::bitboard::init();
+        let pos = Position::from_fen(fen).unwrap();
+        pos.see_ge(parse_move(&pos, mv).unwrap(), threshold)
+    }
+
+    #[test]
+    fn see_respects_pins() {
+        // The knight on c3 defends e4 but is pinned to its king by the b4 bishop.
+        let pinned = "4r1k1/8/8/8/1b2P3/2N5/8/4K3 b - - 0 1";
+        assert!(see(pinned, "e8e4", 0), "a pinned knight cannot recapture");
+        // Without the pinning bishop the knight recaptures and the rook is lost.
+        let free = "4r1k1/8/8/8/4P3/2N5/8/4K3 b - - 0 1";
+        assert!(!see(free, "e8e4", 0));
+    }
+}
