@@ -622,7 +622,7 @@ fn threat_code(from: usize, to: usize, attacker: u8, attacked: u8) -> u32 {
 /// Threats that involve the piece `pc` standing on `sq` in `tb` (as attacker or
 /// target) go to `with`; threats that exist only while `sq` is empty (sliders
 /// seeing past it) go to `without`.
-#[inline]
+#[inline(always)]
 fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<N>, without: &mut IdxList<N>) {
     let pt = piece_type(pc);
     let occ = tb.occ;
