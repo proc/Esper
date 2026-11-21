@@ -3,14 +3,17 @@
 mod bitboard;
 mod book;
 mod cuckoo;
+mod datagen;
 mod exp;
 mod mem;
 mod movegen;
 mod nnue;
+mod pgn;
 mod polyglot_keys;
 mod position;
 mod search;
 mod simd;
+mod small;
 mod tb;
 mod tune;
 mod tt;

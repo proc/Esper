@@ -979,6 +979,13 @@ impl Engine {
                 }
                 _ => println!("info string usage: epd <file> [ms per position]"),
             },
+            "datagen" => {
+                self.wait();
+                match crate::datagen::Config::parse(args).and_then(|c| crate::datagen::run(self.net.clone(), &c)) {
+                    Ok(()) => {}
+                    Err(e) => println!("info string datagen: {e}"),
+                }
+            }
             "bench" => self.bench(args.first().and_then(|s| s.parse().ok()).unwrap_or(13)),
             "smpbench" => {
                 let depth = args.first().and_then(|s| s.parse().ok()).unwrap_or(12);

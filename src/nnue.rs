@@ -93,6 +93,9 @@ pub struct Network {
     stacks: Vec<LayerStack>,
     stack_index: [u16; RAW_STACKS],
     luts: Box<ThreatLuts>,
+    /// Set when the file is a small network (see `small.rs`); the fields above
+    /// are then unused.
+    pub small: Option<crate::small::SmallNet>,
     pub description: String,
 }
 
@@ -212,6 +215,22 @@ impl Network {
     }
 
     pub fn from_bytes(data: &'static [u8]) -> Result<Network, String> {
+        if crate::small::SmallNet::is_small_file(data) {
+            let small = crate::small::SmallNet::from_bytes(data)?;
+            return Ok(Network {
+                data: &[],
+                _backing: None,
+                _large: None,
+                biases: Acc([0; L1]),
+                tp_off: 0,
+                psq_off: 0,
+                stacks: Vec::new(),
+                stack_index: [0; RAW_STACKS],
+                luts: build_luts(),
+                description: small.description(),
+                small: Some(small),
+            });
+        }
         if data.len() < 12 {
             return Err("file too short".into());
         }
@@ -319,6 +338,7 @@ impl Network {
             stacks,
             stack_index,
             luts: build_luts(),
+            small: None,
             description,
         })
     }
@@ -1020,6 +1040,8 @@ pub struct NnueState {
     threats_buf: [u32; MAX_THREATS],
     threats_len: usize,
     threats_ply: usize,
+    /// Accumulators for a small network; everything above is then left empty.
+    small: Option<crate::small::SmallState>,
 }
 
 /// Above this many changed squares a threat refresh starts from scratch rather
@@ -1587,6 +1609,8 @@ fn compute_psq_diff(cur: &mut Entry, p0: &Position, p1: &Position, persp: usize)
 
 impl NnueState {
     pub fn new(net: Arc<Network>, max_ply: usize) -> NnueState {
+        let small = net.small.as_ref().map(|n| crate::small::SmallState::new(n, max_ply));
+        let (max_ply, caches) = if small.is_some() { (0, 0) } else { (max_ply, 2 * 3 * 64) };
         let mut entries = Vec::with_capacity(max_ply);
         for _ in 0..max_ply {
             entries.push(Entry {
@@ -1602,8 +1626,8 @@ impl NnueState {
                 tp_subs: [IdxList16::new(), IdxList16::new()],
             });
         }
-        let mut cache = Vec::with_capacity(2 * 3 * 64);
-        for _ in 0..2 * 3 * 64 {
+        let mut cache = Vec::with_capacity(caches);
+        for _ in 0..caches {
             cache.push(CacheEntry { acc: net.biases, by_color: [0; 2], by_type: [0; 7] });
         }
         NnueState {
@@ -1615,11 +1639,22 @@ impl NnueState {
             threats_buf: [0; MAX_THREATS],
             threats_len: 0,
             threats_ply: usize::MAX,
+            small,
         }
+    }
+
+    /// The network is a small one (see `small.rs`), whose output needs none of
+    /// the Stockfish network's post-processing.
+    #[inline(always)]
+    pub fn is_small(&self) -> bool {
+        self.small.is_some()
     }
 
     /// Start a new stack: the position at ply 0 is unrelated to anything before.
     pub fn reset(&mut self) {
+        if let Some(s) = &mut self.small {
+            return s.reset();
+        }
         let e = &mut self.entries[0];
         e.acc_ok = [false; 2];
         e.psq_refresh = [true; 2];
@@ -1632,6 +1667,9 @@ impl NnueState {
     /// Register the position at `stack[j]` (reached from `stack[j - 1]`): mark
     /// accumulator/threat state as pending so diffs are only computed if evaluated.
     pub fn push(&mut self, stack: &[Position], j: usize) {
+        if let Some(s) = &mut self.small {
+            return s.push(j);
+        }
         if self.threats_ply == j {
             self.threats_ply = usize::MAX;
         }
@@ -1933,8 +1971,55 @@ impl NnueState {
     /// point of view. `stack[0..=ply]` must be the path from the stack's root, with
     /// every ply after the root registered through `push`.
     pub fn evaluate(&mut self, stack: &[Position], ply: usize) -> i32 {
-        for persp in 0..2 {
-            self.ensure(stack, ply, persp);
+        if let Some(s) = &mut self.small {
+            return s.evaluate(self.net.small.as_ref().unwrap(), stack, ply);
+        }
+        // Fast path: both perspectives need a 1-ply incremental update from ply - 1.
+        // Prefetch both perspectives' rows before applying persp 0 so persp 1's
+        // DRAM/L3 latency overlaps persp 0's SIMD compute.
+        if ply > 0 {
+            let (lo, hi) = self.entries.split_at_mut(ply);
+            let (prev, cur) = (&lo[ply - 1], &mut hi[0]);
+            if !cur.acc_ok[0]
+                && !cur.acc_ok[1]
+                && prev.acc_ok[0]
+                && prev.acc_ok[1]
+                && !cur.psq_refresh[0]
+                && !cur.psq_refresh[1]
+                && !cur.tp_refresh[0]
+                && !cur.tp_refresh[1]
+            {
+                let net = &*self.net;
+                let (p0, p1) = (&stack[ply - 1], &stack[ply]);
+                if !cur.psq_diff_ok[0] {
+                    compute_psq_diff(cur, p0, p1, 0);
+                }
+                if !cur.psq_diff_ok[1] {
+                    compute_psq_diff(cur, p0, p1, 1);
+                }
+                if !cur.tp_diff_ok {
+                    compute_tp_diff(net, cur, p0, p1);
+                }
+                let mut abuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                let mut sbuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                let mut abuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                let mut sbuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                let adds0 = row_ptrs(net, cur.tp_adds[0].as_slice(), cur.psq_adds[0].as_slice(), &mut abuf0);
+                let subs0 = row_ptrs(net, cur.tp_subs[0].as_slice(), cur.psq_subs[0].as_slice(), &mut sbuf0);
+                let adds1 = row_ptrs(net, cur.tp_adds[1].as_slice(), cur.psq_adds[1].as_slice(), &mut abuf1);
+                let subs1 = row_ptrs(net, cur.tp_subs[1].as_slice(), cur.psq_subs[1].as_slice(), &mut sbuf1);
+                apply_ptrs(&mut cur.acc[0], &prev.acc[0], adds0, subs0);
+                apply_ptrs(&mut cur.acc[1], &prev.acc[1], adds1, subs1);
+                cur.acc_ok = [true, true];
+            } else {
+                for persp in 0..2 {
+                    self.ensure(stack, ply, persp);
+                }
+            }
+        } else {
+            for persp in 0..2 {
+                self.ensure(stack, ply, persp);
+            }
         }
         let pos = &stack[ply];
         let e = &self.entries[ply];
@@ -2267,22 +2352,26 @@ unsafe fn activate_scalar<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mu
 #[inline]
 unsafe fn layer1_neon_dot(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
     use std::arch::aarch64::*;
-    // Input-group-major weights: each group of 4 activations feeds all 32
-    // outputs through 8 dot products, unrolled 2x into 16 accumulators.
+    // Input-group-major weights: load 16 activations (4 groups of 4) once and
+    // feed all 32 outputs via lane-indexed sdot into 16 accumulators.
     let mut acc0 = [vdupq_n_s32(0); L3 / 4];
     let mut acc1 = [vdupq_n_s32(0); L3 / 4];
     for (k, a) in acc0.iter_mut().enumerate() {
         *a = vld1q_s32(s.b1.as_ptr().add(k * 4));
     }
-    let act_ptr = act.as_ptr() as *const u32;
-    for c in (0..2 * L2 / 4).step_by(2) {
-        let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c)));
-        let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c + 1)));
+    let act_ptr = act.as_ptr();
+    for g in 0..(2 * L2 / 16) {
+        let v = vreinterpretq_s8_u8(vld1q_u8(act_ptr.add(g * 16)));
+        let c = g * 4;
         let w0 = s.w1c.get_unchecked(c).as_ptr();
         let w1 = s.w1c.get_unchecked(c + 1).as_ptr();
+        let w2 = s.w1c.get_unchecked(c + 2).as_ptr();
+        let w3 = s.w1c.get_unchecked(c + 3).as_ptr();
         for k in 0..L3 / 4 {
-            acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
-            acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
+            acc0[k] = vdotq_laneq_s32::<0>(acc0[k], vld1q_s8(w0.add(k * 16)), v);
+            acc1[k] = vdotq_laneq_s32::<1>(acc1[k], vld1q_s8(w1.add(k * 16)), v);
+            acc0[k] = vdotq_laneq_s32::<2>(acc0[k], vld1q_s8(w2.add(k * 16)), v);
+            acc1[k] = vdotq_laneq_s32::<3>(acc1[k], vld1q_s8(w3.add(k * 16)), v);
         }
     }
     let mut h = [0i32; L3];

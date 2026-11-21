@@ -1264,6 +1264,12 @@ impl Searcher {
 
     #[inline]
     fn scale_eval(&self, raw: i32, pos: &Position) -> i32 {
+        if self.nnue.is_small() {
+            // A small network is trained to give the score directly; only the
+            // fade towards a 50-move draw is applied.
+            let v = raw - raw * pos.rule50.min(100) as i32 / 189;
+            return v.clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
+        }
         if SF_EVAL_SCALE {
             return self.scale_eval_sf(raw, pos);
         }

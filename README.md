@@ -66,6 +66,78 @@ All paths produce identical evaluations. Setting the environment variable
 already guarantees the best path (Apple silicon) has the choice fixed at compile
 time and ignores the variable.
 
+## Training your own network
+
+`esper datagen` plays self-play games and writes the positions it meets, scored
+by the search, with the game result. Two trainers can use them.
+
+Games can also come from PGN files instead of self-play:
+
+```bash
+target/release/esper datagen pgn=games.pgn out=data.txt nodes=5000
+```
+
+replays every game that has a result and writes its positions with that result
+(`pgn=` can be repeated or given a comma-separated list; the first `skip=8`
+plies of each game are left out). By default Esper searches each position for
+`nodes` nodes to score it. `score=pgn` instead uses the evaluations recorded in
+the PGN's comments (Lichess's `[%eval 0.35]`, or an engine's `{+0.35/12 …}`) and
+drops positions without one, which needs no searching. Output from PGN files and
+from self-play can be appended to the same file.
+
+A run can be stopped at any time. Each finished game is written at once, so
+nothing but the games in progress is lost. A PGN run records how far it got in
+`<out>.progress` and, run again with the same files and settings, carries on
+with the next game instead of writing the earlier ones twice (delete that file
+to start over). Self-play uses a new random seed each run, so a second run adds
+different games; `seed=N` makes a run repeatable.
+
+### A small network of your own
+
+```bash
+target/release/esper datagen out=data.txt games=200000 nodes=5000
+python3 tools/train.py data.txt --out my.esprnet --engine target/release/esper
+```
+
+then `setoption name EvalFile value my.esprnet`. `tools/train.py` (PyTorch; uses
+a CUDA or Apple GPU when present) trains the network `src/small.rs` reads: 768
+inputs per perspective, one hidden layer (`--hidden`, default 256) with a squared
+clipped ReLU, one output. With `--engine` it loads the exported file into that
+Esper binary and checks that the engine's evaluation matches its own integer
+arithmetic exactly on a sample of positions.
+
+Training can be continued rather than started afresh. Each epoch the run saves a
+checkpoint, `my.esprnet.ckpt`, and
+
+```bash
+python3 tools/train.py more.txt --out my.esprnet --resume
+```
+
+trains the same network further: for `--epochs` more on whatever data files are
+given after a finished run, or from the epoch it was in after a run that was
+stopped part-way. `--resume FILE` starts from another checkpoint or from a
+network file. `python3 tools/train.py --help` has the details.
+
+Expect far less strength than the Stockfish network: this is a much simpler
+network, and it needs a lot of data (a hundred million positions is a sensible
+start; `datagen` produces roughly a thousand a second on eight cores at 5000
+nodes). Compare networks with
+`tools/sprt.py --new-option EvalFile=my.esprnet`.
+
+### The Stockfish architecture, on your data
+
+```bash
+target/release/esper datagen out=data.plain games=200000 nodes=5000 format=plain
+```
+
+writes Stockfish's "plain" training text (every position, with the move played).
+Stockfish's tools convert that to `.binpack`, which the
+[nnue-pytorch](https://github.com/official-stockfish/nnue-pytorch) trainer reads;
+its serialised `.nnue` output loads with `EvalFile` as long as it has the
+architecture of the embedded network. This route has not been run by the author:
+the plain output is written to the documented layout but has not been through
+the converter or the trainer.
+
 ## Command line
 
 ```bash
@@ -122,6 +194,7 @@ These are typed at the engine prompt (or given on the command line).
 | `epd <file> [ms]` | The same for any EPD file with `bm` or `am` operations |
 | `book` | Lists the book moves for the current position with their weights |
 | `tbprobe` | Shows the tablebase WDL and root DTZ result for the current position |
+| `datagen out=FILE [games=N] [nodes=N] [threads=N] [seed=N] [format=text\|plain] [pgn=FILE] [score=search\|pgn] [skip=N]` | Plays self-play games and appends training positions to FILE (see Training your own network) |
 | `selftest [games]` | Plays random games and checks incremental NNUE updates against full refreshes |
 | `evalfile <fens.txt>` | Prints the raw network output for each FEN in a file |
 
@@ -249,6 +322,10 @@ distance. `info` lines include `tbhits`.
 | `src/position.rs` | Board state, copy-make, legality, SEE, FEN and Zobrist keys |
 | `src/movegen.rs` | Move generation, SAN, perft |
 | `src/nnue.rs` | Network loading and inference, with SIMD paths |
+| `src/small.rs` | The small trainable network: loading and inference |
+| `src/datagen.rs` | Training data generation from self-play or PGN files |
+| `src/pgn.rs` | PGN reading for data generation |
+| `tools/train.py` | Trainer for the small network |
 | `src/tt.rs` | Transposition table |
 | `src/search.rs` | Search, move ordering, histories, time management, Lazy SMP |
 | `src/tb.rs` | Syzygy probing (bindings to Fathom) |
