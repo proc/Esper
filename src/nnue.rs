@@ -15,8 +15,11 @@
 //! Incremental updates are derived by diffing consecutive positions of the search
 //! stack, so no bookkeeping is needed in make-move.
 
+#![cfg_attr(feature = "portable", allow(dead_code))]
+
 use crate::bitboard::*;
 use crate::position::*;
+use crate::simd::{self, Level};
 use std::sync::Arc;
 
 pub const L1: usize = 1024;
@@ -543,7 +546,7 @@ impl<const N: usize> IdxSink for IdxList16<N> {
     }
 }
 
-#[cfg(simd_avx2)]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_tile_ptr(p: *const i8, off: usize) {
     unsafe {
@@ -934,58 +937,13 @@ impl ThreatLuts {
 // `dst = src + rows(adds) - rows(subs)`, processed in tiles small enough to keep
 // the running sums in registers while every row is applied.
 
-#[cfg(simd_neon)]
+/// `dst = src + rows(adds) - rows(subs)` with the rows given as feature indices.
 #[inline]
 fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
-    use std::arch::aarch64::*;
     if adds.is_empty() && subs.is_empty() {
         *dst = *src;
         return;
     }
-    // Fast fused paths for the common 1-add/1-sub (quiet) and 1-add/2-sub (capture) updates.
-    if adds.len() == 1 && subs.len() == 1 {
-        let a0 = row(adds[0]).as_ptr() as *const i8;
-        let s0 = row(subs[0]).as_ptr() as *const i8;
-        let src_p = src.0.as_ptr();
-        let dst_p = dst.0.as_mut_ptr();
-        unsafe {
-            for off in (0..L1).step_by(16) {
-                let va = vld1q_s8(a0.add(off));
-                let vs = vld1q_s8(s0.add(off));
-                let r0 = vsubw_s8(vaddw_s8(vld1q_s16(src_p.add(off)), vget_low_s8(va)), vget_low_s8(vs));
-                let r1 = vsubw_high_s8(vaddw_high_s8(vld1q_s16(src_p.add(off + 8)), va), vs);
-                vst1q_s16(dst_p.add(off), r0);
-                vst1q_s16(dst_p.add(off + 8), r1);
-            }
-        }
-        return;
-    }
-    if adds.len() == 1 && subs.len() == 2 {
-        let a0 = row(adds[0]).as_ptr() as *const i8;
-        let s0 = row(subs[0]).as_ptr() as *const i8;
-        let s1 = row(subs[1]).as_ptr() as *const i8;
-        let src_p = src.0.as_ptr();
-        let dst_p = dst.0.as_mut_ptr();
-        unsafe {
-            for off in (0..L1).step_by(16) {
-                let va = vld1q_s8(a0.add(off));
-                let vs0 = vld1q_s8(s0.add(off));
-                let vs1 = vld1q_s8(s1.add(off));
-                let r0 = vsubw_s8(
-                    vsubw_s8(vaddw_s8(vld1q_s16(src_p.add(off)), vget_low_s8(va)), vget_low_s8(vs0)),
-                    vget_low_s8(vs1),
-                );
-                let r1 = vsubw_high_s8(
-                    vsubw_high_s8(vaddw_high_s8(vld1q_s16(src_p.add(off + 8)), va), vs0),
-                    vs1,
-                );
-                vst1q_s16(dst_p.add(off), r0);
-                vst1q_s16(dst_p.add(off + 8), r1);
-            }
-        }
-        return;
-    }
-    const TILE: usize = 128; // 16 registers of 8 lanes
     // Row addresses are looked up once, not once per row per tile.
     const MAXR: usize = TP_LIST + 16;
     // Left uninitialised: zero-filling these on every call cost more than it saved.
@@ -1002,176 +960,7 @@ fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, 
     // SAFETY: the first `na` / `ns` slots were just written.
     let add_ptrs: &[*const i8] = unsafe { std::slice::from_raw_parts(add_buf.as_ptr() as *const *const i8, na) };
     let sub_ptrs: &[*const i8] = unsafe { std::slice::from_raw_parts(sub_buf.as_ptr() as *const *const i8, ns) };
-    // SAFETY: all pointers stay within the 1024-element arrays.
-    unsafe {
-        let mut off = 0;
-        while off < L1 {
-            let mut regs = [vdupq_n_s16(0); TILE / 8];
-            let s = src.0.as_ptr().add(off);
-            for (k, r) in regs.iter_mut().enumerate() {
-                *r = vld1q_s16(s.add(k * 8));
-            }
-            for &p in add_ptrs {
-                let w = p.add(off);
-                for k in 0..TILE / 16 {
-                    let v = vld1q_s8(w.add(k * 16));
-                    regs[2 * k] = vaddw_s8(regs[2 * k], vget_low_s8(v));
-                    regs[2 * k + 1] = vaddw_high_s8(regs[2 * k + 1], v);
-                }
-            }
-            for &p in sub_ptrs {
-                let w = p.add(off);
-                for k in 0..TILE / 16 {
-                    let v = vld1q_s8(w.add(k * 16));
-                    regs[2 * k] = vsubw_s8(regs[2 * k], vget_low_s8(v));
-                    regs[2 * k + 1] = vsubw_high_s8(regs[2 * k + 1], v);
-                }
-            }
-            let d = dst.0.as_mut_ptr().add(off);
-            for (k, r) in regs.iter().enumerate() {
-                vst1q_s16(d.add(k * 8), *r);
-            }
-            off += TILE;
-        }
-    }
-}
-
-#[cfg(simd_avx2)]
-#[inline]
-fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
-    use std::arch::x86_64::*;
-    if adds.is_empty() && subs.is_empty() {
-        *dst = *src;
-        return;
-    }
-    if adds.len() == 1 && subs.len() == 1 {
-        let a0 = row(adds[0]).as_ptr();
-        let s0 = row(subs[0]).as_ptr();
-        let src_p = src.0.as_ptr();
-        let dst_p = dst.0.as_mut_ptr();
-        unsafe {
-            for off in (0..L1).step_by(16) {
-                let r = _mm256_loadu_si256(src_p.add(off) as *const __m256i);
-                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0.add(off) as *const __m128i));
-                let vs = _mm256_cvtepi8_epi16(_mm_loadu_si128(s0.add(off) as *const __m128i));
-                _mm256_storeu_si256(dst_p.add(off) as *mut __m256i, _mm256_sub_epi16(_mm256_add_epi16(r, va), vs));
-            }
-        }
-        return;
-    }
-    if adds.len() == 1 && subs.len() == 2 {
-        let a0 = row(adds[0]).as_ptr();
-        let s0 = row(subs[0]).as_ptr();
-        let s1 = row(subs[1]).as_ptr();
-        let src_p = src.0.as_ptr();
-        let dst_p = dst.0.as_mut_ptr();
-        unsafe {
-            for off in (0..L1).step_by(16) {
-                let r = _mm256_loadu_si256(src_p.add(off) as *const __m256i);
-                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0.add(off) as *const __m128i));
-                let vs0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(s0.add(off) as *const __m128i));
-                let vs1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(s1.add(off) as *const __m128i));
-                let res = _mm256_sub_epi16(_mm256_sub_epi16(_mm256_add_epi16(r, va), vs0), vs1);
-                _mm256_storeu_si256(dst_p.add(off) as *mut __m256i, res);
-            }
-        }
-        return;
-    }
-    const REGS: usize = 8; // of 16 lanes each
-    const TILE: usize = REGS * 16;
-    // SAFETY: all pointers stay within the 1024-element arrays.
-    unsafe {
-        let mut off = 0;
-        while off < L1 {
-            let mut regs = [_mm256_setzero_si256(); REGS];
-            let s = src.0.as_ptr().add(off);
-            for (k, r) in regs.iter_mut().enumerate() {
-                *r = _mm256_loadu_si256(s.add(k * 16) as *const __m256i);
-            }
-            for &i in adds {
-                let w = row(i).as_ptr().add(off);
-                for (k, r) in regs.iter_mut().enumerate() {
-                    let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
-                    *r = _mm256_add_epi16(*r, v);
-                }
-            }
-            for &i in subs {
-                let w = row(i).as_ptr().add(off);
-                for (k, r) in regs.iter_mut().enumerate() {
-                    let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
-                    *r = _mm256_sub_epi16(*r, v);
-                }
-            }
-            let d = dst.0.as_mut_ptr().add(off);
-            for (k, r) in regs.iter().enumerate() {
-                _mm256_storeu_si256(d.add(k * 16) as *mut __m256i, *r);
-            }
-            off += TILE;
-        }
-    }
-}
-
-#[cfg(simd_avx512)]
-#[inline]
-fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
-    use std::arch::x86_64::*;
-    const REGS: usize = 16; // of 32 lanes each
-    const TILE: usize = REGS * 32;
-    // SAFETY: all pointers stay within the 1024-element arrays.
-    unsafe {
-        let mut off = 0;
-        while off < L1 {
-            let mut regs = [_mm512_setzero_si512(); REGS];
-            let s = src.0.as_ptr().add(off);
-            for (k, r) in regs.iter_mut().enumerate() {
-                *r = _mm512_loadu_si512(s.add(k * 32) as *const _);
-            }
-            for &i in adds {
-                let w = row(i).as_ptr().add(off);
-                for (k, r) in regs.iter_mut().enumerate() {
-                    let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
-                    *r = _mm512_add_epi16(*r, v);
-                }
-            }
-            for &i in subs {
-                let w = row(i).as_ptr().add(off);
-                for (k, r) in regs.iter_mut().enumerate() {
-                    let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
-                    *r = _mm512_sub_epi16(*r, v);
-                }
-            }
-            let d = dst.0.as_mut_ptr().add(off);
-            for (k, r) in regs.iter().enumerate() {
-                _mm512_storeu_si512(d.add(k * 32) as *mut _, *r);
-            }
-            off += TILE;
-        }
-    }
-}
-
-#[cfg(simd_none)]
-#[inline]
-fn apply_rows<'a, F: Fn(u32) -> &'a [u8; L1]>(dst: &mut Acc, src: &Acc, row: F, adds: &[u32], subs: &[u32]) {
-    const TILE: usize = 256;
-    let mut off = 0;
-    while off < L1 {
-        let mut regs = [0i16; TILE];
-        regs.copy_from_slice(&src.0[off..off + TILE]);
-        for &i in adds {
-            let w = &row(i)[off..off + TILE];
-            for k in 0..TILE {
-                regs[k] = regs[k].wrapping_add(w[k] as i8 as i16);
-            }
-        }
-        for &i in subs {
-            let w = &row(i)[off..off + TILE];
-            for k in 0..TILE {
-                regs[k] = regs[k].wrapping_sub(w[k] as i8 as i16);
-            }
-        }
-        dst.0[off..off + TILE].copy_from_slice(&regs);
-        off += TILE;
-    }
+    apply_ptrs(dst, src, add_ptrs, sub_ptrs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,8 +1113,8 @@ fn tp_rows<const N: usize, S: IdxSink>(
 }
 
 /// `dst = src + rows(adds) - rows(subs)` with the rows given as addresses.
-#[cfg(simd_neon)]
-fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+#[cfg(target_arch = "aarch64")]
+fn apply_ptrs_neon(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
     use std::arch::aarch64::*;
     const TILE: usize = 128; // 16 registers of 8 lanes
     // SAFETY: every address points at a row of L1 weights.
@@ -1362,8 +1151,9 @@ fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) 
     }
 }
 
-#[cfg(simd_avx2)]
-fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_ptrs_avx2(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
     use std::arch::x86_64::*;
     const REGS: usize = 8; // 128 lanes
     const TILE: usize = REGS * 16;
@@ -1406,8 +1196,9 @@ fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) 
     }
 }
 
-#[cfg(simd_avx512)]
-fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw")]
+unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
     use std::arch::x86_64::*;
     const REGS: usize = 16; // 512 lanes
     const TILE: usize = REGS * 32;
@@ -1442,18 +1233,52 @@ fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) 
     }
 }
 
-#[cfg(simd_none)]
-fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
-    for j in 0..L1 {
-        let mut v = src.0[j];
+/// Portable version: tiles of plain lanes, which the compiler vectorises.
+fn apply_ptrs_scalar(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+    const TILE: usize = 256;
+    let mut off = 0;
+    while off < L1 {
+        let mut regs = [0i16; TILE];
+        regs.copy_from_slice(&src.0[off..off + TILE]);
         for &p in adds {
-            v = v.wrapping_add(unsafe { *p.add(j) } as i16);
+            // SAFETY: every address points at a row of L1 weights.
+            let w = unsafe { std::slice::from_raw_parts(p.add(off), TILE) };
+            for k in 0..TILE {
+                regs[k] = regs[k].wrapping_add(w[k] as i16);
+            }
         }
         for &p in subs {
-            v = v.wrapping_sub(unsafe { *p.add(j) } as i16);
+            let w = unsafe { std::slice::from_raw_parts(p.add(off), TILE) };
+            for k in 0..TILE {
+                regs[k] = regs[k].wrapping_sub(w[k] as i16);
+            }
         }
-        dst.0[j] = v;
+        dst.0[off..off + TILE].copy_from_slice(&regs);
+        off += TILE;
     }
+}
+
+/// `dst = src + rows(adds) - rows(subs)` with the rows given as addresses, on
+/// the best code path this CPU supports.
+#[inline(always)]
+fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) {
+    let level = simd::level();
+    #[cfg(target_arch = "aarch64")]
+    if level >= Level::Neon {
+        return apply_ptrs_neon(dst, src, adds, subs);
+    }
+    // SAFETY: `level` only names instruction sets the CPU was found to have.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if level >= Level::Avx512 {
+            return apply_ptrs_avx512(dst, src, adds, subs);
+        }
+        if level >= Level::Avx2 {
+            return apply_ptrs_avx2(dst, src, adds, subs);
+        }
+    }
+    let _ = level;
+    apply_ptrs_scalar(dst, src, adds, subs)
 }
 
 /// Row addresses for an incremental step: threat rows then piece-square rows.
@@ -1484,8 +1309,8 @@ fn row_ptrs<'a>(
 /// One-pass refresh (Stockfish's update_accumulator_refresh_cache): per tile,
 /// `cache += psq rows`, stored back to the cache, then `+ threat rows`, stored to
 /// `out`. Rows are given as addresses.
-#[cfg(simd_neon)]
-fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+#[cfg(target_arch = "aarch64")]
+fn refresh_rows_neon(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
     use std::arch::aarch64::*;
     const TILE: usize = 128;
     // SAFETY: every row holds L1 weights and the accumulators L1 lanes.
@@ -1535,8 +1360,9 @@ fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*c
     }
 }
 
-#[cfg(simd_avx2)]
-fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn refresh_rows_avx2(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
     use std::arch::x86_64::*;
     const REGS: usize = 8;
     const TILE: usize = REGS * 16;
@@ -1594,8 +1420,9 @@ fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*c
     }
 }
 
-#[cfg(simd_avx512)]
-fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw")]
+unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
     use std::arch::x86_64::*;
     const REGS: usize = 16;
     const TILE: usize = REGS * 32;
@@ -1642,23 +1469,58 @@ fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*c
     }
 }
 
-#[cfg(simd_none)]
-fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
-    // Portable fallback: plain loops over the addresses.
-    for j in 0..L1 {
-        let mut v = cache.0[j];
+/// Portable version: tiles of plain lanes, which the compiler vectorises.
+fn refresh_rows_scalar(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+    const TILE: usize = 256;
+    let mut off = 0;
+    while off < L1 {
+        let mut regs = [0i16; TILE];
+        regs.copy_from_slice(&cache.0[off..off + TILE]);
         for &p in padds {
-            v = v.wrapping_add(unsafe { *p.add(j) } as i16);
+            // SAFETY: every address points at a row of L1 weights.
+            let w = unsafe { std::slice::from_raw_parts(p.add(off), TILE) };
+            for k in 0..TILE {
+                regs[k] = regs[k].wrapping_add(w[k] as i16);
+            }
         }
         for &p in psubs {
-            v = v.wrapping_sub(unsafe { *p.add(j) } as i16);
+            let w = unsafe { std::slice::from_raw_parts(p.add(off), TILE) };
+            for k in 0..TILE {
+                regs[k] = regs[k].wrapping_sub(w[k] as i16);
+            }
         }
-        cache.0[j] = v;
+        cache.0[off..off + TILE].copy_from_slice(&regs);
         for &p in tadds {
-            v = v.wrapping_add(unsafe { *p.add(j) } as i16);
+            let w = unsafe { std::slice::from_raw_parts(p.add(off), TILE) };
+            for k in 0..TILE {
+                regs[k] = regs[k].wrapping_add(w[k] as i16);
+            }
         }
-        out.0[j] = v;
+        out.0[off..off + TILE].copy_from_slice(&regs);
+        off += TILE;
     }
+}
+
+/// One-pass refresh on the best code path this CPU supports.
+#[inline(always)]
+fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*const i8], tadds: &[*const i8]) {
+    let level = simd::level();
+    #[cfg(target_arch = "aarch64")]
+    if level >= Level::Neon {
+        return refresh_rows_neon(cache, out, padds, psubs, tadds);
+    }
+    // SAFETY: `level` only names instruction sets the CPU was found to have.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if level >= Level::Avx512 {
+            return refresh_rows_avx512(cache, out, padds, psubs, tadds);
+        }
+        if level >= Level::Avx2 {
+            return refresh_rows_avx2(cache, out, padds, psubs, tadds);
+        }
+    }
+    let _ = level;
+    refresh_rows_scalar(cache, out, padds, psubs, tadds)
 }
 
 /// Search the added and removed threat lists for pairs that cancel out.
@@ -2078,53 +1940,37 @@ impl NnueState {
         let e = &self.entries[ply];
         let net = &*self.net;
 
-        // Feature transformer output: pairwise product of clipped halves, collecting
-        // non-zero 4-byte group indices on the fly while SIMD registers are live.
-        #[repr(C, align(64))]
-        struct Ft([u8; L1]);
-        let mut ft = std::mem::MaybeUninit::<Ft>::uninit();
-        let ft_ref = unsafe { &mut *ft.as_mut_ptr() };
-        let mut nnz_uninit = std::mem::MaybeUninit::<[u16; L1 / 4 + 8]>::uninit();
-        let nnz = unsafe { &mut *nnz_uninit.as_mut_ptr() };
-        let mut n_nnz = 0usize;
-        let mut bits = [0u8; L1 / 32];
-        for p in 0..2 {
-            let c = pos.stm ^ p;
-            transform(
-                &e.acc[c],
-                (&mut ft_ref.0[p * (L1 / 2)..(p + 1) * (L1 / 2)]).try_into().unwrap(),
-                (p * (L1 / 8)) as u16,
-                nnz,
-                &mut n_nnz,
-                &mut bits,
-            );
-        }
-
         let s = &net.stacks[net.stack_index[layer_stack(pos)] as usize];
-        let h0 = layer0(s, &ft_ref.0, &nnz[..n_nnz], &bits);
-
-        // Squared and linear clipped activations. Clamping first keeps the square
-        // inside i32 without changing the (saturated) result.
-        #[repr(C, align(64))]
-        struct Act([u8; 2 * L2 + 2 * L3]);
-        let mut act = Act([0; 2 * L2 + 2 * L3]);
-        activate::<21, 7>(&h0, &mut act.0[..2 * L2]);
-
-        // Layer 1
-        let h1 = layer1(s, (&act.0[..2 * L2]).try_into().unwrap());
-        activate::<19, 6>(&h1, &mut act.0[2 * L2..]);
-
-        // Output layer (sees both hidden layers) plus a skip connection.
-        let out = s.b2 + dot_u8_i8(&act.0, &s.w2) + h0[L2 - 2] - h0[L2 - 1];
+        let out = forward(&e.acc[pos.stm], &e.acc[pos.stm ^ 1], s);
         let scaled = (out as i64 * (600 * 16) / (128 * 64 * 2)) as i32;
         scaled / 16
     }
 }
 
+// ---------------------------------------------------------------------------
+// Forward pass
+// ---------------------------------------------------------------------------
+//
+// Each step exists once per instruction set; `forward` runs the chain built from
+// the best set the CPU has (see `simd::level`). Functions that use instructions
+// beyond the build's baseline carry `#[target_feature]`, so the binary itself
+// stays runnable on older CPUs.
+
+/// Non-zero 4-byte groups of the transformer output, as a list of group indices.
+type Nnz = [u16; L1 / 4 + 8];
+/// The same as a bitset, one bit per group.
+type Bits = [u8; L1 / 32];
+
+#[repr(C, align(64))]
+struct Ft([u8; L1]);
+
+#[repr(C, align(64))]
+struct Act([u8; 2 * L2 + 2 * L3]);
+
 /// Append up to 8 non-zero group indices described by `mask` starting at `base`.
 #[inline(always)]
-#[cfg_attr(simd_neon_dot, allow(dead_code))]
-fn push_nnz8(mask: usize, base: u16, nnz: &mut [u16; L1 / 4 + 8], n: &mut usize) {
+#[allow(dead_code)]
+fn push_nnz8(mask: usize, base: u16, nnz: &mut Nnz, n: &mut usize) {
     let lut = &NNZ_LUT[mask];
     let dst = unsafe { nnz.as_mut_ptr().add(*n) };
     for k in 0..8 {
@@ -2133,128 +1979,8 @@ fn push_nnz8(mask: usize, base: u16, nnz: &mut [u16; L1 / 4 + 8], n: &mut usize)
     *n += mask.count_ones() as usize;
 }
 
-/// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is
-/// the accumulator, while recording non-zero 4-byte groups.
-#[inline(always)]
-fn transform(
-    acc: &Acc,
-    out: &mut [u8; L1 / 2],
-    base_group: u16,
-    nnz: &mut [u16; L1 / 4 + 8],
-    n_nnz: &mut usize,
-    bits: &mut [u8; L1 / 32],
-) {
-    const H: usize = L1 / 2;
-    let _ = &bits;
-    #[cfg(simd_neon)]
-    unsafe {
-        use std::arch::aarch64::*;
-        const BITS: [u32; 4] = [1, 2, 4, 8];
-        let bit4 = vld1q_u32(BITS.as_ptr());
-        let a = acc.0.as_ptr();
-        // 16 outputs: two widening multiplies, then the high bytes of all 16
-        // products in one de-interleave and a byte shift: (x * y) >> 9, as
-        // Stockfish's NEON transform does it.
-        let step16 = |j: usize| {
-            let x0 = vqmovun_s16(vld1q_s16(a.add(j)));
-            let x1 = vqmovun_s16(vld1q_s16(a.add(j + 8)));
-            let y0 = vqmovun_s16(vld1q_s16(a.add(j + H)));
-            let y1 = vqmovun_s16(vld1q_s16(a.add(j + H + 8)));
-            let m0 = vreinterpretq_u8_u16(vmull_u8(x0, y0));
-            let m1 = vreinterpretq_u8_u16(vmull_u8(x1, y1));
-            vshrq_n_u8::<1>(vuzp2q_u8(m0, m1))
-        };
-        for j in (0..H).step_by(32) {
-            let q0 = step16(j);
-            let q1 = step16(j + 16);
-            vst1q_u8(out.as_mut_ptr().add(j), q0);
-            vst1q_u8(out.as_mut_ptr().add(j + 16), q1);
-            let u0 = vreinterpretq_u32_u8(q0);
-            let u1 = vreinterpretq_u32_u8(q1);
-            #[cfg(simd_neon_dot)]
-            {
-                // Stockfish's recording: one byte per 8 groups, bit g for group g,
-                // from a single horizontal add.
-                const MASK8: [u16; 8] = [1, 16, 2, 32, 4, 64, 8, 128];
-                let t0 = vreinterpretq_u16_u32(vtstq_u32(u0, u0));
-                let t1 = vreinterpretq_u16_u32(vtstq_u32(u1, u1));
-                let packed = vtrn1q_u16(t0, t1);
-                let byte = vaddvq_u16(vandq_u16(packed, vld1q_u16(MASK8.as_ptr())));
-                *bits.get_unchecked_mut(base_group as usize / 8 + j / 32) = byte as u8;
-                let _ = (&nnz, &n_nnz, &bit4);
-            }
-            #[cfg(not(simd_neon_dot))]
-            {
-                let lo = vaddvq_u32(vandq_u32(vtstq_u32(u0, u0), bit4));
-                let hi = vaddvq_u32(vandq_u32(vtstq_u32(u1, u1), bit4));
-                push_nnz8((lo | (hi << 4)) as usize, base_group + (j / 4) as u16, nnz, n_nnz);
-            }
-        }
-    }
-    #[cfg(simd_avx2)]
-    unsafe {
-        use std::arch::x86_64::*;
-        let a = acc.0.as_ptr();
-        let zero = _mm256_setzero_si256();
-        let max = _mm256_set1_epi16(255);
-        let ld = |p: *const i16| _mm256_loadu_si256(p as *const __m256i);
-        let step16 = |j: usize| {
-            let x = ld(a.add(j));
-            let y = ld(a.add(j + H));
-            let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), max);
-            let y = _mm256_min_epi16(_mm256_max_epi16(y, zero), max);
-            let p = _mm256_srli_epi16::<9>(_mm256_mullo_epi16(x, y));
-            _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(p, p)))
-        };
-        for j in (0..H).step_by(32) {
-            let v = _mm256_set_m128i(step16(j + 16), step16(j));
-            _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
-            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero))) as usize;
-            push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
-        }
-    }
-    #[cfg(simd_avx512)]
-    unsafe {
-        use std::arch::x86_64::*;
-        let a = acc.0.as_ptr();
-        let zero = _mm512_setzero_si512();
-        let zero256 = _mm256_setzero_si256();
-        let max = _mm512_set1_epi16(255);
-        let ld = |p: *const i16| _mm512_loadu_si512(p as *const _);
-        for j in (0..H).step_by(32) {
-            let x = ld(a.add(j));
-            let y = ld(a.add(j + H));
-            let x = _mm512_min_epi16(_mm512_max_epi16(x, zero), max);
-            let y = _mm512_min_epi16(_mm512_max_epi16(y, zero), max);
-            let p = _mm512_srli_epi16::<9>(_mm512_mullo_epi16(x, y));
-            let v = _mm512_cvtepi16_epi8(p);
-            _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
-            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero256))) as usize;
-            push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
-        }
-    }
-    #[cfg(simd_none)]
-    {
-        let a = &acc.0;
-        for j in (0..H).step_by(4) {
-            let mut any = 0u8;
-            for k in 0..4 {
-                let x = a[j + k].clamp(0, 255) as u32;
-                let y = a[j + k + H].clamp(0, 255) as u32;
-                let v = ((x * y) >> 9) as u8;
-                out[j + k] = v;
-                any |= v;
-            }
-            if any != 0 {
-                nnz[*n_nnz] = base_group + (j / 4) as u16;
-                *n_nnz += 1;
-            }
-        }
-    }
-}
-
 /// For every 8-bit mask, the positions of its set bits (padded with zeros).
-#[cfg_attr(simd_neon_dot, allow(dead_code))]
+#[allow(dead_code)]
 static NNZ_LUT: [[u16; 8]; 256] = {
     let mut t = [[0u16; 8]; 256];
     let mut m = 0;
@@ -2272,78 +1998,261 @@ static NNZ_LUT: [[u16; 8]; 256] = {
     t
 };
 
-/// Dot product of unsigned activations (at most 127) with signed weights; the
-/// length is a multiple of 64.
+// --- Feature transformer output -------------------------------------------
+//
+// out[j] = clamp(a[j], 0, 255) * clamp(a[j + 512], 0, 255) / 512, where `a` is
+// the accumulator, while recording the non-zero 4-byte groups: as a bitset
+// (`bits`) for the NEON dot-product path, as a list (`nnz`) for the others.
+
+/// NEON; `DOT` selects the bitset recording the dot-product layer reads.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn dot_u8_i8(a: &[u8], w: &[i8]) -> i32 {
-    debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
-    #[cfg(simd_neon_dot)]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut acc0 = vdupq_n_s32(0);
-        let mut acc1 = vdupq_n_s32(0);
-        for i in (0..a.len()).step_by(32) {
-            acc0 = vdotq_s32(acc0, vld1q_s8(w.as_ptr().add(i)), vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i))));
-            acc1 = vdotq_s32(
-                acc1,
-                vld1q_s8(w.as_ptr().add(i + 16)),
-                vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i + 16))),
-            );
+unsafe fn transform_neon_impl<const DOT: bool>(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    bits: &mut Bits,
+) {
+    use std::arch::aarch64::*;
+    const H: usize = L1 / 2;
+    const BITS: [u32; 4] = [1, 2, 4, 8];
+    let bit4 = vld1q_u32(BITS.as_ptr());
+    let a = acc.0.as_ptr();
+    // 16 outputs: two widening multiplies, then the high bytes of all 16
+    // products in one de-interleave and a byte shift: (x * y) >> 9, as
+    // Stockfish's NEON transform does it.
+    let step16 = |j: usize| {
+        let x0 = vqmovun_s16(vld1q_s16(a.add(j)));
+        let x1 = vqmovun_s16(vld1q_s16(a.add(j + 8)));
+        let y0 = vqmovun_s16(vld1q_s16(a.add(j + H)));
+        let y1 = vqmovun_s16(vld1q_s16(a.add(j + H + 8)));
+        let m0 = vreinterpretq_u8_u16(vmull_u8(x0, y0));
+        let m1 = vreinterpretq_u8_u16(vmull_u8(x1, y1));
+        vshrq_n_u8::<1>(vuzp2q_u8(m0, m1))
+    };
+    for j in (0..H).step_by(32) {
+        let q0 = step16(j);
+        let q1 = step16(j + 16);
+        vst1q_u8(out.as_mut_ptr().add(j), q0);
+        vst1q_u8(out.as_mut_ptr().add(j + 16), q1);
+        let u0 = vreinterpretq_u32_u8(q0);
+        let u1 = vreinterpretq_u32_u8(q1);
+        if DOT {
+            // Stockfish's recording: one byte per 8 groups, bit g for group g,
+            // from a single horizontal add.
+            const MASK8: [u16; 8] = [1, 16, 2, 32, 4, 64, 8, 128];
+            let t0 = vreinterpretq_u16_u32(vtstq_u32(u0, u0));
+            let t1 = vreinterpretq_u16_u32(vtstq_u32(u1, u1));
+            let packed = vtrn1q_u16(t0, t1);
+            let byte = vaddvq_u16(vandq_u16(packed, vld1q_u16(MASK8.as_ptr())));
+            *bits.get_unchecked_mut(base_group as usize / 8 + j / 32) = byte as u8;
+        } else {
+            let lo = vaddvq_u32(vandq_u32(vtstq_u32(u0, u0), bit4));
+            let hi = vaddvq_u32(vandq_u32(vtstq_u32(u1, u1), bit4));
+            push_nnz8((lo | (hi << 4)) as usize, base_group + (j / 4) as u16, nnz, n_nnz);
         }
-        vaddvq_s32(vaddq_s32(acc0, acc1))
-    }
-    #[cfg(simd_x86)]
-    unsafe {
-        use std::arch::x86_64::*;
-        let ones = _mm256_set1_epi16(1);
-        let mut acc = _mm256_setzero_si256();
-        for i in (0..a.len()).step_by(32) {
-            let x = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-            let y = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
-            // 2 * 127 * 128 fits i16, so the pairwise sum never saturates.
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(x, y), ones));
-        }
-        let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256::<1>(acc));
-        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b0100_1110>(s));
-        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s));
-        _mm_cvtsi128_si32(s)
-    }
-    #[cfg(not(any(simd_neon_dot, simd_x86)))]
-    {
-        let mut sum = 0i32;
-        for i in 0..a.len() {
-            sum += a[i] as i32 * w[i] as i32;
-        }
-        sum
     }
 }
 
-/// First (sparse-input) affine layer: only groups of four inputs that are not all
-/// zero are visited.
-/// Squared and linear clipped ReLU of 32 values: `out[i] = min(clamp(h,±16384)^2 >> SQ, 127)`
-/// and `out[32 + i] = clamp(h >> LIN, 0, 127)`.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn activate<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
-    debug_assert!(out.len() >= 2 * L2);
-    #[cfg(simd_neon)]
-    unsafe {
-        use std::arch::aarch64::*;
-        let (lo, hi, top) = (vdupq_n_s32(-16384), vdupq_n_s32(16384), vdupq_n_s32(127));
-        let zero = vdupq_n_s32(0);
-        for k in (0..L2).step_by(8) {
-            let (a, b) = (vld1q_s32(h.as_ptr().add(k)), vld1q_s32(h.as_ptr().add(k + 4)));
-            let (ca, cb) = (vmaxq_s32(vminq_s32(a, hi), lo), vmaxq_s32(vminq_s32(b, hi), lo));
-            let sa = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(ca, ca)), top);
-            let sb = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(cb, cb)), top);
-            let la = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(a), top), zero);
-            let lb = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(b), top), zero);
-            let sq8 = vqmovn_u16(vcombine_u16(vqmovun_s32(sa), vqmovun_s32(sb)));
-            let li8 = vqmovn_u16(vcombine_u16(vqmovun_s32(la), vqmovun_s32(lb)));
-            vst1_u8(out.as_mut_ptr().add(k), sq8);
-            vst1_u8(out.as_mut_ptr().add(L2 + k), li8);
+unsafe fn transform_neon_bits(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    bits: &mut Bits,
+) {
+    transform_neon_impl::<true>(acc, out, base_group, nnz, n_nnz, bits)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transform_neon_list(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    bits: &mut Bits,
+) {
+    transform_neon_impl::<false>(acc, out, base_group, nnz, n_nnz, bits)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn transform_avx2(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    _bits: &mut Bits,
+) {
+    use std::arch::x86_64::*;
+    const H: usize = L1 / 2;
+    let a = acc.0.as_ptr();
+    let zero = _mm256_setzero_si256();
+    let max = _mm256_set1_epi16(255);
+    let ld = |p: *const i16| _mm256_loadu_si256(p as *const __m256i);
+    let step16 = |j: usize| {
+        let x = ld(a.add(j));
+        let y = ld(a.add(j + H));
+        let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), max);
+        let y = _mm256_min_epi16(_mm256_max_epi16(y, zero), max);
+        let p = _mm256_srli_epi16::<9>(_mm256_mullo_epi16(x, y));
+        _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(p, p)))
+    };
+    for j in (0..H).step_by(32) {
+        let v = _mm256_set_m128i(step16(j + 16), step16(j));
+        _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero))) as usize;
+        push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw")]
+#[inline]
+unsafe fn transform_avx512(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    _bits: &mut Bits,
+) {
+    use std::arch::x86_64::*;
+    const H: usize = L1 / 2;
+    let a = acc.0.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let zero256 = _mm256_setzero_si256();
+    let max = _mm512_set1_epi16(255);
+    let ld = |p: *const i16| _mm512_loadu_si512(p as *const _);
+    for j in (0..H).step_by(32) {
+        let x = ld(a.add(j));
+        let y = ld(a.add(j + H));
+        let x = _mm512_min_epi16(_mm512_max_epi16(x, zero), max);
+        let y = _mm512_min_epi16(_mm512_max_epi16(y, zero), max);
+        let p = _mm512_srli_epi16::<9>(_mm512_mullo_epi16(x, y));
+        let v = _mm512_cvtepi16_epi8(p);
+        _mm256_storeu_si256(out.as_mut_ptr().add(j) as *mut __m256i, v);
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero256))) as usize;
+        push_nnz8(mask, base_group + (j / 4) as u16, nnz, n_nnz);
+    }
+}
+
+#[inline(always)]
+unsafe fn transform_scalar(
+    acc: &Acc,
+    out: &mut [u8; L1 / 2],
+    base_group: u16,
+    nnz: &mut Nnz,
+    n_nnz: &mut usize,
+    _bits: &mut Bits,
+) {
+    const H: usize = L1 / 2;
+    let a = &acc.0;
+    for j in (0..H).step_by(4) {
+        let mut any = 0u8;
+        for k in 0..4 {
+            let x = a[j + k].clamp(0, 255) as u32;
+            let y = a[j + k + H].clamp(0, 255) as u32;
+            let v = ((x * y) >> 9) as u8;
+            out[j + k] = v;
+            any |= v;
+        }
+        if any != 0 {
+            nnz[*n_nnz] = base_group + (j / 4) as u16;
+            *n_nnz += 1;
         }
     }
-    #[cfg(not(simd_neon))]
+}
+
+// --- Dot product ------------------------------------------------------------
+//
+// Unsigned activations (at most 127) times signed weights; the length is a
+// multiple of 64.
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn dot_neon_dot(a: &[u8], w: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    for i in (0..a.len()).step_by(32) {
+        acc0 = vdotq_s32(acc0, vld1q_s8(w.as_ptr().add(i)), vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i))));
+        acc1 =
+            vdotq_s32(acc1, vld1q_s8(w.as_ptr().add(i + 16)), vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i + 16))));
+    }
+    vaddvq_s32(vaddq_s32(acc0, acc1))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_avx2(a: &[u8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_si256();
+    for i in (0..a.len()).step_by(32) {
+        let x = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let y = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
+        // 2 * 127 * 128 fits i16, so the pairwise sum never saturates.
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(x, y), ones));
+    }
+    let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256::<1>(acc));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b0100_1110>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s));
+    _mm_cvtsi128_si32(s)
+}
+
+#[inline(always)]
+unsafe fn dot_scalar(a: &[u8], w: &[i8]) -> i32 {
+    debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
+    let mut sum = 0i32;
+    for i in 0..a.len() {
+        sum += a[i] as i32 * w[i] as i32;
+    }
+    sum
+}
+
+// --- Activation -------------------------------------------------------------
+//
+// Squared and linear clipped ReLU of 32 values:
+// `out[i] = min(clamp(h,±16384)^2 >> SQ, 127)` and `out[32 + i] = clamp(h >> LIN, 0, 127)`.
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn activate_neon<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
+    use std::arch::aarch64::*;
+    debug_assert!(out.len() >= 2 * L2);
+    let (lo, hi, top) = (vdupq_n_s32(-16384), vdupq_n_s32(16384), vdupq_n_s32(127));
+    let zero = vdupq_n_s32(0);
+    for k in (0..L2).step_by(8) {
+        let (a, b) = (vld1q_s32(h.as_ptr().add(k)), vld1q_s32(h.as_ptr().add(k + 4)));
+        let (ca, cb) = (vmaxq_s32(vminq_s32(a, hi), lo), vmaxq_s32(vminq_s32(b, hi), lo));
+        let sa = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(ca, ca)), top);
+        let sb = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(cb, cb)), top);
+        let la = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(a), top), zero);
+        let lb = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(b), top), zero);
+        let sq8 = vqmovn_u16(vcombine_u16(vqmovun_s32(sa), vqmovun_s32(sb)));
+        let li8 = vqmovn_u16(vcombine_u16(vqmovun_s32(la), vqmovun_s32(lb)));
+        vst1_u8(out.as_mut_ptr().add(k), sq8);
+        vst1_u8(out.as_mut_ptr().add(L2 + k), li8);
+    }
+}
+
+#[inline(always)]
+unsafe fn activate_scalar<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
+    debug_assert!(out.len() >= 2 * L2);
     for i in 0..L2 {
         let c = h[i].clamp(-16384, 16384);
         out[i] = ((c * c) >> SQ).min(127) as u8;
@@ -2351,164 +2260,277 @@ fn activate<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
     }
 }
 
-/// Second layer: 64 activations to 32 outputs.
-#[inline(always)]
-fn layer1(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
-    #[cfg(simd_neon_dot)]
-    unsafe {
-        use std::arch::aarch64::*;
-        // Input-group-major weights: each group of 4 activations feeds all 32
-        // outputs through 8 dot products, unrolled 2x into 16 accumulators.
-        let mut acc0 = [vdupq_n_s32(0); L3 / 4];
-        let mut acc1 = [vdupq_n_s32(0); L3 / 4];
-        for (k, a) in acc0.iter_mut().enumerate() {
-            *a = vld1q_s32(s.b1.as_ptr().add(k * 4));
-        }
-        let act_ptr = act.as_ptr() as *const u32;
-        for c in (0..2 * L2 / 4).step_by(2) {
-            let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c)));
-            let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c + 1)));
-            let w0 = s.w1c.get_unchecked(c).as_ptr();
-            let w1 = s.w1c.get_unchecked(c + 1).as_ptr();
-            for k in 0..L3 / 4 {
-                acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
-                acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
-            }
-        }
-        let mut h = [0i32; L3];
+// --- Second layer: 64 activations to 32 outputs -----------------------------
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn layer1_neon_dot(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
+    use std::arch::aarch64::*;
+    // Input-group-major weights: each group of 4 activations feeds all 32
+    // outputs through 8 dot products, unrolled 2x into 16 accumulators.
+    let mut acc0 = [vdupq_n_s32(0); L3 / 4];
+    let mut acc1 = [vdupq_n_s32(0); L3 / 4];
+    for (k, a) in acc0.iter_mut().enumerate() {
+        *a = vld1q_s32(s.b1.as_ptr().add(k * 4));
+    }
+    let act_ptr = act.as_ptr() as *const u32;
+    for c in (0..2 * L2 / 4).step_by(2) {
+        let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c)));
+        let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c + 1)));
+        let w0 = s.w1c.get_unchecked(c).as_ptr();
+        let w1 = s.w1c.get_unchecked(c + 1).as_ptr();
         for k in 0..L3 / 4 {
-            vst1q_s32(h.as_mut_ptr().add(k * 4), vaddq_s32(acc0[k], acc1[k]));
+            acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
+            acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
         }
-        h
     }
-    #[cfg(not(simd_neon_dot))]
-    {
-        let mut h = s.b1;
-        for o in 0..L3 {
-            h[o] += dot_u8_i8(act, &s.w1[o]);
-        }
-        h
+    let mut h = [0i32; L3];
+    for k in 0..L3 / 4 {
+        vst1q_s32(h.as_mut_ptr().add(k * 4), vaddq_s32(acc0[k], acc1[k]));
     }
+    h
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
-fn layer0(s: &LayerStack, ft: &[u8; L1], nnz: &[u16], bits: &[u8; L1 / 32]) -> [i32; L2] {
-    let _ = (&nnz, &bits);
-    let group = |c: usize| unsafe { std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const u32) };
+unsafe fn layer1_avx2(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
+    let mut h = s.b1;
+    for o in 0..L3 {
+        h[o] += dot_avx2(act, &s.w1[o]);
+    }
+    h
+}
 
-    #[cfg(simd_neon_dot)]
-    unsafe {
-        use std::arch::aarch64::*;
-        let _ = &group;
-        let mut acc0 = [vdupq_n_s32(0); L2 / 4];
-        let mut acc1 = [vdupq_n_s32(0); L2 / 4];
-        for (k, a) in acc0.iter_mut().enumerate() {
-            *a = vld1q_s32(s.b0.as_ptr().add(k * 4));
-        }
-        let ft_ptr = ft.as_ptr() as *const u32;
-        // Walk non-zero groups from the bitset, unrolled 2x into 16 accumulators
-        // to hide the 3-cycle sdot latency and saturate NEON pipes.
-        for word in 0..L1 / 4 / 64 {
-            let mut b = u64::from_le_bytes(*(bits.as_ptr().add(word * 8) as *const [u8; 8]));
-            let base = word * 64;
-            while b != 0 {
-                let c0 = base + b.trailing_zeros() as usize;
+#[inline(always)]
+unsafe fn layer1_scalar(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
+    let mut h = s.b1;
+    for o in 0..L3 {
+        h[o] += dot_scalar(act, &s.w1[o]);
+    }
+    h
+}
+
+// --- First (sparse-input) layer ---------------------------------------------
+//
+// Only groups of four inputs that are not all zero are visited.
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn layer0_neon_dot(s: &LayerStack, ft: &[u8; L1], _nnz: &[u16], bits: &Bits) -> [i32; L2] {
+    use std::arch::aarch64::*;
+    let mut acc0 = [vdupq_n_s32(0); L2 / 4];
+    let mut acc1 = [vdupq_n_s32(0); L2 / 4];
+    for (k, a) in acc0.iter_mut().enumerate() {
+        *a = vld1q_s32(s.b0.as_ptr().add(k * 4));
+    }
+    let ft_ptr = ft.as_ptr() as *const u32;
+    // Walk non-zero groups from the bitset, unrolled 2x into 16 accumulators
+    // to hide the 3-cycle sdot latency and saturate NEON pipes.
+    for word in 0..L1 / 4 / 64 {
+        let mut b = u64::from_le_bytes(*(bits.as_ptr().add(word * 8) as *const [u8; 8]));
+        let base = word * 64;
+        while b != 0 {
+            let c0 = base + b.trailing_zeros() as usize;
+            b &= b - 1;
+            if b != 0 {
+                let c1 = base + b.trailing_zeros() as usize;
                 b &= b - 1;
-                if b != 0 {
-                    let c1 = base + b.trailing_zeros() as usize;
-                    b &= b - 1;
-                    let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c0)));
-                    let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c1)));
-                    let w0 = s.w0.get_unchecked(c0).as_ptr();
-                    let w1 = s.w0.get_unchecked(c1).as_ptr();
-                    for k in 0..L2 / 4 {
-                        acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
-                        acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
-                    }
-                } else {
-                    let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c0)));
-                    let w0 = s.w0.get_unchecked(c0).as_ptr();
-                    for k in 0..L2 / 4 {
-                        acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
-                    }
+                let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c0)));
+                let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c1)));
+                let w0 = s.w0.get_unchecked(c0).as_ptr();
+                let w1 = s.w0.get_unchecked(c1).as_ptr();
+                for k in 0..L2 / 4 {
+                    acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
+                    acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
+                }
+            } else {
+                let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(ft_ptr.add(c0)));
+                let w0 = s.w0.get_unchecked(c0).as_ptr();
+                for k in 0..L2 / 4 {
+                    acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
                 }
             }
         }
-        let mut h0 = [0i32; L2];
-        for k in 0..L2 / 4 {
-            vst1q_s32(h0.as_mut_ptr().add(k * 4), vaddq_s32(acc0[k], acc1[k]));
-        }
-        h0
     }
-    #[cfg(simd_avx2)]
-    unsafe {
-        use std::arch::x86_64::*;
-        let ones = _mm256_set1_epi16(1);
-        let mut acc = [_mm256_setzero_si256(); L2 / 8];
+    let mut h0 = [0i32; L2];
+    for k in 0..L2 / 4 {
+        vst1q_s32(h0.as_mut_ptr().add(k * 4), vaddq_s32(acc0[k], acc1[k]));
+    }
+    h0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn layer0_avx2(s: &LayerStack, ft: &[u8; L1], nnz: &[u16], _bits: &Bits) -> [i32; L2] {
+    use std::arch::x86_64::*;
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_si256(); L2 / 8];
+    for (k, a) in acc.iter_mut().enumerate() {
+        *a = _mm256_loadu_si256(s.b0.as_ptr().add(k * 8) as *const __m256i);
+    }
+    for &c in nnz {
+        let c = c as usize;
+        let input = _mm256_set1_epi32(std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const i32));
+        let w = s.w0.get_unchecked(c).as_ptr();
         for (k, a) in acc.iter_mut().enumerate() {
-            *a = _mm256_loadu_si256(s.b0.as_ptr().add(k * 8) as *const __m256i);
+            let wv = _mm256_loadu_si256(w.add(k * 32) as *const __m256i);
+            *a = _mm256_add_epi32(*a, _mm256_madd_epi16(_mm256_maddubs_epi16(input, wv), ones));
         }
-        for &c in nnz {
-            let c = c as usize;
-            let input = _mm256_set1_epi32(group(c) as i32);
-            let w = s.w0.get_unchecked(c).as_ptr();
-            for (k, a) in acc.iter_mut().enumerate() {
-                let wv = _mm256_loadu_si256(w.add(k * 32) as *const __m256i);
-                *a = _mm256_add_epi32(*a, _mm256_madd_epi16(_mm256_maddubs_epi16(input, wv), ones));
-            }
-        }
-        let mut h0 = [0i32; L2];
-        for (k, a) in acc.iter().enumerate() {
-            _mm256_storeu_si256(h0.as_mut_ptr().add(k * 8) as *mut __m256i, *a);
-        }
-        h0
     }
-    #[cfg(simd_avx512)]
+    let mut h0 = [0i32; L2];
+    for (k, a) in acc.iter().enumerate() {
+        _mm256_storeu_si256(h0.as_mut_ptr().add(k * 8) as *mut __m256i, *a);
+    }
+    h0
+}
+
+/// AVX-512, with (`$vnni`) or without the VNNI dot-product instruction.
+#[cfg(target_arch = "x86_64")]
+macro_rules! layer0_avx512_fn {
+    ($name:ident, $features:literal, $vnni:literal) => {
+        #[target_feature(enable = $features)]
+        #[inline]
+        unsafe fn $name(s: &LayerStack, ft: &[u8; L1], nnz: &[u16], _bits: &Bits) -> [i32; L2] {
+            use std::arch::x86_64::*;
+            let mut acc = [_mm512_setzero_si512(); L2 / 16];
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a = _mm512_loadu_si512(s.b0.as_ptr().add(k * 16) as *const _);
+            }
+            let ones = _mm512_set1_epi16(1);
+            for &c in nnz {
+                let c = c as usize;
+                let input = _mm512_set1_epi32(std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const i32));
+                let w = s.w0.get_unchecked(c).as_ptr();
+                for (k, a) in acc.iter_mut().enumerate() {
+                    let wv = _mm512_loadu_si512(w.add(k * 64) as *const _);
+                    if $vnni {
+                        *a = _mm512_dpbusd_epi32(*a, input, wv);
+                    } else {
+                        *a = _mm512_add_epi32(*a, _mm512_madd_epi16(_mm512_maddubs_epi16(input, wv), ones));
+                    }
+                }
+            }
+            let mut h0 = [0i32; L2];
+            for (k, a) in acc.iter().enumerate() {
+                _mm512_storeu_si512(h0.as_mut_ptr().add(k * 16) as *mut _, *a);
+            }
+            h0
+        }
+    };
+}
+#[cfg(target_arch = "x86_64")]
+layer0_avx512_fn!(layer0_avx512, "avx2,avx512f,avx512bw", false);
+#[cfg(target_arch = "x86_64")]
+layer0_avx512_fn!(layer0_avx512_vnni, "avx2,avx512f,avx512bw,avx512vnni", true);
+
+#[inline(always)]
+unsafe fn layer0_scalar(s: &LayerStack, ft: &[u8; L1], nnz: &[u16], _bits: &Bits) -> [i32; L2] {
+    let mut h0 = s.b0;
+    for &c in nnz {
+        let c = c as usize;
+        let x = std::ptr::read_unaligned(ft.as_ptr().add(c * 4) as *const u32).to_ne_bytes().map(|b| b as i32);
+        let w = &s.w0[c];
+        for o in 0..L2 {
+            h0[o] +=
+                x[0] * w[o * 4] as i32 + x[1] * w[o * 4 + 1] as i32 + x[2] * w[o * 4 + 2] as i32 + x[3] * w[o * 4 + 3] as i32;
+        }
+    }
+    h0
+}
+
+// --- The whole pass ---------------------------------------------------------
+
+/// Defines the network output for one instruction set from its steps: `us` and
+/// `them` are the accumulators of the side to move and its opponent.
+macro_rules! forward_fn {
+    ($(#[$attr:meta])* $name:ident: $transform:ident, $layer0:ident, $activate:ident, $layer1:ident, $dot:ident) => {
+        $(#[$attr])*
+        unsafe fn $name(us: &Acc, them: &Acc, s: &LayerStack) -> i32 {
+            // Feature transformer output: pairwise product of clipped halves,
+            // collecting the non-zero 4-byte groups on the way.
+            let mut ft = std::mem::MaybeUninit::<Ft>::uninit();
+            let ft_ref = &mut *ft.as_mut_ptr();
+            let mut nnz_uninit = std::mem::MaybeUninit::<Nnz>::uninit();
+            let nnz = &mut *nnz_uninit.as_mut_ptr();
+            let mut n_nnz = 0usize;
+            let mut bits = [0u8; L1 / 32];
+            for (p, acc) in [us, them].into_iter().enumerate() {
+                $transform(
+                    acc,
+                    (&mut ft_ref.0[p * (L1 / 2)..(p + 1) * (L1 / 2)]).try_into().unwrap(),
+                    (p * (L1 / 8)) as u16,
+                    nnz,
+                    &mut n_nnz,
+                    &mut bits,
+                );
+            }
+            let h0 = $layer0(s, &ft_ref.0, &nnz[..n_nnz], &bits);
+
+            // Squared and linear clipped activations. Clamping first keeps the
+            // square inside i32 without changing the (saturated) result.
+            let mut act = Act([0; 2 * L2 + 2 * L3]);
+            $activate::<21, 7>(&h0, &mut act.0[..2 * L2]);
+            let h1 = $layer1(s, (&act.0[..2 * L2]).try_into().unwrap());
+            $activate::<19, 6>(&h1, &mut act.0[2 * L2..]);
+
+            // Output layer (sees both hidden layers) plus a skip connection.
+            s.b2 + $dot(&act.0, &s.w2) + h0[L2 - 2] - h0[L2 - 1]
+        }
+    };
+}
+
+forward_fn!(
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "dotprod")]
+    forward_neon_dot: transform_neon_bits, layer0_neon_dot, activate_neon, layer1_neon_dot, dot_neon_dot
+);
+forward_fn!(
+    #[cfg(target_arch = "aarch64")]
+    forward_neon: transform_neon_list, layer0_scalar, activate_neon, layer1_scalar, dot_scalar
+);
+forward_fn!(
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
+    forward_avx512_vnni: transform_avx512, layer0_avx512_vnni, activate_scalar, layer1_avx2, dot_avx2
+);
+forward_fn!(
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avx512f,avx512bw")]
+    forward_avx512: transform_avx512, layer0_avx512, activate_scalar, layer1_avx2, dot_avx2
+);
+forward_fn!(
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    forward_avx2: transform_avx2, layer0_avx2, activate_scalar, layer1_avx2, dot_avx2
+);
+forward_fn!(forward_scalar: transform_scalar, layer0_scalar, activate_scalar, layer1_scalar, dot_scalar);
+
+/// Raw network output from the two accumulators, on the best code path this CPU
+/// supports.
+#[inline(always)]
+fn forward(us: &Acc, them: &Acc, s: &LayerStack) -> i32 {
+    let level = simd::level();
+    // SAFETY: `level` only names instruction sets the CPU was found to have.
     unsafe {
-        use std::arch::x86_64::*;
-        let mut acc = [_mm512_setzero_si512(); L2 / 16];
-        for (k, a) in acc.iter_mut().enumerate() {
-            *a = _mm512_loadu_si512(s.b0.as_ptr().add(k * 16) as *const _);
+        #[cfg(target_arch = "aarch64")]
+        match level {
+            Level::NeonDot => return forward_neon_dot(us, them, s),
+            Level::Neon => return forward_neon(us, them, s),
+            _ => {}
         }
-        #[cfg(not(simd_vnni))]
-        let ones = _mm512_set1_epi16(1);
-        for &c in nnz {
-            let c = c as usize;
-            let input = _mm512_set1_epi32(group(c) as i32);
-            let w = s.w0.get_unchecked(c).as_ptr();
-            for (k, a) in acc.iter_mut().enumerate() {
-                let wv = _mm512_loadu_si512(w.add(k * 64) as *const _);
-                #[cfg(simd_vnni)]
-                {
-                    *a = _mm512_dpbusd_epi32(*a, input, wv);
-                }
-                #[cfg(not(simd_vnni))]
-                {
-                    *a = _mm512_add_epi32(*a, _mm512_madd_epi16(_mm512_maddubs_epi16(input, wv), ones));
-                }
-            }
+        #[cfg(target_arch = "x86_64")]
+        match level {
+            Level::Avx512Vnni => return forward_avx512_vnni(us, them, s),
+            Level::Avx512 => return forward_avx512(us, them, s),
+            Level::Avx2 => return forward_avx2(us, them, s),
+            _ => {}
         }
-        let mut h0 = [0i32; L2];
-        for (k, a) in acc.iter().enumerate() {
-            _mm512_storeu_si512(h0.as_mut_ptr().add(k * 16) as *mut _, *a);
-        }
-        h0
-    }
-    #[cfg(not(any(simd_neon_dot, simd_x86)))]
-    {
-        let mut h0 = s.b0;
-        for &c in nnz {
-            let c = c as usize;
-            let x = group(c).to_ne_bytes().map(|b| b as i32);
-            let w = &s.w0[c];
-            for o in 0..L2 {
-                h0[o] += x[0] * w[o * 4] as i32
-                    + x[1] * w[o * 4 + 1] as i32
-                    + x[2] * w[o * 4 + 2] as i32
-                    + x[3] * w[o * 4 + 3] as i32;
-            }
-        }
-        h0
+        let _ = level;
+        forward_scalar(us, them, s)
     }
 }
 

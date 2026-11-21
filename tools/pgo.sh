@@ -40,14 +40,20 @@ if [ -z "$profdata" ]; then
     exit 1
 fi
 
-# RUSTFLAGS replaces .cargo/config.toml's rustflags, so keep the CPU target.
-base_flags="-C target-cpu=${PGO_TARGET_CPU:-native}"
-data=$(mktemp -d)
-trap 'rm -rf "$data"' EXIT
-
 # An explicit --target keeps RUSTFLAGS off build scripts, so only Esper itself
 # is instrumented and optimised.
 host=$(rustc -vV | sed -n 's/^host: //p')
+
+# RUSTFLAGS replaces .cargo/config.toml's rustflags, so repeat its CPU target:
+# the portable baseline, since the SIMD path is chosen at run time. Set
+# PGO_TARGET_CPU (e.g. native) to build for one CPU instead.
+case "$host" in
+    x86_64-*) cpu=${PGO_TARGET_CPU:-x86-64-v2} ;;
+    *) cpu=${PGO_TARGET_CPU:-} ;;
+esac
+base_flags=${cpu:+-C target-cpu=$cpu}
+data=$(mktemp -d)
+trap 'rm -rf "$data"' EXIT
 
 echo "== instrumented build"
 RUSTFLAGS="$base_flags -Cprofile-generate=$data" cargo build --release --target "$host" --target-dir target/pgo-gen "$@"
@@ -57,6 +63,14 @@ gen=target/pgo-gen/$host/release/esper
 "$gen" bench 14 > /dev/null
 "$gen" -t 4 bench 13 > /dev/null
 "$gen" perftbench > /dev/null
+# Also exercise the SIMD paths below this machine's best, so the paths other
+# CPUs will take are not left optimised as never-run code. A path this CPU
+# cannot run (or a build that fixes the path at compile time) is skipped.
+for level in avx512 avx2 neon; do
+    if ESPER_SIMD=$level "$gen" uci | grep -q "SIMD path: $level\$"; then
+        ESPER_SIMD=$level "$gen" bench 12 > /dev/null
+    fi
+done
 
 echo "== merging profile with $profdata"
 "$profdata" merge -o "$data/esper.profdata" "$data"

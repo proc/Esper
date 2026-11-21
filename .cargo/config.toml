@@ -1,2 +1,6 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# The SIMD code path (NEON, AVX2, AVX-512, ...) is chosen at run time, so the
+# build does not target the build machine's CPU and one binary runs everywhere.
+# x86-64 builds only assume x86-64-v2 (SSE4.2 and POPCNT, every CPU since about
+# 2009), which the board code needs for a fast population count.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]

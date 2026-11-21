@@ -10,12 +10,19 @@ mod nnue;
 mod polyglot_keys;
 mod position;
 mod search;
+mod simd;
 mod tb;
 mod tune;
 mod tt;
 mod uci;
 
 fn main() {
+    // A build made for a newer CPU than this one would otherwise die on an
+    // illegal instruction with no explanation.
+    if let Some(feature) = simd::missing_baseline() {
+        eprintln!("error: this build of Esper needs a CPU with {feature}, which this one lacks");
+        std::process::exit(1);
+    }
     bitboard::init();
     cuckoo::init();
     let net = match uci::load_default_network() {

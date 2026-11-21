@@ -26,34 +26,45 @@ UCI engine; standard chess only, Chess960 is not supported.
 
 | Command | Result |
 |---|---|
-| `cargo build --release` | Optimised build for this machine, network embedded |
+| `cargo build --release` | Optimised build, network embedded; picks its SIMD path at run time |
 | `cargo build --release --no-default-features` | Network and opening book left out; the network is loaded from `nn-bddd9d57eb87.nnue` in the working directory or next to the binary |
 | `cargo build --release --no-default-features --features embed` | Network embedded, opening book left out |
-| `cargo build --release --features portable` | Hand-written SIMD disabled (for checking the SIMD paths) |
+| `cargo build --release --features portable` | Hand-written SIMD left unused (for checking the SIMD paths) |
 | `cargo build --release --features tune` | Search parameters exposed as `T_*` UCI options for SPSA |
-| `tools/pgo.sh` | Profile-guided build (`target/release/esper-pgo`; with `--install` also copied to `target/release/esper`): instruments, runs the bench, rebuilds with the profile. Needs an `llvm-profdata` matching rustc's LLVM (rustup's `llvm-tools` or Homebrew's `llvm`) |
+| `tools/pgo.sh` (`tools\pgo.ps1` on Windows) | Profile-guided build (`target/release/esper-pgo`; with `--install` also copied to `target/release/esper`): instruments, runs the bench, rebuilds with the profile. Needs an `llvm-profdata` matching rustc's LLVM (rustup's `llvm-tools` or Homebrew's `llvm`) |
 
 Building needs Rust (2021 edition) and a C compiler, since `build.rs` compiles the
 vendored Fathom tablebase prober. The release profile uses fat LTO, one codegen
 unit and `panic = "abort"`.
 
-`.cargo/config.toml` sets `-C target-cpu=native`, so the binary is tuned for, and
-may only run on, the CPU it was built on. For a binary to copy elsewhere, remove
-that line or choose a level such as `x86-64-v3` (AVX2) or `x86-64-v4` (AVX-512).
+The build does not target the build machine's CPU: the binary detects what the
+CPU it runs on supports and uses the best SIMD path for it (see below), so one
+binary can be copied to other machines. On x86-64, `.cargo/config.toml` sets
+`-C target-cpu=x86-64-v2` (SSE4.2 and POPCNT, every CPU since about 2009), which
+the board code needs for a fast population count; a CPU older than that gets an
+error message at startup. Building with `RUSTFLAGS="-C target-cpu=native"` still
+works and is a little faster on x86-64 (the board code can then use BMI2), at
+the cost of a binary tied to that CPU.
 
 ### SIMD
 
-`build.rs` picks the SIMD path from the CPU features enabled at compile time:
+Every path for the architecture is compiled in; `src/simd.rs` picks one when the
+engine starts and reports it as `info string SIMD path: …` in reply to `uci`:
 
-| Target | Path |
+| CPU | Path |
 |---|---|
-| aarch64 (Apple silicon, Graviton…) | NEON, with the dot-product instructions where available |
-| x86-64 with AVX-512F and BW | AVX-512, with VNNI when enabled (compiles, but has not been run by the author) |
-| x86-64 with AVX2 | AVX2 |
-| anything else | Portable loops |
+| aarch64 with the dot-product instructions (Apple silicon, Graviton 2+…) | `neon-dot` |
+| other aarch64 | `neon` |
+| x86-64 with AVX-512F, BW and VNNI | `avx512-vnni` (compiles, but has not been run by the author) |
+| x86-64 with AVX-512F and BW | `avx512` (compiles, but has not been run by the author) |
+| x86-64 with AVX2 | `avx2` |
+| anything else | `scalar`: portable loops |
 
-All paths produce identical evaluations. A baseline `x86-64` build with no
-`target-cpu` gets the portable path.
+All paths produce identical evaluations. Setting the environment variable
+`ESPER_SIMD` to one of those names selects a lower path than the detected one
+(for testing); a path the CPU cannot run is never selected. A build whose target
+already guarantees the best path (Apple silicon) has the choice fixed at compile
+time and ignores the variable.
 
 ## Command line
 

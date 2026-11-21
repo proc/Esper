@@ -948,6 +948,7 @@ impl Engine {
                 println!("option name BookDepth type spin default 0 min 0 max 1000");
                 println!("option name Clear Hash type button");
                 crate::tune::print_uci_options();
+                println!("info string SIMD path: {}", crate::simd::level().name());
                 println!("uciok");
             }
             "isready" => println!("readyok"),

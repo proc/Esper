@@ -9,8 +9,9 @@
 # Needs an llvm-profdata whose LLVM major version matches rustc's; set
 # $env:LLVM_PROFDATA to choose one, otherwise rustup's llvm-tools component is
 # used (rustup component add llvm-tools).
-# Set $env:PGO_TARGET_CPU (for example x86-64-v3) for a binary that must run on
-# other machines; the default is this machine's CPU.
+# The SIMD path (AVX2, AVX-512, ...) is chosen at run time, so the result runs on
+# any x86-64-v2 CPU. Set $env:PGO_TARGET_CPU (for example native) to build for
+# one CPU instead.
 # Extra arguments are passed on to both cargo builds.
 param(
     [switch]$Install,
@@ -68,9 +69,12 @@ if (-not $profdata) {
     Fail "no llvm-profdata for LLVM $want found; run 'rustup component add llvm-tools' or set LLVM_PROFDATA"
 }
 
-# RUSTFLAGS replaces .cargo/config.toml's rustflags, so keep the CPU target.
-$cpu = if ($env:PGO_TARGET_CPU) { $env:PGO_TARGET_CPU } else { 'native' }
-$baseFlags = "-C target-cpu=$cpu"
+# RUSTFLAGS replaces .cargo/config.toml's rustflags, so repeat its CPU target:
+# the portable baseline on x86-64, the target's default elsewhere.
+$cpu = $env:PGO_TARGET_CPU
+if (-not $cpu -and $hostTriple.StartsWith('x86_64')) { $cpu = 'x86-64-v2' }
+$baseFlags = if ($cpu) { "-C target-cpu=$cpu" } else { '' }
+$savedSimd = $env:ESPER_SIMD
 $data = Join-Path ([System.IO.Path]::GetTempPath()) ("esper-pgo-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $data | Out-Null
 $savedFlags = $env:RUSTFLAGS
@@ -90,6 +94,18 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail 'training run failed (-t 4 bench 13)' }
     & $gen perftbench | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail 'training run failed (perftbench)' }
+    # Also exercise the SIMD paths below this machine's best, so the paths other
+    # CPUs will take are not left optimised as never-run code. A path this CPU
+    # cannot run is skipped.
+    foreach ($level in @('avx512', 'avx2', 'neon')) {
+        $env:ESPER_SIMD = $level
+        $reported = (& $gen uci) -join "`n"
+        if ($reported -match "SIMD path: $level(\r|\n|$)") {
+            & $gen bench 12 | Out-Null
+            if ($LASTEXITCODE -ne 0) { Fail "training run failed (ESPER_SIMD=$level bench 12)" }
+        }
+    }
+    $env:ESPER_SIMD = $savedSimd
 
     Write-Host "== merging profile with $profdata"
     $merged = Join-Path $data 'esper.profdata'
@@ -119,5 +135,6 @@ try {
 }
 finally {
     $env:RUSTFLAGS = $savedFlags
+    $env:ESPER_SIMD = $savedSimd
     Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
 }
