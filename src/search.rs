@@ -636,7 +636,18 @@ impl Picker {
     #[inline(always)]
     fn get(&self, i: usize) -> Ext {
         // SAFETY: callers only read slots below `end_cur` / `end_bad`, all written.
-        unsafe { self.buf[i].assume_init() }
+        debug_assert!(i < MAX_MOVES);
+        unsafe { self.buf.get_unchecked(i).assume_init() }
+    }
+
+    /// Write slot `i`. A position has at most 218 moves and the buffer holds
+    /// each generated move once (deferred ones move to the front), so `i` stays
+    /// below MAX_MOVES; unchecked, as these stores run for every move scored.
+    #[inline(always)]
+    fn put(&mut self, i: usize, e: Ext) {
+        debug_assert!(i < MAX_MOVES);
+        // SAFETY: see above.
+        unsafe { self.buf.get_unchecked_mut(i).write(e) };
     }
 
     #[inline(always)]
@@ -654,7 +665,7 @@ impl Picker {
             // En passant lands on an empty square: no victim, as in Stockfish.
             let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
             let v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
-            self.buf[at + i].write(Ext { v, m, _pad: 0 });
+            self.put(at + i, Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -728,7 +739,7 @@ impl Picker {
                 } else {
                     1 << 24
                 };
-                self.buf[at + i].write(Ext { v, m, _pad: 0 });
+                self.put(at + i, Ext { v, m, _pad: 0 });
                 continue;
             }
             let (from, to) = (m.from(), m.to());
@@ -759,7 +770,7 @@ impl Picker {
             if ply < LOW_PLY_SIZE {
                 v += 8 * s.low_ply_hist[ply][m.from_to()] as i32 / (1 + ply as i32);
             }
-            self.buf[at + i].write(Ext { v, m, _pad: 0 });
+            self.put(at + i, Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -776,7 +787,7 @@ impl Picker {
                 let idx = pos.board[m.from()] as usize * 64 + m.to();
                 s.butterfly[pos.stm][m.from_to()] as i32 + s.cont_score(ply, 1, idx)
             };
-            self.buf[at + i].write(Ext { v, m, _pad: 0 });
+            self.put(at + i, Ext { v, m, _pad: 0 });
         }
         at + list.len
     }
@@ -812,7 +823,7 @@ impl Picker {
                         if pos.see_ge(e.m, -e.v / 37) {
                             return e.m;
                         }
-                        self.buf[self.end_bad].write(e);
+                        self.put(self.end_bad, e);
                         self.end_bad += 1;
                     }
                     self.end_bad_caps = self.end_bad;
@@ -888,7 +899,7 @@ impl Picker {
                             if e.v > GOOD_QUIET_THRESHOLD {
                                 return e.m;
                             }
-                            self.buf[self.end_bad].write(e);
+                            self.put(self.end_bad, e);
                             self.end_bad += 1;
                         }
                     }
@@ -1286,20 +1297,29 @@ impl Searcher {
     /// The continuation-history row of the move made `back` plies before `ply`,
     /// or the never-updated sentinel row when there is no such move.
     #[inline(always)]
-    fn cont_row(&self, ply: usize, back: usize) -> &[AtomicI16] {
+    fn cont_row(&self, ply: usize, back: usize) -> &[AtomicI16; 1024] {
+        // Rows are handed out as fixed-size arrays without a range check: the
+        // table holds 4 blocks of 1024 rows of 1024 (cont_block < 4, cont < 1024)
+        // and the sentinel row is 1024 long. With a known row length, the
+        // lookups into it need no check either.
         if ply >= back {
             let e = &self.ss[ply - back];
             if e.cont != NO_CONT {
                 let base = (e.cont_block * 1024 + e.cont) * 1024;
-                return &self.hist.cont_hist[base..base + 1024];
+                debug_assert!(base + 1024 <= self.hist.cont_hist.len());
+                // SAFETY: see above.
+                return unsafe { &*(self.hist.cont_hist.as_ptr().add(base) as *const [AtomicI16; 1024]) };
             }
         }
-        &self.hist.cont_sentinel
+        debug_assert_eq!(self.hist.cont_sentinel.len(), 1024);
+        // SAFETY: the sentinel row is 1024 long.
+        unsafe { &*(self.hist.cont_sentinel.as_ptr() as *const [AtomicI16; 1024]) }
     }
 
     #[inline(always)]
     fn cont_score(&self, ply: usize, back: usize, idx: usize) -> i32 {
-        ld(&self.cont_row(ply, back)[idx])
+        // Piece-to indices are below 1024 (16 pieces x 64 squares).
+        ld(&self.cont_row(ply, back)[idx & 1023])
     }
 
     /// Start of the pawn-history row for `pos`'s pawn structure.
