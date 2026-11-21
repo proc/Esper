@@ -233,8 +233,8 @@ pub struct Searcher {
     pub tt: Arc<TT>,
     pub shared: Arc<Shared>,
     nnue: NnueState,
-    pos: Vec<Position>,
-    ss: Vec<Stack>,
+    pos: PlyVec<Position>,
+    ss: PlyVec<Stack>,
     keys: Vec<u64>,
     pv: Vec<[Move; MAX_PLY + 2]>,
     pv_len: [usize; MAX_PLY + 2],
@@ -357,6 +357,46 @@ fn atomic_table(len: usize, fill: i16) -> Box<[AtomicI16]> {
 
 /// The tables Stockfish shares between all search threads: the continuation and
 /// pawn histories and the pawn, minor-piece and non-pawn correction histories.
+/// The per-ply stacks: a fixed-length vector indexed by ply without bounds
+/// checks in release builds. The search never goes past `MAX_PLY + 2` (it stops
+/// at `MAX_PLY`) and the vector holds `MAX_PLY + 8`; debug builds still check.
+/// The search indexes these on almost every line, and the checks added up.
+struct PlyVec<T>(Vec<T>);
+
+impl<T> std::ops::Index<usize> for PlyVec<T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &T {
+        debug_assert!(i < self.0.len());
+        // SAFETY: see above.
+        unsafe { self.0.get_unchecked(i) }
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for PlyVec<T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        debug_assert!(i < self.0.len());
+        // SAFETY: see above.
+        unsafe { self.0.get_unchecked_mut(i) }
+    }
+}
+
+impl<T> std::ops::Deref for PlyVec<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for PlyVec<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
 /// With `SHARED_HISTORY` off each thread gets its own copy.
 pub struct SharedHist {
     /// Continuation history, `[in check][capture][piece-to of the earlier move][piece-to]`.
@@ -913,8 +953,8 @@ impl Searcher {
             tt,
             shared,
             nnue: NnueState::new(net, MAX_PLY + 8),
-            pos: vec![Position::empty(); MAX_PLY + 8],
-            ss: vec![
+            pos: PlyVec(vec![Position::empty(); MAX_PLY + 8]),
+            ss: PlyVec(vec![
                 Stack {
                     mv: Move::NONE,
                     cont: NO_CONT,
@@ -933,7 +973,7 @@ impl Searcher {
                     cont_block: 0,
                 };
                 MAX_PLY + 8
-            ],
+            ]),
             keys: Vec::with_capacity(1024),
             pv: vec![[Move::NONE; MAX_PLY + 2]; MAX_PLY + 2],
             pv_len: [0; MAX_PLY + 2],
@@ -1012,7 +1052,7 @@ impl Searcher {
     pub fn eval_position(&mut self, pos: &Position) -> (i32, i32) {
         self.pos[0] = *pos;
         self.nnue.reset();
-        let raw = self.nnue.evaluate(&self.pos[..1], 0);
+        let raw = self.nnue.evaluate(&self.pos.0[..1], 0);
         (raw, self.scale_eval(raw, pos))
     }
 
@@ -1158,7 +1198,7 @@ impl Searcher {
 
     #[inline]
     fn evaluate(&mut self, ply: usize) -> i32 {
-        let raw = self.nnue.evaluate(&self.pos[..=ply], ply);
+        let raw = self.nnue.evaluate(&self.pos.0[..=ply], ply);
         self.scale_eval(raw, &self.pos[ply])
     }
 

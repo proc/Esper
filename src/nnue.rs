@@ -397,8 +397,12 @@ impl Network {
 
     #[inline(always)]
     fn tp_row(&self, idx: u32) -> &[u8; L1] {
-        let o = self.tp_off + idx as usize * L1;
-        self.data[o..o + L1].try_into().unwrap()
+        // Unchecked: indices are filtered below THREAT_DIMS (+ PAIR_DIMS for pawn
+        // pairs) where they are made, and the loader insists on the exact file
+        // size, so every row lies inside `data`.
+        debug_assert!((idx as usize) < THREAT_DIMS + PAIR_DIMS);
+        // SAFETY: see above.
+        unsafe { &*(self.data.as_ptr().add(self.tp_off + idx as usize * L1) as *const [u8; L1]) }
     }
     /// A threat row, or a piece-square row when `idx` carries `PSQ_FLAG`.
     #[inline(always)]
@@ -407,8 +411,9 @@ impl Network {
     }
     #[inline(always)]
     fn psq_row(&self, idx: u32) -> &[u8; L1] {
-        let o = self.psq_off + idx as usize * L1;
-        self.data[o..o + L1].try_into().unwrap()
+        debug_assert!((idx as usize) < PSQ_DIMS);
+        // SAFETY: as for `tp_row`; piece-square indices are below PSQ_DIMS.
+        unsafe { &*(self.data.as_ptr().add(self.psq_off + idx as usize * L1) as *const [u8; L1]) }
     }
 }
 
@@ -601,16 +606,63 @@ impl ThreatBoard {
         self.board[sq] = if self.board[sq] == 0 { pc } else { 0 };
     }
 
+}
+
+/// What `piece_threats` reads of a board: a working copy (`ThreatBoard`) or a
+/// position used as it is, which saves copying it.
+trait ThreatView {
+    fn piece(&self, sq: usize) -> u8;
+    fn by_type(&self) -> &[u64; 7];
+    fn by_color(&self) -> &[u64; 2];
+    fn occupied(&self) -> u64;
     /// Piece types a piece of type `pt` can threaten (kings are never involved).
     #[inline(always)]
     fn targets(&self, pt: usize) -> u64 {
-        let t = &self.by_type;
+        let t = self.by_type();
         match pt {
             PAWN => t[KNIGHT] | t[ROOK],
             BISHOP | ROOK => t[PAWN] | t[KNIGHT] | t[BISHOP] | t[ROOK],
             KNIGHT | QUEEN => t[PAWN] | t[KNIGHT] | t[BISHOP] | t[ROOK] | t[QUEEN],
             _ => 0,
         }
+    }
+}
+
+impl ThreatView for ThreatBoard {
+    #[inline(always)]
+    fn piece(&self, sq: usize) -> u8 {
+        self.board[sq]
+    }
+    #[inline(always)]
+    fn by_type(&self) -> &[u64; 7] {
+        &self.by_type
+    }
+    #[inline(always)]
+    fn by_color(&self) -> &[u64; 2] {
+        &self.by_color
+    }
+    #[inline(always)]
+    fn occupied(&self) -> u64 {
+        self.occ
+    }
+}
+
+impl ThreatView for Position {
+    #[inline(always)]
+    fn piece(&self, sq: usize) -> u8 {
+        self.board[sq]
+    }
+    #[inline(always)]
+    fn by_type(&self) -> &[u64; 7] {
+        &self.by_type
+    }
+    #[inline(always)]
+    fn by_color(&self) -> &[u64; 2] {
+        &self.by_color
+    }
+    #[inline(always)]
+    fn occupied(&self) -> u64 {
+        self.by_color[WHITE] | self.by_color[BLACK]
     }
 }
 
@@ -621,12 +673,22 @@ fn threat_code(from: usize, to: usize, attacker: u8, attacked: u8) -> u32 {
 
 /// Threats that involve the piece `pc` standing on `sq` in `tb` (as attacker or
 /// target) go to `with`; threats that exist only while `sq` is empty (sliders
-/// seeing past it) go to `without`.
+/// seeing past it) go to `without` (only with `XRAY`). `other` (64 for none) is
+/// the second square of a quiet move: x-ray views along a ray holding both
+/// squares appear at one square and vanish at the other, so neither is listed
+/// (Stockfish's noRaysContaining).
 #[inline(always)]
-fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut IdxList<N>, without: &mut IdxList<N>) {
+fn piece_threats<V: ThreatView, const N: usize, const XRAY: bool>(
+    tb: &V,
+    pc: u8,
+    sq: usize,
+    with: &mut IdxList<N>,
+    without: &mut IdxList<N>,
+    other: usize,
+) {
     let pt = piece_type(pc);
-    let occ = tb.occ;
-    let t = &tb.by_type;
+    let occ = tb.occupied();
+    let t = tb.by_type();
     // Slider rays from `sq`, shared by every part below.
     let diag = bishop_attacks(sq, occ);
     let ortho = rook_attacks(sq, occ);
@@ -642,7 +704,7 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
     let mut att = own & tb.targets(pt);
     while att != 0 {
         let to = pop_lsb(&mut att);
-        with.push(threat_code(sq, to, pc, tb.board[to]));
+        with.push(threat_code(sq, to, pc, tb.piece(to)));
     }
     let diag_sliders = diag & (t[BISHOP] | t[QUEEN]);
     let ortho_sliders = ortho & (t[ROOK] | t[QUEEN]);
@@ -653,14 +715,16 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
             attackers |= (diag & t[BISHOP]) | (ortho & t[ROOK]);
         }
         if pt == KNIGHT || pt == ROOK {
-            let white = t[PAWN] & tb.by_color[WHITE];
-            let black = t[PAWN] & tb.by_color[BLACK];
-            attackers |= (pawn_attacks(BLACK, sq) & white) | (pawn_attacks(WHITE, sq) & black);
+            let c = tb.by_color();
+            attackers |= (pawn_attacks(BLACK, sq) & t[PAWN] & c[WHITE]) | (pawn_attacks(WHITE, sq) & t[PAWN] & c[BLACK]);
         }
         while attackers != 0 {
             let from = pop_lsb(&mut attackers);
-            with.push(threat_code(from, sq, tb.board[from], pc));
+            with.push(threat_code(from, sq, tb.piece(from), pc));
         }
+    }
+    if !XRAY {
+        return;
     }
     // Sliders whose line runs through `sq` see one piece further when it is
     // empty: the first piece past `sq` on that line, which `sq`'s own ray in the
@@ -668,12 +732,15 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
     let mut sliders = diag_sliders | ortho_sliders;
     while sliders != 0 {
         let from = pop_lsb(&mut sliders);
-        let spc = tb.board[from];
+        if other < 64 && (between(from, sq) & bit(other) != 0 || between(from, other) & bit(sq) != 0) {
+            continue;
+        }
+        let spc = tb.piece(from);
         let ray = if (diag_sliders >> from) & 1 != 0 { diag } else { ortho };
         let mut beyond = ray & line(from, sq) & !between(from, sq) & !bit(from) & tb.targets(piece_type(spc));
         while beyond != 0 {
             let to = pop_lsb(&mut beyond);
-            without.push(threat_code(from, to, spc, tb.board[to]));
+            without.push(threat_code(from, to, spc, tb.piece(to)));
         }
     }
 }
@@ -682,18 +749,43 @@ fn piece_threats<const N: usize>(tb: &ThreatBoard, pc: u8, sq: usize, with: &mut
 /// arrived rather than by rescanning both boards. A threat can appear in both
 /// lists; the accumulator arithmetic is linear, so that is harmless.
 fn threat_changes_inc<const N: usize>(p0: &Position, p1: &Position, added: &mut IdxList<N>, removed: &mut IdxList<N>) {
-    let mut tb = ThreatBoard::new(p0);
     let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
     for pt in PAWN..=KING {
         changed |= p0.by_type[pt] ^ p1.by_type[pt];
     }
+    if THREAT_FAST_PATHS && changed.count_ones() == 2 {
+        let (a, b) = (changed.trailing_zeros() as usize, 63 - changed.leading_zeros() as usize);
+        // `from` empties; `to` is whichever square holds a piece afterwards.
+        let (from, to) = if p1.board[a] == 0 { (a, b) } else { (b, a) };
+        if p0.board[from] != 0 && p1.board[from] == 0 && p1.board[to] != 0 {
+            if p0.board[to] == 0 {
+                // Quiet move (or promotion): lift on the old board, set down on
+                // the new one; neither needs a working copy.
+                piece_threats::<_, N, true>(p0, p0.board[from], from, removed, added, to);
+                piece_threats::<_, N, true>(p1, p1.board[to], to, added, removed, from);
+            } else {
+                // Capture: lift the mover, then swap victim for mover on `to`.
+                // `to` stays occupied, so no line through it changes (no
+                // x-rays), and the board between the two steps differs from
+                // `p1` only on `to`, which neither piece's threats read.
+                piece_threats::<_, N, true>(p0, p0.board[from], from, removed, added, 64);
+                piece_threats::<_, N, false>(p1, p0.board[to], to, removed, added, 64);
+                piece_threats::<_, N, false>(p1, p1.board[to], to, added, removed, 64);
+            }
+            if FAST_PATH_CANCEL {
+                cancel_duplicates(added, removed);
+            }
+            return;
+        }
+    }
+    let mut tb = ThreatBoard::new(p0);
     // Lift the pieces that leave or are replaced...
     let mut c = changed;
     while c != 0 {
         let sq = pop_lsb(&mut c);
         let pc = tb.board[sq];
         if pc != 0 {
-            piece_threats(&tb, pc, sq, removed, added);
+            piece_threats::<_, N, true>(&tb, pc, sq, removed, added, 64);
             tb.toggle(sq, pc);
         }
     }
@@ -704,11 +796,16 @@ fn threat_changes_inc<const N: usize>(p0: &Position, p1: &Position, added: &mut 
         let pc = p1.board[sq];
         if pc != 0 {
             tb.toggle(sq, pc);
-            piece_threats(&tb, pc, sq, added, removed);
+            piece_threats::<_, N, true>(&tb, pc, sq, added, removed, 64);
         }
     }
-    // Drop threats that were both lost and regained: each costs two row updates.
-    // (Turning this off cost about 2% in cycles: the duplicate rows cost more.)
+    cancel_duplicates(added, removed);
+}
+
+/// Drop threats that were both lost and regained: each costs two row updates.
+/// (Turning this off cost about 2% in cycles: the duplicate rows cost more.)
+#[inline(always)]
+fn cancel_duplicates<const N: usize>(added: &mut IdxList<N>, removed: &mut IdxList<N>) {
     if !CANCEL_DUPLICATE_THREATS {
         return;
     }
@@ -1311,6 +1408,10 @@ fn refresh_rows(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs: &[*c
 
 /// Search the added and removed threat lists for pairs that cancel out.
 const CANCEL_DUPLICATE_THREATS: bool = true;
+
+/// Quiet moves and captures skip the working copy of the board.
+const THREAT_FAST_PATHS: bool = true;
+const FAST_PATH_CANCEL: bool = false;
 
 /// Compute a move's feature changes when it is made rather than when the
 /// position is evaluated. Off: many made positions are never evaluated, and the
@@ -2207,5 +2308,65 @@ mod threat_tests {
             }
         }
         assert!(checked > 10_000);
+    }
+    /// Move pairs from random games, the kind of steps the search updates.
+    fn sample_steps() -> Vec<(Position, Position)> {
+        crate::bitboard::init();
+        let fens = [
+            crate::position::START_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R w KQ - 3 9",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut steps = Vec::new();
+        for fen in fens {
+            for _ in 0..30 {
+                let mut pos = Position::from_fen(fen).unwrap();
+                for _ in 0..40 {
+                    let moves = legal_moves(&pos);
+                    if moves.is_empty() {
+                        break;
+                    }
+                    for &m in &moves {
+                        steps.push((pos, pos.make(m)));
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    pos = pos.make(moves[(seed % moves.len() as u64) as usize]);
+                }
+            }
+        }
+        steps
+    }
+
+    /// Time per call of the incremental threat diff (run with
+    /// `cargo test --release threat_diff_bench -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn threat_diff_bench() {
+        // A cache-sized sample: in the search both positions are hot.
+        let mut steps = sample_steps();
+        let stride = steps.len() / 4000;
+        steps = steps.into_iter().step_by(stride.max(1)).collect();
+        let mut total = 0usize;
+        let t = std::time::Instant::now();
+        let rounds: usize = std::env::var("TD_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(800);
+        for _ in 0..rounds {
+            for (p0, p1) in &steps {
+                let (mut a, mut r) = (IdxList::<MAX_THREATS>::new(), IdxList::<MAX_THREATS>::new());
+                threat_changes_inc(std::hint::black_box(p0), std::hint::black_box(p1), &mut a, &mut r);
+                total += a.n + r.n;
+                std::hint::black_box((&a, &r));
+            }
+        }
+        let calls = (steps.len() * rounds) as f64;
+        println!(
+            "threat_changes_inc: {} steps, {:.1} ns/call, {:.2} threats/call",
+            steps.len(),
+            t.elapsed().as_nanos() as f64 / calls,
+            total as f64 / calls
+        );
     }
 }

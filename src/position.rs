@@ -708,11 +708,17 @@ impl Position {
         let mut stm = self.stm ^ 1;
         // Stockfish's pin rule: a piece pinned to its king may not recapture
         // while the pinner is still on the board.
-        let pins = [self.slider_blockers(WHITE), self.slider_blockers(BLACK)];
+        // Worked out per side only when that side has a capture to make: most
+        // exchanges end after a move or two.
+        let mut pins: [Option<(u64, u64)>; 2] = [None, None];
         loop {
             let mut mine = attackers & self.by_color[stm];
-            if pins[stm].1 & occ != 0 {
-                mine &= !pins[stm].0;
+            if mine == 0 {
+                break;
+            }
+            let (blockers, pinners) = *pins[stm].get_or_insert_with(|| self.slider_blockers(stm));
+            if pinners & occ != 0 {
+                mine &= !blockers;
             }
             if mine == 0 {
                 break;
