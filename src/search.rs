@@ -1213,6 +1213,17 @@ impl Searcher {
         self.scale_eval(raw, &self.pos[ply])
     }
 
+    /// Row of the continuation correction history for the move `back` plies
+    /// before `ply`: 0 (the sentinel) for a null move or a ply before the root.
+    #[inline(always)]
+    fn cont_corr_row(&self, ply: usize, back: usize) -> usize {
+        if ply >= back && self.ss[ply - back].cont != NO_CONT {
+            self.ss[ply - back].cont
+        } else {
+            0
+        }
+    }
+
     /// Stockfish-style correction value of the position at `ply`, in its raw
     /// weighted form (divide by 131072 for evaluation units).
     #[inline]
@@ -1224,12 +1235,11 @@ impl Searcher {
         let micv = ld(h.minor_corr(stm, pos.minor_key));
         let wnp = ld(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
         let bnp = ld(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
+        // A null move or a ply before the root reads Stockfish's sentinel row
+        // ([NO_PIECE][0]): row 0 here, which no real move uses. It is learned
+        // like any other row.
         let cont = |back: usize| -> i32 {
-            if ply >= back && self.ss[ply - back].cont != NO_CONT && self.ss[ply - 1].cont != NO_CONT {
-                self.cont_corr[self.ss[ply - back].cont * 1024 + self.ss[ply - 1].cont] as i32
-            } else {
-                0
-            }
+            self.cont_corr[self.cont_corr_row(ply, back) * 1024 + self.ss[ply - 1].cont] as i32
         };
         let cntcv = if ply >= 1 && self.ss[ply - 1].cont != NO_CONT {
             7885 * (cont(2) + cont(4)) + 6307 * cont(6)
@@ -1251,10 +1261,8 @@ impl Searcher {
         if ply >= 1 && self.ss[ply - 1].cont != NO_CONT {
             let to = self.ss[ply - 1].cont;
             for (back, w) in [(2usize, 130), (4, 70), (6, 35)] {
-                if ply >= back && self.ss[ply - back].cont != NO_CONT {
-                    let idx = self.ss[ply - back].cont * 1024 + to;
-                    hist_update(&mut self.cont_corr[idx], bonus * w / 128, SF_CORR_LIMIT);
-                }
+                let idx = self.cont_corr_row(ply, back) * 1024 + to;
+                hist_update(&mut self.cont_corr[idx], bonus * w / 128, SF_CORR_LIMIT);
             }
         }
     }
@@ -1426,7 +1434,7 @@ impl Searcher {
         self.tt.prefetch(key);
         self.keys.push(key);
         self.nnue.push(&self.pos, ply + 1);
-        self.nodes += 1;
+        // Not counted as a node, as in Stockfish (only real moves are).
     }
 
     /// Before a deep hash cutoff, check that the position after the hash move
@@ -2720,10 +2728,6 @@ impl Searcher {
                         self.print_info(depth, pv_idx, &line, label);
                     }
                     delta += 47 * delta / 128;
-                    if delta > 1500 {
-                        alpha = -INF;
-                        beta = INF;
-                    }
                 };
                 if fail_highs > 0 && pv_idx == 0 {
                     self.fail_high_recovery = (fail_highs + 1) / 2 + 2;
