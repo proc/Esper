@@ -698,7 +698,8 @@ impl Position {
         if balance >= 0 {
             return true;
         }
-        let mut occ = (self.occ() ^ bit(from)) | bit(to);
+        // Clearing `to` matters for pins: a captured pinner no longer pins.
+        let mut occ = self.occ() ^ bit(from) ^ bit(to);
         if flag == FLAG_EP {
             occ ^= bit(to ^ 8);
         }

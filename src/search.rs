@@ -1897,6 +1897,7 @@ impl Searcher {
         let all_node = !pv_node && !cut_node;
         let prior_reduction = if ply > 0 { std::mem::take(&mut self.ss[ply - 1].reduction) } else { 0 };
         self.ss[ply].stat_score = 0;
+        self.ss[ply].move_count = 0;
         self.ss[ply + 1].prior_nmp_fail_high = 0;
         self.ss[ply].follow_pv = root
             || (self.ss[ply - 1].follow_pv
@@ -1997,15 +1998,13 @@ impl Searcher {
         // Hindsight: a big reduction of the previous move that the evaluation
         // does not support is partly given back; a quiet position loses a ply.
         let prev_eval = if ply >= 1 { self.ss[ply - 1].static_eval } else { NONE };
-        let opponent_worsening = static_eval != NONE && (prev_eval == NONE || static_eval > -prev_eval);
+        let opponent_worsening = static_eval > -prev_eval;
         if SF_HINDSIGHT && excluded.is_none() {
             if prior_reduction >= 3 && !opponent_worsening {
                 depth += 1;
             }
             if prior_reduction >= 2
                 && depth >= 2
-                && static_eval != NONE
-                && prev_eval != NONE
                 && static_eval + prev_eval > 166
             {
                 depth -= 1;
@@ -2303,6 +2302,8 @@ impl Searcher {
                 continue;
             }
             move_count += 1;
+            // Set before the singular search, which overwrites it (as in Stockfish).
+            self.ss[ply].move_count = move_count;
             let capture = m.is_capture_stage();
             let gives_check = if move_count == 1 {
                 pos.gives_check(m)
@@ -2453,7 +2454,6 @@ impl Searcher {
                     / 1024
             };
             self.ss[ply].stat_score = stat_score;
-            self.ss[ply].move_count = move_count;
             self.make(ply, m);
             debug_assert_eq!(gives_check, self.pos[ply + 1].checkers != 0);
             let mut new_depth = new_depth_base + ext;
