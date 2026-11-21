@@ -43,31 +43,31 @@ macro_rules! params {
 
 params! {
     // Evaluation scaling
-    T_OptimismScale = 422, 200, 700;
-    T_OptimismDiv = 91, 30, 200;
+    T_OptimismScale = 440, 200, 700;
+    T_OptimismDiv = 90, 30, 200;
     // Quiet move futility (move loop)
-    T_FutBase = 162, 50, 300;
-    T_FutMult = 110, 50, 200;
-    T_FutAboveAlpha = 97, 0, 200;
+    T_FutBase = 170, 50, 300;
+    T_FutMult = 109, 50, 200;
+    T_FutAboveAlpha = 98, 0, 200;
     // Reverse futility
-    T_RfpImproving = 2658, 1000, 4000;
+    T_RfpImproving = 2719, 1000, 4000;
     // Razoring
-    T_RazorMargin = 335, 150, 600;
+    T_RazorMargin = 340, 150, 600;
     // Quiescence futility
     T_QsFutBase = 319, 100, 500;
     // Capture futility and exchange pruning (move loop)
-    T_CapFutBase = 220, 100, 400;
-    T_CapFutMult = 268, 100, 400;
+    T_CapFutBase = 229, 100, 400;
+    T_CapFutMult = 270, 100, 400;
     T_CapSeeMult = 177, 80, 300;
     // Hash-entry ProbCut
-    T_SmallProbCut = 418, 200, 700;
+    T_SmallProbCut = 425, 200, 700;
     // Singular extensions
-    T_SingularMargin = 58, 20, 120;
-    T_DoubleExtMargin = -14, -100, 100;
-    T_TripleExtMargin = 84, 0, 200;
+    T_SingularMargin = 57, 20, 120;
+    T_DoubleExtMargin = -10, -100, 100;
+    T_TripleExtMargin = 83, 0, 200;
     // LMR / LMP / Fortress / Time management
-    T_LmrCutNode = 3720, 2000, 6000;
-    T_LmpScale = 1038, 600, 1600;
+    T_LmrCutNode = 3712, 2000, 6000;
+    T_LmpScale = 1027, 600, 1600;
     T_FortressRule50 = 31, 16, 60;
     T_TimeFalling = 230, 100, 400;
     T_TimeInstability = 2229, 1000, 3500;

@@ -2108,7 +2108,7 @@ impl Searcher {
             }
 
             // Razoring
-            if all_node && eval < alpha - 342 * depth && !self.seek_mate {
+            if all_node && eval < alpha - tune::T_RazorMargin.get() * depth && !self.seek_mate {
                 return self.qsearch(ply, alpha, beta, false);
             }
 
