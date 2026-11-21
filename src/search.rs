@@ -73,6 +73,9 @@ const DEEPER_PLY_GUARD: bool = false;
 const TM_RESEARCH_FIRST: bool = true;
 /// Cut a stable iteration short once twice the planned time has passed.
 const TM_SOFT_STOP: bool = true;
+/// Stockfish's time allocation and stopping rule (with a fixed clock reserve)
+/// instead of the snappy scheme.
+const SF_TIME_MANAGEMENT: bool = true;
 /// Searched moves remembered for history maluses (Stockfish's SEARCHEDLIST_CAPACITY).
 const SEARCHED_CAP: usize = 32;
 /// Extra null-move reduction (plies) granted when the evaluation is far above beta.
@@ -660,14 +663,19 @@ impl Picker {
     fn score_captures(&mut self, s: &Searcher, pos: &Position, at: usize) -> usize {
         let mut list = MoveList::new();
         generate(pos, &mut list, true, false);
-        for (i, &m) in list.as_slice().iter().enumerate() {
-            let pc = pos.board[m.from()] as usize;
+        let mut out = at;
+        for &m in list.as_slice() {
+            if m == self.tt_move {
+                continue;
+            }
+            let pc = unsafe { *pos.board.get_unchecked(m.from()) } as usize;
             // En passant lands on an empty square: no victim, as in Stockfish.
-            let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(pos.board[m.to()]) };
+            let victim = if m.flag() == FLAG_EP { 0 } else { piece_type(unsafe { *pos.board.get_unchecked(m.to()) }) };
             let v = s.capture_hist[pc][m.to()][victim] as i32 + 7 * PIECE_VALUE[victim];
-            self.put(at + i, Ext { v, m, _pad: 0 });
+            self.put(out, Ext { v, m, _pad: 0 });
+            out += 1;
         }
-        at + list.len
+        out
     }
 
     /// Quiet moves: history tables, threats by lesser pieces and checks.
@@ -718,17 +726,21 @@ impl Picker {
             checks[QUEEN] = checks[BISHOP] | checks[ROOK];
         }
 
-        let cont_slice = |back: usize| -> Option<&[AtomicI16]> { Some(s.cont_row(ply, back)) };
-        let c1 = cont_slice(1);
-        let c2 = cont_slice(2);
-        let c3 = cont_slice(3);
-        let c4 = cont_slice(4);
-        let c6 = cont_slice(6);
+        let c1 = s.cont_row(ply, 1);
+        let c2 = s.cont_row(ply, 2);
+        let c3 = s.cont_row(ply, 3);
+        let c4 = s.cont_row(ply, 4);
+        let c6 = s.cont_row(ply, 6);
 
         let pawn_base = s.pawn_hist_base(pos);
         let killers = s.ss[ply].killers;
         let counter = s.counter_move(ply);
-        for (i, &m) in list.as_slice().iter().enumerate() {
+        let [t0, t1, t2] = self.tried;
+        let mut out = at;
+        for &m in list.as_slice() {
+            if m == self.tt_move || m == t0 || m == t1 || m == t2 {
+                continue;
+            }
             // Killers and the countermove get lighter reductions in this search, so
             // they are also tried first among the quiet moves.
             if KILLERS && KILLER_ORDERING && (m == killers[0] || m == killers[1] || m == counter) {
@@ -739,7 +751,8 @@ impl Picker {
                 } else {
                     1 << 24
                 };
-                self.put(at + i, Ext { v, m, _pad: 0 });
+                self.put(out, Ext { v, m, _pad: 0 });
+                out += 1;
                 continue;
             }
             let (from, to) = (m.from(), m.to());
@@ -748,11 +761,11 @@ impl Picker {
             let idx = pc * 64 + to;
             let (h1, h2, h3, h4, h6, bf, ph) = unsafe {
                 (
-                    c1.map_or(0, |t| ld(t.get_unchecked(idx))),
-                    c2.map_or(0, |t| ld(t.get_unchecked(idx))),
-                    c3.map_or(0, |t| ld(t.get_unchecked(idx))),
-                    c4.map_or(0, |t| ld(t.get_unchecked(idx))),
-                    c6.map_or(0, |t| ld(t.get_unchecked(idx))),
+                    ld(c1.get_unchecked(idx)),
+                    ld(c2.get_unchecked(idx)),
+                    ld(c3.get_unchecked(idx)),
+                    ld(c4.get_unchecked(idx)),
+                    ld(c6.get_unchecked(idx)),
                     *s.butterfly.get_unchecked(us).get_unchecked(m.from_to()) as i32,
                     ld(s.hist.pawn_hist.get_unchecked(pawn_base + idx)),
                 )
@@ -761,18 +774,22 @@ impl Picker {
             let mut v = hist + 2 * ph + h3 + h4 + h6;
             if detailed {
                 // Bonus for escaping an attack by a lesser piece, penalty for walking into one.
-                let threat = (lesser[pt] & bit(from) != 0) as i32 - (lesser[pt] & bit(to) != 0) as i32;
-                v += PIECE_VALUE[pt] * 20 * threat;
-                if checks[pt] & bit(to) != 0 && pos.see_ge(m, -36) {
+                let lt = unsafe { *lesser.get_unchecked(pt) };
+                if lt != 0 {
+                    let threat = (lt & bit(from) != 0) as i32 - (lt & bit(to) != 0) as i32;
+                    v += PIECE_VALUE[pt] * 20 * threat;
+                }
+                if unsafe { *checks.get_unchecked(pt) } & bit(to) != 0 && pos.see_ge(m, -36) {
                     v += 16384;
                 }
             }
             if ply < LOW_PLY_SIZE {
                 v += 8 * s.low_ply_hist[ply][m.from_to()] as i32 / (1 + ply as i32);
             }
-            self.put(at + i, Ext { v, m, _pad: 0 });
+            self.put(out, Ext { v, m, _pad: 0 });
+            out += 1;
         }
-        at + list.len
+        out
     }
 
     /// Check evasions: captures by victim value, then quiets by history.
@@ -1115,6 +1132,59 @@ impl Searcher {
         self.soft_deadline = u64::MAX;
         self.movetime = limits.movetime.map(|mt| mt.saturating_sub(overhead).max(1));
         let us = root.stm;
+        // Stockfish's TimeManagement::init, keeping a fixed reserve on the clock.
+        if SF_TIME_MANAGEMENT {
+            if let Some(time) = limits.time[us] {
+                self.time_managed = true;
+                let reserve = (2 * overhead).max(50);
+                if time <= reserve {
+                    self.hard_ms = 1;
+                    self.soft_ms = 1;
+                    return;
+                }
+                let t = time as f64;
+                let inc = limits.inc[us] as f64;
+                let overhead = overhead as f64;
+                let ply = (2 * (root.fullmove as i64 - 1) + (us == BLACK) as i64).max(0) as f64;
+                let mut mtg = limits.movestogo.map_or(50, |m| m.min(50)) as f64;
+                if t < 1000.0 && limits.movestogo.is_none() {
+                    mtg = (t * 0.05).floor().max(1.0);
+                }
+                let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
+                let (mut opt_scale, max_scale);
+                if limits.movestogo.is_none() {
+                    if self.orig_time_adjust < 0.0 {
+                        self.orig_time_adjust = 0.3272 * time_left.log10() - 0.4141;
+                    }
+                    let log_t = (t / 1000.0).log10();
+                    let opt_c = (0.0029869 + 0.00033554 * log_t).min(0.004905);
+                    let max_c = (3.3744 + 3.0608 * log_t).max(3.1441);
+                    opt_scale = (0.012112 + (ply + 3.22713).powf(0.46866) * opt_c).min(0.19404 * t / time_left)
+                        * self.orig_time_adjust;
+                    max_scale = (max_c + ply / 12.352).min(6.873);
+                } else {
+                    opt_scale = ((0.88 + ply / 116.4) / mtg).min(0.88 * t / time_left);
+                    max_scale = 1.3 + 0.11 * mtg;
+                }
+                // Behind on the clock, plan less time.
+                if limits.movestogo != Some(1) {
+                    let theirs = limits.time[us ^ 1].unwrap_or(0) as f64;
+                    let advantage = (t - theirs) / (1.0 + t + theirs);
+                    opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
+                }
+                let mut soft = (opt_scale * time_left).max(1.0);
+                let hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
+                // The engine, GUI and OS can all stall for a few milliseconds:
+                // always leave the reserve on the clock.
+                let hard = hard.min(t - reserve as f64).max(1.0);
+                if limits.ponder_option {
+                    soft += soft / 4.0;
+                }
+                self.hard_ms = hard as u64;
+                self.soft_ms = (soft as u64).min(self.hard_ms).max(1);
+            }
+            return;
+        }
         // Snappy, flag-proof time allocation.
         if let Some(time) = limits.time[us] {
             self.time_managed = true;
@@ -1592,7 +1662,7 @@ impl Searcher {
     /// argument (not inferred from the window, which a PV node can narrow).
     fn qsearch(&mut self, ply: usize, mut alpha: i32, beta: i32, pv_node: bool) -> i32 {
         self.pv_len[ply] = 0;
-        if self.nodes & 255 == 0 {
+        if self.nodes & 1023 == 0 {
             self.check_time();
         }
         if self.stopped {
@@ -1758,7 +1828,7 @@ impl Searcher {
         }
         let root = ply == 0;
         self.pv_len[ply] = 0;
-        if self.nodes & 255 == 0 {
+        if self.nodes & 1023 == 0 {
             self.check_time();
         }
         if self.stopped {
@@ -2200,7 +2270,6 @@ impl Searcher {
             if !pos.is_legal(m) {
                 continue;
             }
-            self.prefetch_after(&pos, m);
             move_count += 1;
             let capture = m.is_capture_stage();
             let gives_check = if move_count == 1 {
@@ -2279,6 +2348,8 @@ impl Searcher {
                     }
                 }
             }
+
+            self.prefetch_after(&pos, m);
 
             // Singular extension: is the hash move much better than everything else?
             let mut ext = 0;
@@ -2801,15 +2872,17 @@ impl Searcher {
                 let high_effort = interpolate(effort, 75800.0, 104510.0, 0.969, 0.714).clamp(0.693, 0.838);
                 let mut total = self.soft_ms as f64 * falling * reduction * instability * high_effort;
                 if root_moves.len() == 1 {
-                    total = total.min(100.0);
+                    total = total.min(if SF_TIME_MANAGEMENT { 500.0 } else { 100.0 });
                 }
-                self.soft_deadline = (1.15 * total).min(self.hard_ms as f64) as u64;
+                if !SF_TIME_MANAGEMENT {
+                    self.soft_deadline = (1.15 * total).min(self.hard_ms as f64) as u64;
+                }
                 tm_trace = format!(
                     "depth {depth} falling {falling:.2} reduction {reduction:.2} instability {instability:.2} effort {:.0}k/{high_effort:.2} total {total:.0}",
                     effort / 1000.0
                 );
                 let elapsed = self.start.elapsed().as_millis() as f64;
-                let stop_limit = if self.iter_unstable { total } else { total * 0.65 };
+                let stop_limit = if SF_TIME_MANAGEMENT || self.iter_unstable { total } else { total * 0.65 };
                 if elapsed > stop_limit.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
                     || lines[0].score == -(MATE - 2)

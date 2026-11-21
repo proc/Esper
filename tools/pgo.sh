@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Profile-guided optimisation build of Esper.
 #
-#   tools/pgo.sh            # builds target/release/esper with PGO
+#   tools/pgo.sh            # builds target/release/esper-pgo with PGO
+#   tools/pgo.sh --install  # ... and copies it to target/release/esper
 #
 # 1. builds an instrumented binary, 2. runs the bench (single- and multi-threaded)
 # to record which code is hot, 3. rebuilds the release binary using that profile.
@@ -11,6 +12,13 @@
 # LLVM_PROFDATA to choose one, otherwise rustup's llvm-tools or Homebrew's llvm
 # is used.
 set -euo pipefail
+# --install also copies the result to target/release/esper, the path GUIs
+# usually point at (a later plain `cargo build --release` overwrites it).
+install=0
+if [ "${1:-}" = "--install" ]; then
+    install=1
+    shift
+fi
 cd "$(dirname "$0")/.."
 
 llvm_major() { "$1" --version 2>/dev/null | grep -oE 'LLVM version [0-9]+' | grep -oE '[0-9]+$' || true; }
@@ -65,5 +73,13 @@ echo "== optimised build"
 RUSTFLAGS="$base_flags -Cprofile-use=$data/esper.profdata -Cllvm-args=-pgo-warn-missing-function=false" \
     cargo build --release --target "$host" --target-dir target/pgo-use "$@"
 mkdir -p target/release
-cp "target/pgo-use/$host/release/esper" target/release/esper-pgo
+# Copy to a fresh file, never over an existing one: macOS caches the code
+# signature of a binary that has run, and a binary rewritten in place is then
+# killed on launch (SIGKILL, exit 137) even though its signature is valid.
+install_bin() { rm -f "$2" && cp "$1" "$2"; }
+install_bin "target/pgo-use/$host/release/esper" target/release/esper-pgo
 echo "== done: target/release/esper-pgo"
+if [ "$install" = 1 ]; then
+    install_bin target/release/esper-pgo target/release/esper
+    echo "== installed as target/release/esper"
+fi
