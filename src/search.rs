@@ -42,6 +42,8 @@ const KILLERS: bool = false;
 // Stockfish-style forms of the main pruning rules (see `search()` / `qsearch()`).
 /// Prefetch the child's hash entry when a move is picked (see `prefetch_after`).
 const EARLY_TT_PREFETCH: bool = true;
+/// Also prefetch the child entry of the move the picker will offer next.
+const PEEK_PREFETCH: bool = true;
 const SF_NMP: bool = true;
 // Further Stockfish-derived techniques.
 const SF_EVAL_SCALE: bool = true;
@@ -183,23 +185,30 @@ struct Stack {
     cont_block: usize,
 }
 
-/// Stockfish's reduction table: `reductions[i] = 2872 / 128 * ln(i)`.
-fn sf_reductions() -> &'static [i32; 256] {
-    static T: std::sync::OnceLock<[i32; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0; 256];
-        for (i, v) in t.iter_mut().enumerate().skip(1) {
-            *v = (2872.0 / 128.0 * (i as f64).ln()) as i32;
-        }
-        t
-    })
-}
+/// Stockfish's reduction table: `SF_REDUCTIONS[i] = (2872.0 / 128.0 * (i as f64).ln()) as i32`.
+static SF_REDUCTIONS: [i32; 256] = [
+      0,   0,  15,  24,  31,  36,  40,  43,  46,  49,  51,  53,  55,  57,  59,  60,
+     62,  63,  64,  66,  67,  68,  69,  70,  71,  72,  73,  73,  74,  75,  76,  77,
+     77,  78,  79,  79,  80,  81,  81,  82,  82,  83,  83,  84,  84,  85,  85,  86,
+     86,  87,  87,  88,  88,  89,  89,  89,  90,  90,  91,  91,  91,  92,  92,  92,
+     93,  93,  94,  94,  94,  95,  95,  95,  95,  96,  96,  96,  97,  97,  97,  98,
+     98,  98,  98,  99,  99,  99,  99, 100, 100, 100, 100, 101, 101, 101, 101, 102,
+    102, 102, 102, 103, 103, 103, 103, 103, 104, 104, 104, 104, 105, 105, 105, 105,
+    105, 106, 106, 106, 106, 106, 107, 107, 107, 107, 107, 107, 108, 108, 108, 108,
+    108, 109, 109, 109, 109, 109, 109, 110, 110, 110, 110, 110, 110, 111, 111, 111,
+    111, 111, 111, 111, 112, 112, 112, 112, 112, 112, 113, 113, 113, 113, 113, 113,
+    113, 114, 114, 114, 114, 114, 114, 114, 114, 115, 115, 115, 115, 115, 115, 115,
+    116, 116, 116, 116, 116, 116, 116, 116, 117, 117, 117, 117, 117, 117, 117, 117,
+    117, 118, 118, 118, 118, 118, 118, 118, 118, 118, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 120, 120, 120, 120, 120, 120, 120, 120, 120, 121, 121, 121, 121,
+    121, 121, 121, 121, 121, 121, 122, 122, 122, 122, 122, 122, 122, 122, 122, 122,
+    122, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 124, 124, 124, 124,
+];
 
 /// Base reduction in 1024ths of a ply.
 #[inline(always)]
 fn sf_reduction(improving: bool, depth: i32, move_count: i32) -> i32 {
-    let t = sf_reductions();
-    let scale = t[depth.clamp(0, 255) as usize] * t[move_count.clamp(0, 255) as usize];
+    let scale = SF_REDUCTIONS[depth.clamp(0, 255) as usize] * SF_REDUCTIONS[move_count.clamp(0, 255) as usize];
     scale + !improving as i32 * scale * 197 / 512 + 948
 }
 
@@ -596,19 +605,24 @@ struct Picker {
 
 /// Sort descending all entries with a value of at least `limit` to the front;
 /// the order of the remaining ones is unspecified.
+#[inline(always)]
 fn partial_insertion_sort(list: &mut [Ext], limit: i32) {
+    let len = list.len();
     let mut sorted_end = 0;
-    for p in 1..list.len() {
-        if list[p].v >= limit {
-            let tmp = list[p];
-            sorted_end += 1;
-            list[p] = list[sorted_end];
-            let mut q = sorted_end;
-            while q > 0 && list[q - 1].v < tmp.v {
-                list[q] = list[q - 1];
-                q -= 1;
+    // SAFETY: `p < len` and `0 <= q <= sorted_end <= p < len`.
+    unsafe {
+        for p in 1..len {
+            let tmp = *list.get_unchecked(p);
+            if tmp.v >= limit {
+                sorted_end += 1;
+                *list.get_unchecked_mut(p) = *list.get_unchecked(sorted_end);
+                let mut q = sorted_end;
+                while q > 0 && list.get_unchecked(q - 1).v < tmp.v {
+                    *list.get_unchecked_mut(q) = *list.get_unchecked(q - 1);
+                    q -= 1;
+                }
+                *list.get_unchecked_mut(q) = tmp;
             }
-            list[q] = tmp;
         }
     }
 }
@@ -634,6 +648,18 @@ impl Picker {
     #[inline(always)]
     fn in_good_captures(&self) -> bool {
         self.stage == Stage::GoodCapture
+    }
+
+    /// The move `next` will most likely return after the current one (from the
+    /// sorted list being walked), or NONE when it is not known yet.
+    #[inline(always)]
+    fn peek(&self) -> Move {
+        match self.stage {
+            Stage::GoodCapture | Stage::GoodQuiet | Stage::Bad | Stage::All if self.cur < self.end_cur => {
+                self.get(self.cur).m
+            }
+            _ => Move::NONE,
+        }
     }
 
     #[inline(always)]
@@ -1780,6 +1806,12 @@ impl Searcher {
                     continue;
                 }
             }
+            if PEEK_PREFETCH {
+                let n = picker.peek();
+                if !n.is_none() {
+                    self.prefetch_after(&pos, n);
+                }
+            }
             self.make(ply, m);
             let score = -self.qsearch(ply + 1, -beta, -alpha, pv_node);
             self.unmake();
@@ -2350,6 +2382,13 @@ impl Searcher {
             }
 
             self.prefetch_after(&pos, m);
+            if PEEK_PREFETCH {
+                // Also the next move's child, which then has this whole subtree to arrive.
+                let n = picker.peek();
+                if !n.is_none() {
+                    self.prefetch_after(&pos, n);
+                }
+            }
 
             // Singular extension: is the hash move much better than everything else?
             let mut ext = 0;

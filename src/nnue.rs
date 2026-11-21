@@ -2280,11 +2280,17 @@ fn dot_u8_i8(a: &[u8], w: &[i8]) -> i32 {
     #[cfg(simd_neon_dot)]
     unsafe {
         use std::arch::aarch64::*;
-        let mut acc = vdupq_n_s32(0);
-        for i in (0..a.len()).step_by(16) {
-            acc = vdotq_s32(acc, vld1q_s8(w.as_ptr().add(i)), vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i))));
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        for i in (0..a.len()).step_by(32) {
+            acc0 = vdotq_s32(acc0, vld1q_s8(w.as_ptr().add(i)), vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i))));
+            acc1 = vdotq_s32(
+                acc1,
+                vld1q_s8(w.as_ptr().add(i + 16)),
+                vreinterpretq_s8_u8(vld1q_u8(a.as_ptr().add(i + 16))),
+            );
         }
-        vaddvq_s32(acc)
+        vaddvq_s32(vaddq_s32(acc0, acc1))
     }
     #[cfg(simd_x86)]
     unsafe {
@@ -2327,10 +2333,10 @@ fn activate<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
         for k in (0..L2).step_by(8) {
             let (a, b) = (vld1q_s32(h.as_ptr().add(k)), vld1q_s32(h.as_ptr().add(k + 4)));
             let (ca, cb) = (vmaxq_s32(vminq_s32(a, hi), lo), vmaxq_s32(vminq_s32(b, hi), lo));
-            let sa = vminq_s32(vshlq_s32(vmulq_s32(ca, ca), vdupq_n_s32(-SQ)), top);
-            let sb = vminq_s32(vshlq_s32(vmulq_s32(cb, cb), vdupq_n_s32(-SQ)), top);
-            let la = vmaxq_s32(vminq_s32(vshlq_s32(a, vdupq_n_s32(-LIN)), top), zero);
-            let lb = vmaxq_s32(vminq_s32(vshlq_s32(b, vdupq_n_s32(-LIN)), top), zero);
+            let sa = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(ca, ca)), top);
+            let sb = vminq_s32(vshrq_n_s32::<SQ>(vmulq_s32(cb, cb)), top);
+            let la = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(a), top), zero);
+            let lb = vmaxq_s32(vminq_s32(vshrq_n_s32::<LIN>(b), top), zero);
             let sq8 = vqmovn_u16(vcombine_u16(vqmovun_s32(sa), vqmovun_s32(sb)));
             let li8 = vqmovn_u16(vcombine_u16(vqmovun_s32(la), vqmovun_s32(lb)));
             vst1_u8(out.as_mut_ptr().add(k), sq8);
@@ -2352,21 +2358,26 @@ fn layer1(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
     unsafe {
         use std::arch::aarch64::*;
         // Input-group-major weights: each group of 4 activations feeds all 32
-        // outputs through 8 dot products, with no horizontal sums.
-        let mut acc = [vdupq_n_s32(0); L3 / 4];
-        for (k, a) in acc.iter_mut().enumerate() {
+        // outputs through 8 dot products, unrolled 2x into 16 accumulators.
+        let mut acc0 = [vdupq_n_s32(0); L3 / 4];
+        let mut acc1 = [vdupq_n_s32(0); L3 / 4];
+        for (k, a) in acc0.iter_mut().enumerate() {
             *a = vld1q_s32(s.b1.as_ptr().add(k * 4));
         }
-        for c in 0..2 * L2 / 4 {
-            let input = vreinterpretq_s8_u32(vdupq_n_u32(std::ptr::read_unaligned(act.as_ptr().add(c * 4) as *const u32)));
-            let w = s.w1c.get_unchecked(c).as_ptr();
-            for (k, a) in acc.iter_mut().enumerate() {
-                *a = vdotq_s32(*a, vld1q_s8(w.add(k * 16)), input);
+        let act_ptr = act.as_ptr() as *const u32;
+        for c in (0..2 * L2 / 4).step_by(2) {
+            let in0 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c)));
+            let in1 = vreinterpretq_s8_u32(vld1q_dup_u32(act_ptr.add(c + 1)));
+            let w0 = s.w1c.get_unchecked(c).as_ptr();
+            let w1 = s.w1c.get_unchecked(c + 1).as_ptr();
+            for k in 0..L3 / 4 {
+                acc0[k] = vdotq_s32(acc0[k], vld1q_s8(w0.add(k * 16)), in0);
+                acc1[k] = vdotq_s32(acc1[k], vld1q_s8(w1.add(k * 16)), in1);
             }
         }
         let mut h = [0i32; L3];
-        for (k, a) in acc.iter().enumerate() {
-            vst1q_s32(h.as_mut_ptr().add(k * 4), *a);
+        for k in 0..L3 / 4 {
+            vst1q_s32(h.as_mut_ptr().add(k * 4), vaddq_s32(acc0[k], acc1[k]));
         }
         h
     }
