@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-pub const MAX_PLY: usize = 128;
+pub const MAX_PLY: usize = 246;
 pub const MATE: i32 = 32000;
 /// Scores at or beyond this are real mates.
 pub const MATE_IN_MAX: i32 = MATE - 2 * MAX_PLY as i32;
