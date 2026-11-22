@@ -1012,6 +1012,8 @@ struct Entry {
     tp_refresh: [bool; 2],
     psq_diff_ok: [bool; 2],
     tp_diff_ok: bool,
+    /// The move that led from `ply - 1` to `ply` (`Move::NONE` for null move / root).
+    mv: Move,
     // Feature rows to add / subtract relative to the previous ply.
     // All threat + pawn-pair indices fit in u16 (THREAT_DIMS + PAIR_DIMS = 64,368).
     psq_adds: [IdxList<8>; 2],
@@ -1561,9 +1563,39 @@ const EAGER_DIFF: bool = false;
 /// (those not due a refresh).
 #[inline]
 fn compute_tp_diff(net: &Network, cur: &mut Entry, p0: &Position, p1: &Position) {
+    let mv = cur.mv;
+    if mv.is_none() {
+        for p in 0..2 {
+            if !cur.tp_refresh[p] {
+                cur.tp_adds[p].clear();
+                cur.tp_subs[p].clear();
+            }
+        }
+        cur.tp_diff_ok = true;
+        return;
+    }
     let mut added = IdxList::<MAX_THREATS>::new();
     let mut removed = IdxList::<MAX_THREATS>::new();
-    threat_changes_inc(p0, p1, &mut added, &mut removed);
+    let flag = mv.flag();
+    if THREAT_FAST_PATHS && flag != FLAG_EP && flag != FLAG_KCASTLE && flag != FLAG_QCASTLE {
+        let (from, to) = (mv.from(), mv.to());
+        let mover = p0.board[from];
+        let cap = p0.board[to];
+        let placed = p1.board[to];
+        if cap == 0 {
+            piece_threats::<_, MAX_THREATS, true>(p0, mover, from, &mut removed, &mut added, to);
+            piece_threats::<_, MAX_THREATS, true>(p1, placed, to, &mut added, &mut removed, from);
+        } else {
+            piece_threats::<_, MAX_THREATS, true>(p0, mover, from, &mut removed, &mut added, 64);
+            piece_threats::<_, MAX_THREATS, false>(p1, cap, to, &mut removed, &mut added, 64);
+            piece_threats::<_, MAX_THREATS, false>(p1, placed, to, &mut added, &mut removed, 64);
+        }
+        if FAST_PATH_CANCEL {
+            cancel_duplicates(&mut added, &mut removed);
+        }
+    } else {
+        threat_changes_inc(p0, p1, &mut added, &mut removed);
+    }
     let (w0, b0) = (p0.pieces(WHITE, PAWN), p0.pieces(BLACK, PAWN));
     let (w1, b1) = (p1.pieces(WHITE, PAWN), p1.pieces(BLACK, PAWN));
     for p in 0..2 {
@@ -1581,15 +1613,33 @@ fn compute_tp_diff(net: &Network, cur: &mut Entry, p0: &Position, p1: &Position)
 /// Piece-square rows that change from `p0` to `p1` for perspective `persp`.
 #[inline]
 fn compute_psq_diff(cur: &mut Entry, p0: &Position, p1: &Position, persp: usize) {
+    let (adds, subs) = (&mut cur.psq_adds[persp], &mut cur.psq_subs[persp]);
+    adds.clear();
+    subs.clear();
+    let mv = cur.mv;
+    if mv.is_none() {
+        cur.psq_diff_ok[persp] = true;
+        return;
+    }
     let k1 = p1.king_sq(persp);
     let block = psq_block(p1, persp);
     let base = psq_base(persp, k1, block);
     let orient = orientation(persp, k1);
-    let (adds, subs) = (&mut cur.psq_adds[persp], &mut cur.psq_subs[persp]);
-    adds.clear();
-    subs.clear();
-    // Only the squares the move touched can differ: read the old and new piece
-    // there instead of comparing all twelve piece bitboards.
+    let flag = mv.flag();
+    if flag != FLAG_EP && flag != FLAG_KCASTLE && flag != FLAG_QCASTLE {
+        let (from, to) = (mv.from(), mv.to());
+        let mover = p0.board[from];
+        let cap = p0.board[to];
+        let placed = p1.board[to];
+        subs.push((base + psq_piece_offset(persp, piece_color(mover), piece_type(mover)) + (from ^ orient)) as u32);
+        if cap != 0 {
+            subs.push((base + psq_piece_offset(persp, piece_color(cap), piece_type(cap)) + (to ^ orient)) as u32);
+        }
+        adds.push((base + psq_piece_offset(persp, piece_color(placed), piece_type(placed)) + (to ^ orient)) as u32);
+        cur.psq_diff_ok[persp] = true;
+        return;
+    }
+    // En passant or castling: scan the changed squares.
     let mut changed = (p0.by_color[0] ^ p1.by_color[0]) | (p0.by_color[1] ^ p1.by_color[1]);
     for pt in PAWN..=KING {
         changed |= p0.by_type[pt] ^ p1.by_type[pt];
@@ -1620,6 +1670,7 @@ impl NnueState {
                 tp_refresh: [true; 2],
                 psq_diff_ok: [false; 2],
                 tp_diff_ok: false,
+                mv: Move::NONE,
                 psq_adds: [IdxList::new(), IdxList::new()],
                 psq_subs: [IdxList::new(), IdxList::new()],
                 tp_adds: [IdxList16::new(), IdxList16::new()],
@@ -1664,9 +1715,9 @@ impl NnueState {
         self.threats_ply = usize::MAX;
     }
 
-    /// Register the position at `stack[j]` (reached from `stack[j - 1]`): mark
-    /// accumulator/threat state as pending so diffs are only computed if evaluated.
-    pub fn push(&mut self, stack: &[Position], j: usize) {
+    /// Register the position at `stack[j]` (reached from `stack[j - 1]` via `mv`):
+    /// mark accumulator/threat state as pending so diffs are only computed if evaluated.
+    pub fn push(&mut self, stack: &[Position], j: usize, mv: Move) {
         if let Some(s) = &mut self.small {
             return s.push(j);
         }
@@ -1678,6 +1729,13 @@ impl NnueState {
         cur.acc_ok = [false; 2];
         cur.psq_diff_ok = [false; 2];
         cur.tp_diff_ok = false;
+        cur.mv = mv;
+        if mv.is_none() {
+            // Null move: board pieces and king squares are unchanged.
+            cur.psq_refresh = [false; 2];
+            cur.tp_refresh = [false; 2];
+            return;
+        }
         for persp in 0..2 {
             let (k0, k1) = (p0.king_sq(persp), p1.king_sq(persp));
             cur.psq_refresh[persp] = k0 != k1 || psq_block(p0, persp) != psq_block(p1, persp);
@@ -1989,28 +2047,33 @@ impl NnueState {
                 && !cur.tp_refresh[0]
                 && !cur.tp_refresh[1]
             {
-                let net = &*self.net;
-                let (p0, p1) = (&stack[ply - 1], &stack[ply]);
-                if !cur.psq_diff_ok[0] {
-                    compute_psq_diff(cur, p0, p1, 0);
+                if cur.mv.is_none() {
+                    cur.acc = prev.acc;
+                    cur.acc_ok = [true, true];
+                } else {
+                    let net = &*self.net;
+                    let (p0, p1) = (&stack[ply - 1], &stack[ply]);
+                    if !cur.psq_diff_ok[0] {
+                        compute_psq_diff(cur, p0, p1, 0);
+                    }
+                    if !cur.psq_diff_ok[1] {
+                        compute_psq_diff(cur, p0, p1, 1);
+                    }
+                    if !cur.tp_diff_ok {
+                        compute_tp_diff(net, cur, p0, p1);
+                    }
+                    let mut abuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                    let mut sbuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                    let mut abuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                    let mut sbuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
+                    let adds0 = row_ptrs(net, cur.tp_adds[0].as_slice(), cur.psq_adds[0].as_slice(), &mut abuf0);
+                    let subs0 = row_ptrs(net, cur.tp_subs[0].as_slice(), cur.psq_subs[0].as_slice(), &mut sbuf0);
+                    let adds1 = row_ptrs(net, cur.tp_adds[1].as_slice(), cur.psq_adds[1].as_slice(), &mut abuf1);
+                    let subs1 = row_ptrs(net, cur.tp_subs[1].as_slice(), cur.psq_subs[1].as_slice(), &mut sbuf1);
+                    apply_ptrs(&mut cur.acc[0], &prev.acc[0], adds0, subs0);
+                    apply_ptrs(&mut cur.acc[1], &prev.acc[1], adds1, subs1);
+                    cur.acc_ok = [true, true];
                 }
-                if !cur.psq_diff_ok[1] {
-                    compute_psq_diff(cur, p0, p1, 1);
-                }
-                if !cur.tp_diff_ok {
-                    compute_tp_diff(net, cur, p0, p1);
-                }
-                let mut abuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
-                let mut sbuf0 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
-                let mut abuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
-                let mut sbuf1 = [std::mem::MaybeUninit::uninit(); TP_DIFF_LIST + 8];
-                let adds0 = row_ptrs(net, cur.tp_adds[0].as_slice(), cur.psq_adds[0].as_slice(), &mut abuf0);
-                let subs0 = row_ptrs(net, cur.tp_subs[0].as_slice(), cur.psq_subs[0].as_slice(), &mut sbuf0);
-                let adds1 = row_ptrs(net, cur.tp_adds[1].as_slice(), cur.psq_adds[1].as_slice(), &mut abuf1);
-                let subs1 = row_ptrs(net, cur.tp_subs[1].as_slice(), cur.psq_subs[1].as_slice(), &mut sbuf1);
-                apply_ptrs(&mut cur.acc[0], &prev.acc[0], adds0, subs0);
-                apply_ptrs(&mut cur.acc[1], &prev.acc[1], adds1, subs1);
-                cur.acc_ok = [true, true];
             } else {
                 for persp in 0..2 {
                     self.ensure(stack, ply, persp);

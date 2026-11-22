@@ -1526,7 +1526,7 @@ impl Searcher {
         let key = self.pos[ply + 1].key;
         self.tt.prefetch(key);
         self.keys.push(key);
-        self.nnue.push(&self.pos, ply + 1);
+        self.nnue.push(&self.pos, ply + 1, m);
         self.nodes += 1;
     }
 
@@ -1538,7 +1538,7 @@ impl Searcher {
         let key = self.pos[ply + 1].key;
         self.tt.prefetch(key);
         self.keys.push(key);
-        self.nnue.push(&self.pos, ply + 1);
+        self.nnue.push(&self.pos, ply + 1, Move::NONE);
         // Not counted as a node, as in Stockfish (only real moves are).
     }
 
@@ -2991,7 +2991,7 @@ impl ThreadResult {
 }
 
 /// Pick the thread whose result to play (Stockfish's get_best_thread). Every
-/// thread votes for its best move with its score above the lowest one plus 14;
+/// thread votes for its best move weighted by `(score - min_score + 14) * depth`;
 /// the move with the most votes wins (ties to the longer PV). A thread with a
 /// proven result is preferred, the more decisive the better.
 fn best_thread(results: &[ThreadResult]) -> usize {
@@ -3000,26 +3000,33 @@ fn best_thread(results: &[ThreadResult]) -> usize {
         return 0;
     }
     let min_score = results.iter().filter(|r| valid(r)).map(|r| r.best_score).min().unwrap_or(0);
-    let mut votes = vec![0i64; 65536];
-    for r in results.iter().filter(|r| valid(r)) {
-        votes[r.best_pv[0].0 as usize] += (r.best_score - min_score + 14) as i64;
-    }
+    let vote_for = |mv: Move| -> i64 {
+        let mut total = 0i64;
+        for r in results.iter().filter(|r| valid(r)) {
+            if r.best_pv[0] == mv {
+                total += (r.best_score - min_score + 14) as i64 * r.completed_depth as i64;
+            }
+        }
+        total
+    };
     let decisive = |s: i32| s.abs() >= MATE_BOUND;
     let mut best = 0;
+    let mut best_votes = vote_for(results[0].best_pv[0]);
     for (i, r) in results.iter().enumerate().skip(1) {
         if !valid(r) {
             continue;
         }
         let b = &results[best];
-        let (vr, vb) = (votes[r.best_pv[0].0 as usize], votes[b.best_pv[0].0 as usize]);
+        let vr = vote_for(r.best_pv[0]);
         let better = if decisive(b.best_score) {
             decisive(r.best_score) && r.best_score.abs() > b.best_score.abs()
         } else {
             decisive(r.best_score)
-                || (r.best_score > -MATE_BOUND && (vr > vb || (vr == vb && r.best_pv.len() > b.best_pv.len())))
+                || (r.best_score > -MATE_BOUND && (vr > best_votes || (vr == best_votes && r.best_pv.len() > b.best_pv.len())))
         };
         if better {
             best = i;
+            best_votes = vr;
         }
     }
     best

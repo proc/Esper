@@ -1002,7 +1002,7 @@ impl Engine {
                     moves[(rnd() % moves.len() as u64) as usize]
                 };
                 stack.push(pos.make(m));
-                inc.push(&stack, ply + 1);
+                inc.push(&stack, ply + 1, m);
                 // Evaluate only some plies so multi-ply lazy updates get exercised.
                 if !stack[ply + 1].in_check() && rnd() % 3 != 0 {
                     let a = inc.evaluate(&stack, ply + 1);
