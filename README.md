@@ -161,6 +161,7 @@ esper -t 4 bench
 | `Threads` | 1 (or `-t N`) | Search threads (Lazy SMP) |
 | `MultiPV` | 1 | Number of principal variations reported |
 | `Move Overhead` | 25 | Milliseconds held back per move for GUI and network lag |
+| `Auto Move Overhead` | true | Measure what each move really costs on the clock (from the times the GUI or server reports) and use that when it is more than `Move Overhead` |
 | `Ponder` | false | Pondering is supported through `go ponder` and `ponderhit` |
 | `UCI_ShowWDL` | false | Adds `wdl` win/draw/loss figures to `info` lines |
 | `EvalFile` | `<embedded>` | Path to another network with the same architecture |

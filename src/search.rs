@@ -1176,7 +1176,10 @@ impl Searcher {
                 if t < 1000.0 && limits.movestogo.is_none() {
                     mtg = (t * 0.05).floor().max(1.0);
                 }
-                let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
+                // With no increment nothing pays the overhead back, and a long game
+                // must not run the clock out on it: set aside enough for 80 moves.
+                let lag_moves = if inc == 0.0 && limits.movestogo.is_none() { mtg.max(80.0) } else { mtg };
+                let time_left = (t + inc * (mtg - 1.0) - overhead * (2.0 + lag_moves)).max(1.0);
                 let (mut opt_scale, max_scale);
                 if limits.movestogo.is_none() {
                     if self.orig_time_adjust < 0.0 {

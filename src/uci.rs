@@ -33,7 +33,71 @@ const BENCH_FENS: [&str; 12] = [
     "4rrk1/pp1n1pp1/q5p1/P1pP4/2n3P1/7P/1P3PB1/R1BQ1RK1 w - - 3 22",
 ];
 
+/// Learns how much clock time each move costs beyond the engine's own thinking:
+/// GUI and pipe delays, and above all network lag when playing on a server.
+///
+/// Every `go` reports our clock. Comparing it with the previous report, less the
+/// time the last search took, plus the increment, gives what the move really
+/// cost. The estimate jumps up to a new high at once and decays slowly, and
+/// replaces `Move Overhead` whenever it is the larger of the two.
+#[derive(Default)]
+struct LagMeter {
+    /// Learned cost per move in milliseconds.
+    estimate: f64,
+    /// The search in progress: our clock when it was started, our increment,
+    /// our colour, and when our clock began to run (`None` while pondering).
+    pending: Option<(u64, u64, usize, Option<Instant>)>,
+    /// After our last move: the clock we should be shown next if moving cost
+    /// nothing, and our colour.
+    expected: Option<(i64, usize)>,
+    /// The last value reported in an `info string`.
+    reported: u64,
+}
+
+impl LagMeter {
+    /// A search for `side` starts with `time` on its clock.
+    fn on_go(&mut self, side: usize, time: u64, inc: u64, started: Option<Instant>) {
+        if let Some((expected, s)) = self.expected.take() {
+            let lag = expected - time as i64;
+            // A clock well above the expected one is a new game or a clock
+            // that was not running (a server's first moves): no information.
+            if s == side && (-20..=10_000).contains(&lag) {
+                let lag = lag.max(0) as f64;
+                self.estimate = lag.max(0.85 * self.estimate + 0.15 * lag);
+            }
+        }
+        self.pending = Some((time, inc, side, started));
+    }
+
+    fn on_ponderhit(&mut self) {
+        if let Some(p) = self.pending.as_mut() {
+            p.3.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// The search's move went out.
+    fn on_bestmove(&mut self) {
+        // A ponder search that was stopped never had our clock running.
+        if let Some((time, inc, side, Some(started))) = self.pending.take() {
+            let spent = started.elapsed().as_millis() as i64;
+            self.expected = Some((time as i64 - spent + inc as i64, side));
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pending = None;
+        self.expected = None;
+    }
+
+    /// The overhead to plan with, given the `Move Overhead` option.
+    fn overhead(&self, option: u64) -> u64 {
+        // A quarter on top: lag varies from move to move.
+        option.max((self.estimate * 1.25) as u64).min(5000)
+    }
+}
+
 struct SearchTask {
+    lag: Arc<Mutex<LagMeter>>,
     pool: ThreadPool,
     pos: Position,
     keys: Vec<u64>,
@@ -75,6 +139,9 @@ pub struct Engine {
     default_threads: usize,
     multipv: usize,
     overhead: u64,
+    /// `Move Overhead` is raised to the measured cost of a move when that is higher.
+    auto_overhead: bool,
+    lag: Arc<Mutex<LagMeter>>,
     show_wdl: bool,
     contempt: i32,
     exp: Arc<Mutex<Experience>>,
@@ -135,6 +202,7 @@ impl Engine {
                     CoordCmd::Quit => break,
                     CoordCmd::Run(task) => {
                         let SearchTask {
+                            lag,
                             mut pool,
                             pos,
                             keys,
@@ -186,6 +254,7 @@ impl Engine {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                             println!("bestmove {}", r.mv.to_uci());
+                            lag.lock().unwrap().on_bestmove();
                         } else {
                             if !silent {
                                 if let Some(entry) = exp.lock().unwrap().probe(pos.key) {
@@ -226,6 +295,7 @@ impl Engine {
                                 } else {
                                     println!("bestmove {} ponder {}", best.to_uci(), ponder.to_uci());
                                 }
+                                lag.lock().unwrap().on_bestmove();
                             }
                             if exp_write && !silent && pool.main.completed_depth >= 6 && !best.is_none() {
                                 let target = if exp_file.is_empty() { "esper.exp" } else { exp_file.as_str() };
@@ -258,6 +328,8 @@ impl Engine {
             default_threads: 1,
             multipv: 1,
             overhead: 25,
+            auto_overhead: true,
+            lag: Arc::new(Mutex::new(LagMeter::default())),
             show_wdl: false,
             contempt: 0,
             exp: Arc::new(Mutex::new(Experience::empty())),
@@ -390,10 +462,33 @@ impl Engine {
                     Some(p) => println!("bestmove {} ponder {}", m.to_uci(), p.to_uci()),
                     None => println!("bestmove {}", m.to_uci()),
                 }
+                if let Some(t) = limits.time[self.pos.stm] {
+                    let mut lag = self.lag.lock().unwrap();
+                    lag.on_go(self.pos.stm, t, limits.inc[self.pos.stm], limits.received);
+                    lag.on_bestmove();
+                }
                 return;
             }
         }
-        self.start_search(limits, false);
+        // The previous search must be over before this one is registered.
+        self.stop();
+        let mut overhead = self.overhead;
+        {
+            let us = self.pos.stm;
+            let mut lag = self.lag.lock().unwrap();
+            match limits.time[us] {
+                Some(t) => lag.on_go(us, t, limits.inc[us], (!limits.ponder).then_some(limits.received.unwrap())),
+                None => lag.reset(),
+            }
+            if self.auto_overhead {
+                overhead = lag.overhead(self.overhead);
+                if overhead.abs_diff(lag.reported.max(self.overhead)) >= 10 {
+                    lag.reported = overhead;
+                    println!("info string measured move overhead {overhead} ms");
+                }
+            }
+        }
+        self.start_search_with(limits, false, overhead);
     }
 
     /// Load the book named by `BookFile` if it is not loaded yet.
@@ -444,6 +539,10 @@ impl Engine {
     }
 
     fn start_search(&mut self, limits: Limits, silent: bool) {
+        self.start_search_with(limits, silent, self.overhead)
+    }
+
+    fn start_search_with(&mut self, limits: Limits, silent: bool, overhead: u64) {
         self.stop();
         self.shared.stop.0.store(false, Relaxed);
         self.shared.pondering.0.store(limits.ponder, Relaxed);
@@ -453,7 +552,8 @@ impl Engine {
             keys: self.keys.clone(),
             limits,
             multipv: self.multipv,
-            overhead: self.overhead,
+            overhead,
+            lag: self.lag.clone(),
             tb_cfg: self.tb,
             show_wdl: self.show_wdl,
             contempt: self.contempt * search::NORMALIZE_PAWN / 100,
@@ -515,6 +615,7 @@ impl Engine {
                     self.overhead = n.min(5000);
                 }
             }
+            "auto move overhead" => self.auto_overhead = value.trim().eq_ignore_ascii_case("true"),
             "uci_showwdl" => self.show_wdl = value.trim().eq_ignore_ascii_case("true"),
             "contempt" => {
                 if let Ok(n) = value.parse::<i32>() {
@@ -619,6 +720,7 @@ impl Engine {
     /// zeroing potentially gigabytes of RAM synchronously, and clears history tables.
     fn uci_new_game(&mut self) {
         self.stop();
+        self.lag.lock().unwrap().reset();
         self.tt.new_search();
         if let Some(pool) = self.pool.as_mut() {
             pool.clear();
@@ -932,6 +1034,7 @@ impl Engine {
                 println!("option name Threads type spin default {} min 1 max 512", self.default_threads);
                 println!("option name MultiPV type spin default 1 min 1 max 256");
                 println!("option name Move Overhead type spin default 25 min 0 max 5000");
+                println!("option name Auto Move Overhead type check default true");
                 println!("option name Ponder type check default false");
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name Contempt type spin default 0 min -100 max 100");
@@ -959,7 +1062,10 @@ impl Engine {
             }
             "go" => self.go(args),
             "stop" => self.stop(),
-            "ponderhit" => self.shared.pondering.0.store(false, Relaxed),
+            "ponderhit" => {
+                self.lag.lock().unwrap().on_ponderhit();
+                self.shared.pondering.0.store(false, Relaxed)
+            }
             "setoption" => self.set_option(args),
             "quit" => {
                 self.stop();
