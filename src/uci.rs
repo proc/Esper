@@ -9,6 +9,7 @@ use crate::search::{self, Limits, Shared, ThreadPool};
 use crate::tb::{self, TbConfig};
 use crate::tt::{BOUND_EXACT, TT};
 use std::io::BufRead;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -112,6 +113,23 @@ struct SearchTask {
     exp_write: bool,
     silent: bool,
     shared: Arc<Shared>,
+    /// A book move (and its book reply) to play if a short search does not refute it.
+    book: Option<(Move, Option<Move>)>,
+    /// Set by `stop`: skip what is left of the book check.
+    cancel: Arc<AtomicBool>,
+}
+
+/// A book move is dropped when a short search scores it this much (centipawns)
+/// below the move the search prefers.
+const BOOK_CHECK_MARGIN: i32 = 50;
+
+/// How long each of the two book-check searches may take.
+fn book_check_ms(limits: &Limits, stm: usize) -> u64 {
+    match (limits.time[stm], limits.movetime) {
+        (Some(t), _) => ((t + 40 * limits.inc[stm]) / 250).clamp(20, 1500).min(t / 20).max(1),
+        (None, Some(mt)) => (mt / 4).max(1),
+        _ => 300,
+    }
 }
 
 enum CoordCmd {
@@ -157,6 +175,9 @@ pub struct Engine {
     book_best: bool,
     /// Last move number played from the book; 0 means no limit.
     book_depth: u32,
+    /// Check each book move with a short search before playing it.
+    book_check: bool,
+    cancel: Arc<AtomicBool>,
     /// The `Ponder` option (time management plans a little more when it is on).
     ponder_opt: bool,
 }
@@ -217,8 +238,47 @@ impl Engine {
                             exp_write,
                             silent,
                             shared,
+                            book,
+                            cancel,
                         } = *task;
-                        let mut root_tb = if !silent && multipv == 1 && limits.searchmoves.is_empty() {
+                        // A book move is played only if a short search finds nothing
+                        // clearly better: books built from game statistics hold blunders.
+                        let mut book_played = false;
+                        if let Some((bm, bp)) = book {
+                            let ms = book_check_ms(&limits, pos.stm);
+                            let mut probe = Limits { movetime: Some(ms), ..Limits::default() };
+                            let (best, ..) =
+                                pool.run(&pos, &keys, &probe, 1, 0, tb_cfg, true, show_wdl, contempt, &shared);
+                            let top = pool.main.best_score;
+                            let mut keep = best == bm || cancel.load(Relaxed);
+                            if !keep {
+                                shared.stop.0.store(false, Relaxed);
+                                probe.searchmoves = vec![bm];
+                                pool.run(&pos, &keys, &probe, 1, 0, tb_cfg, true, show_wdl, contempt, &shared);
+                                let gap = (top - pool.main.best_score) * 100 / search::NORMALIZE_PAWN;
+                                keep = gap <= BOOK_CHECK_MARGIN || cancel.load(Relaxed);
+                                if !keep {
+                                    println!(
+                                        "info string book move {} rejected: {} is {} cp better",
+                                        to_san(&pos, bm),
+                                        to_san(&pos, best),
+                                        gap
+                                    );
+                                }
+                            }
+                            if keep {
+                                println!("info string book move {}", to_san(&pos, bm));
+                                match bp {
+                                    Some(p) => println!("bestmove {} ponder {}", bm.to_uci(), p.to_uci()),
+                                    None => println!("bestmove {}", bm.to_uci()),
+                                }
+                                lag.lock().unwrap().on_bestmove();
+                                book_played = true;
+                            } else {
+                                shared.stop.0.store(false, Relaxed);
+                            }
+                        }
+                        let mut root_tb = if !book_played && !silent && multipv == 1 && limits.searchmoves.is_empty() {
                             tb::probe_root(&pos, &tb_cfg)
                         } else {
                             None
@@ -230,7 +290,8 @@ impl Engine {
                             }
                         }
                         let hold = limits.infinite;
-                        if let Some(r) = root_tb {
+                        if book_played {
+                        } else if let Some(r) = root_tb {
                             let outcome = tb::outcome(r.wdl, &tb_cfg);
                             let score = match outcome {
                                 1 => search::TB_CP - r.dtz as i32,
@@ -260,7 +321,7 @@ impl Engine {
                                 if let Some(entry) = exp.lock().unwrap().probe(pos.key) {
                                     if entry.depth >= 8 && pos.is_pseudo_legal(entry.mv) {
                                         pool.main.tt.store(
-                                            pos.key,
+                                            pos.tt_key(),
                                             entry.mv,
                                             entry.score as i32,
                                             search::NONE,
@@ -341,6 +402,8 @@ impl Engine {
             book: None,
             book_best: false,
             book_depth: 0,
+            book_check: true,
+            cancel: Arc::new(AtomicBool::new(false)),
             ponder_opt: false,
         };
         e.rebuild_searchers();
@@ -374,6 +437,7 @@ impl Engine {
     }
 
     fn stop(&mut self) {
+        self.cancel.store(true, Relaxed);
         self.shared.stop.0.store(true, Relaxed);
         self.shared.pondering.0.store(false, Relaxed);
         self.wait();
@@ -452,22 +516,27 @@ impl Engine {
             }
             i += 1;
         }
+        let mut book = None;
         if self.own_book && !limits.ponder && !limits.infinite && limits.searchmoves.is_empty() {
             if let Some(m) = self.book_move() {
                 let next = self.pos.make(m);
                 let seen = |key: u64| key == next.key || self.keys.contains(&key);
                 let ponder = self.book.as_ref().and_then(|b| b.probe(&next, true, |p| !seen(next.make(p).key)));
-                println!("info string book move {}", to_san(&self.pos, m));
-                match ponder {
-                    Some(p) => println!("bestmove {} ponder {}", m.to_uci(), p.to_uci()),
-                    None => println!("bestmove {}", m.to_uci()),
+                if self.book_check {
+                    book = Some((m, ponder));
+                } else {
+                    println!("info string book move {}", to_san(&self.pos, m));
+                    match ponder {
+                        Some(p) => println!("bestmove {} ponder {}", m.to_uci(), p.to_uci()),
+                        None => println!("bestmove {}", m.to_uci()),
+                    }
+                    if let Some(t) = limits.time[self.pos.stm] {
+                        let mut lag = self.lag.lock().unwrap();
+                        lag.on_go(self.pos.stm, t, limits.inc[self.pos.stm], limits.received);
+                        lag.on_bestmove();
+                    }
+                    return;
                 }
-                if let Some(t) = limits.time[self.pos.stm] {
-                    let mut lag = self.lag.lock().unwrap();
-                    lag.on_go(self.pos.stm, t, limits.inc[self.pos.stm], limits.received);
-                    lag.on_bestmove();
-                }
-                return;
             }
         }
         // The previous search must be over before this one is registered.
@@ -488,7 +557,7 @@ impl Engine {
                 }
             }
         }
-        self.start_search_with(limits, false, overhead);
+        self.start_search_with(limits, false, overhead, book);
     }
 
     /// Load the book named by `BookFile` if it is not loaded yet.
@@ -539,11 +608,18 @@ impl Engine {
     }
 
     fn start_search(&mut self, limits: Limits, silent: bool) {
-        self.start_search_with(limits, silent, self.overhead)
+        self.start_search_with(limits, silent, self.overhead, None)
     }
 
-    fn start_search_with(&mut self, limits: Limits, silent: bool, overhead: u64) {
+    fn start_search_with(
+        &mut self,
+        limits: Limits,
+        silent: bool,
+        overhead: u64,
+        book: Option<(Move, Option<Move>)>,
+    ) {
         self.stop();
+        self.cancel.store(false, Relaxed);
         self.shared.stop.0.store(false, Relaxed);
         self.shared.pondering.0.store(limits.ponder, Relaxed);
         let task = Box::new(SearchTask {
@@ -562,6 +638,8 @@ impl Engine {
             exp_write: self.exp_write,
             silent,
             shared: self.shared.clone(),
+            book,
+            cancel: self.cancel.clone(),
         });
         let (lock, cv) = &*self.coord;
         let mut guard = lock.lock().unwrap();
@@ -694,6 +772,7 @@ impl Engine {
                     self.ensure_book();
                 }
             }
+            "bookcheck" => self.book_check = value.trim().eq_ignore_ascii_case("true"),
             "bookbestmove" => self.book_best = value.trim().eq_ignore_ascii_case("true"),
             "bookdepth" => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -1048,6 +1127,7 @@ impl Engine {
                 println!("option name OwnBook type check default false");
                 println!("option name BookFile type string default {}", book::EMBEDDED_NAME);
                 println!("option name BookBestMove type check default false");
+                println!("option name BookCheck type check default true");
                 println!("option name BookDepth type spin default 0 min 0 max 1000");
                 println!("option name Clear Hash type button");
                 crate::tune::print_uci_options();

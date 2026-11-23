@@ -208,6 +208,15 @@ pub struct Position {
     pub fullmove: u16,
 }
 
+#[inline(always)]
+fn key50(rule50: u32) -> u64 {
+    if rule50 < 14 {
+        0
+    } else {
+        (((rule50 - 14) / 8) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29) << 1
+    }
+}
+
 impl Position {
     pub fn empty() -> Position {
         Position {
@@ -397,6 +406,21 @@ impl Position {
         p
     }
 
+    /// Hash-table key: the position key with the fifty-move counter mixed in
+    /// once it matters (Stockfish), so scores and evals damped for one counter
+    /// are not reused at a very different one.
+    #[inline(always)]
+    pub fn tt_key(&self) -> u64 {
+        self.key ^ key50(self.rule50 as u32)
+    }
+
+    /// `tt_key` of the position after `m`.
+    #[inline(always)]
+    pub fn tt_key_after(&self, m: Move) -> u64 {
+        let resets = m.is_capture() || piece_type(self.board[m.from()]) == PAWN;
+        self.key_after(m) ^ if resets { 0 } else { key50(self.rule50 as u32 + 1) }
+    }
+
     /// Zobrist key of the position after playing `m`, without updating check/pin info.
     #[inline]
     pub fn key_after(&self, m: Move) -> u64 {
@@ -438,7 +462,7 @@ impl Position {
             p.ep = NO_SQ;
         }
         p.stm ^= 1;
-        p.rule50 = self.rule50.saturating_add(1);
+        // The fifty-move counter is left alone, as in Stockfish.
         p.plies_from_null = 0;
         p.update_check_info();
         p

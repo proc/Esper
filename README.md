@@ -173,6 +173,7 @@ esper -t 4 bench
 | `BookFile` | `<embedded>` | The built-in book, or the path of any Polyglot `.bin` book |
 | `BookBestMove` | false | Always play the most heavily weighted book move instead of choosing at random by weight |
 | `BookDepth` | 0 | Last move number taken from the book; 0 means no limit |
+| `BookCheck` | true | Check each book move with a short search first, and think normally instead when the search finds a move at least 50 centipawns better |
 | `Clear Hash` | | Clears the hash table and the history tables |
 
 `go` understands `wtime`, `btime`, `winc`, `binc`, `movestogo`, `depth`, `nodes`,
@@ -283,8 +284,11 @@ safeguard: under a second on the clock it never plans to use more than half of i
 ### Opening book
 
 The book is off by default; `setoption name OwnBook value true` turns it on.
-While the position is in the book, `go` answers at once with a book move (and a
-book reply as the ponder move) instead of searching. `go infinite`, `go ponder`
+While the position is in the book, `go` answers with a book move (and a book
+reply as the ponder move) after a short check instead of a full search. The
+check (`BookCheck`) searches the position briefly, and if the search prefers
+another move by 50 centipawns or more the book move is dropped and the engine
+thinks as usual. `go infinite`, `go ponder`
 and `go searchmoves` always search. Moves are drawn at random in proportion to
 their weights unless `BookBestMove` is set.
 

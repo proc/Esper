@@ -75,6 +75,13 @@ const DEEPER_PLY_GUARD: bool = false;
 const TM_RESEARCH_FIRST: bool = true;
 /// Cut a stable iteration short once twice the planned time has passed.
 const TM_SOFT_STOP: bool = true;
+/// The most one move may take, as a multiple of its planned time and as a share
+/// of the clock (sudden death and increment games).
+const MAX_OVER_PLAN: f64 = 3.0;
+const MAX_CLOCK_SHARE: f64 = 0.05;
+/// A deeper pass is started only while less than this share of the move's
+/// budget is used.
+const NEXT_PASS_ROOM: f64 = 0.62;
 /// Stockfish's time allocation and stopping rule (with a fixed clock reserve)
 /// instead of the snappy scheme.
 const SF_TIME_MANAGEMENT: bool = true;
@@ -1202,7 +1209,14 @@ impl Searcher {
                     opt_scale *= 1.0 + 0.9 * advantage.min(0.0);
                 }
                 let mut soft = (opt_scale * time_left).max(1.0);
-                let hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
+                let mut hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
+                // Stockfish lets one move run to almost seven times its planned
+                // time, which can be a quarter of the clock. Without a move count
+                // to reach, no single move is worth that: at most three times the
+                // plan, and never more than 5% of the clock plus the increment.
+                if limits.movestogo.is_none() {
+                    hard = hard.min(MAX_OVER_PLAN * soft).min((MAX_CLOCK_SHARE * t + inc).max(soft));
+                }
                 // The engine, GUI and OS can all stall for a few milliseconds:
                 // always leave the reserve on the clock.
                 let hard = hard.min(t - reserve as f64).max(1.0);
@@ -1512,7 +1526,7 @@ impl Searcher {
     fn prefetch_after(&self, pos: &Position, m: Move) {
         let f = m.flag();
         if EARLY_TT_PREFETCH && !(f == FLAG_EP || f == FLAG_KCASTLE || f == FLAG_QCASTLE || m.is_promo()) {
-            self.tt.prefetch(pos.key_after(m));
+            self.tt.prefetch(pos.tt_key_after(m));
         }
     }
 
@@ -1524,7 +1538,7 @@ impl Searcher {
         self.ss[ply].cont_block = 2 * self.pos[ply].in_check() as usize + m.is_capture_stage() as usize;
         self.pos[ply + 1] = self.pos[ply].make(m);
         let key = self.pos[ply + 1].key;
-        self.tt.prefetch(key);
+        self.tt.prefetch(self.pos[ply + 1].tt_key());
         self.keys.push(key);
         self.nnue.push(&self.pos, ply + 1, m);
         self.nodes += 1;
@@ -1536,7 +1550,7 @@ impl Searcher {
         self.ss[ply].cont = NO_CONT;
         self.pos[ply + 1] = self.pos[ply].make_null();
         let key = self.pos[ply + 1].key;
-        self.tt.prefetch(key);
+        self.tt.prefetch(self.pos[ply + 1].tt_key());
         self.keys.push(key);
         self.nnue.push(&self.pos, ply + 1, Move::NONE);
         // Not counted as a node, as in Stockfish (only real moves are).
@@ -1549,7 +1563,7 @@ impl Searcher {
         if depth < 7 || tt_move.is_none() || tt_score.abs() >= MATE_BOUND || !pos.is_legal(tt_move) {
             return true;
         }
-        match self.tt.probe(pos.key_after(tt_move)) {
+        match self.tt.probe(pos.tt_key_after(tt_move)) {
             Some(t) if t.bound != 0 && t.score != NONE => (tt_score >= beta) == (-t.score >= beta),
             _ => true,
         }
@@ -1721,7 +1735,7 @@ impl Searcher {
             }
         }
 
-        let tte = self.tt.probe(pos.key);
+        let tte = self.tt.probe(pos.tt_key());
         let mut tt_move = Move::NONE;
         let mut tt_score = NONE;
         let tt_pv = tte.is_some_and(|t| t.pv);
@@ -1762,7 +1776,7 @@ impl Searcher {
                 // Lean the stand-pat score toward beta.
                 best = (441 * best + 583 * beta) / 1024;
                 if tte.is_none() {
-                    self.tt.store(pos.key, Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, BOUND_LOWER, false);
+                    self.tt.store(pos.tt_key(), Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, BOUND_LOWER, false);
                 }
                 return best;
             }
@@ -1856,7 +1870,7 @@ impl Searcher {
             best = (462 * best + 562 * beta) / 1024;
         }
         let bound = if best >= beta { BOUND_LOWER } else { BOUND_UPPER };
-        self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
+        self.tt.store(pos.tt_key(), best_move, score_to_tt(best, ply), raw_eval, 0, bound, tt_pv);
         best
     }
 
@@ -1934,7 +1948,7 @@ impl Searcher {
 
         // The hash table is probed in singular (excluded-move) searches too; only the
         // cutoff is skipped there, and the PV flag carries over from the outer visit.
-        let tte = self.tt.probe(pos.key);
+        let tte = self.tt.probe(pos.tt_key());
         self.ss[ply].tt_hit = tte.is_some();
         let mut tt_move = Move::NONE;
         let mut tt_score = NONE;
@@ -1979,7 +1993,7 @@ impl Searcher {
             };
             // Save the evaluation for the next visit even if nothing else gets stored.
             if SF_EVAL_STORE && tte.is_none() {
-                self.tt.store(pos.key, Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, 0, tt_pv);
+                self.tt.store(pos.tt_key(), Move::NONE, NONE, raw_eval, DEPTH_UNSEARCHED, 0, tt_pv);
             }
             let corr = if SF_CORRECTION { corr_raw / 131072 } else { self.correction(&self.pos[ply]) };
             static_eval = (raw_eval + corr).clamp(-MATE_BOUND + 1, MATE_BOUND - 1);
@@ -2082,7 +2096,7 @@ impl Searcher {
                     || (bound == BOUND_UPPER && v <= alpha)
                 {
                     let d = (depth + 6).min(MAX_PLY as i32 - 1);
-                    self.tt.store(pos.key, Move::NONE, score_to_tt(v, ply), NONE, d, bound, tt_pv);
+                    self.tt.store(pos.tt_key(), Move::NONE, score_to_tt(v, ply), NONE, d, bound, tt_pv);
                     return v;
                 }
                 // In PV nodes keep searching for the line, bounded by the verdict.
@@ -2227,7 +2241,7 @@ impl Searcher {
                         return 0;
                     }
                     if v >= pc_beta {
-                        self.tt.store(pos.key, m, score_to_tt(v, ply), raw_eval, pc_depth + 1, BOUND_LOWER, tt_pv);
+                        self.tt.store(pos.tt_key(), m, score_to_tt(v, ply), raw_eval, pc_depth + 1, BOUND_LOWER, tt_pv);
                         if v.abs() < MATE_BOUND {
                             return v - (pc_beta - beta);
                         }
@@ -2421,6 +2435,9 @@ impl Searcher {
                 if self.stopped {
                     return 0;
                 }
+                // The excluded search may have marked this node as on the PV (Stockfish
+                // keeps the flag in the stack, so it sees the change).
+                tt_pv = self.ss[ply].tt_pv;
                 if v < s_beta {
                     let corr_adj = corr_raw.abs() / 198368;
                     let deep = (ply as i32 > self.root_depth) as i32;
@@ -2697,7 +2714,7 @@ impl Searcher {
                 BOUND_UPPER
             };
             let d = if move_count != 0 { depth } else { (depth + 6).min(MAX_PLY as i32 - 1) };
-            self.tt.store(pos.key, best_move, score_to_tt(best, ply), raw_eval, d, bound, tt_pv);
+            self.tt.store(pos.tt_key(), best_move, score_to_tt(best, ply), raw_eval, d, bound, tt_pv);
         }
         // Correction history: update when the result lies on the side of the static
         // eval that the outcome (a best move or none) says it should.
@@ -2810,6 +2827,7 @@ impl Searcher {
                 let mut alpha = (avg as i64 - delta as i64).max(-INF as i64) as i32;
                 let mut beta = (avg as i64 + delta as i64).min(INF as i64) as i32;
                 let mut fail_highs = 0;
+                let mut failed_high: Option<(Move, Move)> = None;
                 if pv_idx == 0 {
                     self.fail_high_recovery = (self.fail_high_recovery - 2).max(0);
                 }
@@ -2839,6 +2857,11 @@ impl Searcher {
                         if TM_RESEARCH_FIRST && self.pv_len[0] > 0 {
                             self.root_move = self.pv[0][0];
                         }
+                        // It also becomes the move to play if the re-search is cut short
+                        // (Stockfish sorts it to the front before checking for a stop).
+                        if pv_idx == 0 && self.pv_len[0] > 0 {
+                            failed_high = Some((self.pv[0][0], if self.pv_len[0] > 1 { self.pv[0][1] } else { Move::NONE }));
+                        }
                     } else {
                         break s;
                     }
@@ -2857,6 +2880,9 @@ impl Searcher {
                     if pv_idx == 0 && self.completed_depth > 0 && self.pv_len[0] > 0 {
                         self.best_move = self.pv[0][0];
                         self.ponder_move = if self.pv_len[0] > 1 { self.pv[0][1] } else { Move::NONE };
+                    } else if let Some((m, reply)) = failed_high {
+                        self.best_move = m;
+                        self.ponder_move = reply;
                     }
                     break;
                 }
@@ -2920,7 +2946,8 @@ impl Searcher {
                 let high_effort = interpolate(effort, 75800.0, 104510.0, 0.969, 0.714).clamp(0.693, 0.838);
                 let mut total = self.soft_ms as f64 * falling * reduction * instability * high_effort;
                 if root_moves.len() == 1 {
-                    total = total.min(if SF_TIME_MANAGEMENT { 500.0 } else { 100.0 });
+                    // A forced move needs no thought, only a reply to ponder on.
+                    total = total.min((self.soft_ms as f64 * 0.1).clamp(1.0, 100.0));
                 }
                 if !SF_TIME_MANAGEMENT {
                     self.soft_deadline = (1.15 * total).min(self.hard_ms as f64) as u64;
@@ -2930,7 +2957,9 @@ impl Searcher {
                     effort / 1000.0
                 );
                 let elapsed = self.start.elapsed().as_millis() as f64;
-                let stop_limit = if SF_TIME_MANAGEMENT || self.iter_unstable { total } else { total * 0.65 };
+                // The next pass costs about as much as everything so far, so one
+                // begun late overruns the budget: start it only with room to finish.
+                let stop_limit = if SF_TIME_MANAGEMENT { total * NEXT_PASS_ROOM } else if self.iter_unstable { total } else { total * 0.65 };
                 if elapsed > stop_limit.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
                     || lines[0].score == -(MATE - 2)
@@ -3258,7 +3287,7 @@ impl ThreadPool {
         // Without a reply in the PV, take one from the hash table (Stockfish).
         if self.main.ponder_move.is_none() && !self.main.best_move.is_none() {
             let next = self.main.pos[0].make(self.main.best_move);
-            if let Some(t) = self.main.tt.probe(next.key) {
+            if let Some(t) = self.main.tt.probe(next.tt_key()) {
                 if !t.mv.is_none() && next.is_pseudo_legal(t.mv) && next.is_legal(t.mv) {
                     self.main.ponder_move = t.mv;
                 }
