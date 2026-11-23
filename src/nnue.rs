@@ -576,6 +576,18 @@ fn prefetch_tile_ptr(p: *const i8, off: usize) {
     }
 }
 
+/// The whole 512-byte tile the AVX-512 kernels read next from a weight row.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_tile512_ptr(p: *const i8, off: usize) {
+    unsafe {
+        use std::arch::x86_64::*;
+        for line in 0..8 {
+            _mm_prefetch(p.add(off + line * 64), _MM_HINT_T0);
+        }
+    }
+}
+
 #[inline(always)]
 fn prefetch_row(row: &[u8; L1]) {
     #[cfg(target_arch = "aarch64")]
@@ -1229,12 +1241,17 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
     unsafe {
         let mut off = 0;
         while off < L1 {
+            let next_off = off + TILE;
+            let do_pf = next_off < L1;
             let mut regs = [_mm512_setzero_si512(); REGS];
             let s = src.0.as_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm512_loadu_si512(s.add(k * 32) as *const _);
             }
             for &p in adds {
+                if do_pf {
+                    prefetch_tile512_ptr(p, next_off);
+                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1242,6 +1259,9 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
                 }
             }
             for &p in subs {
+                if do_pf {
+                    prefetch_tile512_ptr(p, next_off);
+                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1252,7 +1272,7 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
             for (k, r) in regs.iter().enumerate() {
                 _mm512_storeu_si512(d.add(k * 32) as *mut _, *r);
             }
-            off += TILE;
+            off = next_off;
         }
     }
 }
@@ -1453,12 +1473,17 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
     unsafe {
         let mut off = 0;
         while off < L1 {
+            let next_off = off + TILE;
+            let do_pf = next_off < L1;
             let mut regs = [_mm512_setzero_si512(); REGS];
             let c = cache.0.as_mut_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm512_loadu_si512(c.add(k * 32) as *const _);
             }
             for &p in padds {
+                if do_pf {
+                    prefetch_tile512_ptr(p, next_off);
+                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1466,6 +1491,9 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
                 }
             }
             for &p in psubs {
+                if do_pf {
+                    prefetch_tile512_ptr(p, next_off);
+                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1478,6 +1506,9 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
                 }
             }
             for &p in tadds {
+                if do_pf {
+                    prefetch_tile512_ptr(p, next_off);
+                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1488,7 +1519,7 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
             for (k, r) in regs.iter().enumerate() {
                 _mm512_storeu_si512(d.add(k * 32) as *mut _, *r);
             }
-            off += TILE;
+            off = next_off;
         }
     }
 }
@@ -2362,6 +2393,67 @@ unsafe fn dot_avx2(a: &[u8], w: &[i8]) -> i32 {
     _mm_cvtsi128_si32(s)
 }
 
+/// AVX-512 dot product and second layer, with (`$vnni`) or without the VNNI
+/// dot-product instruction.
+#[cfg(target_arch = "x86_64")]
+macro_rules! tail_avx512_fns {
+    ($dot:ident, $layer1:ident, $features:literal, $vnni:literal) => {
+        #[target_feature(enable = $features)]
+        #[inline]
+        unsafe fn $dot(a: &[u8], w: &[i8]) -> i32 {
+            use std::arch::x86_64::*;
+            debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
+            let ones = _mm512_set1_epi16(1);
+            let mut acc = _mm512_setzero_si512();
+            for i in (0..a.len()).step_by(64) {
+                let x = _mm512_loadu_si512(a.as_ptr().add(i) as *const _);
+                let y = _mm512_loadu_si512(w.as_ptr().add(i) as *const _);
+                if $vnni {
+                    acc = _mm512_dpbusd_epi32(acc, x, y);
+                } else {
+                    // 2 * 127 * 128 fits i16, so the pairwise sum never saturates.
+                    acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(x, y), ones));
+                }
+            }
+            _mm512_reduce_add_epi32(acc)
+        }
+
+        /// Input-group-major weights (`w1c`): each group of four activations is
+        /// broadcast once and feeds all 32 outputs, so no horizontal sums are needed.
+        #[target_feature(enable = $features)]
+        #[inline]
+        unsafe fn $layer1(s: &LayerStack, act: &[u8; 2 * L2]) -> [i32; L3] {
+            use std::arch::x86_64::*;
+            let ones = _mm512_set1_epi16(1);
+            let mut acc = [_mm512_setzero_si512(); L3 / 16];
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a = _mm512_loadu_si512(s.b1.as_ptr().add(k * 16) as *const _);
+            }
+            for c in 0..2 * L2 / 4 {
+                let input = _mm512_set1_epi32(std::ptr::read_unaligned(act.as_ptr().add(c * 4) as *const i32));
+                let w = s.w1c.get_unchecked(c).as_ptr();
+                for (k, a) in acc.iter_mut().enumerate() {
+                    let wv = _mm512_loadu_si512(w.add(k * 64) as *const _);
+                    if $vnni {
+                        *a = _mm512_dpbusd_epi32(*a, input, wv);
+                    } else {
+                        *a = _mm512_add_epi32(*a, _mm512_madd_epi16(_mm512_maddubs_epi16(input, wv), ones));
+                    }
+                }
+            }
+            let mut h = [0i32; L3];
+            for (k, a) in acc.iter().enumerate() {
+                _mm512_storeu_si512(h.as_mut_ptr().add(k * 16) as *mut _, *a);
+            }
+            h
+        }
+    };
+}
+#[cfg(target_arch = "x86_64")]
+tail_avx512_fns!(dot_avx512, layer1_avx512, "avx2,avx512f,avx512bw", false);
+#[cfg(target_arch = "x86_64")]
+tail_avx512_fns!(dot_avx512_vnni, layer1_avx512_vnni, "avx2,avx512f,avx512bw,avx512vnni", true);
+
 #[inline(always)]
 unsafe fn dot_scalar(a: &[u8], w: &[i8]) -> i32 {
     debug_assert!(a.len() == w.len() && a.len() % 64 == 0);
@@ -2395,6 +2487,26 @@ unsafe fn activate_neon<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut 
         let li8 = vqmovn_u16(vcombine_u16(vqmovun_s32(la), vqmovun_s32(lb)));
         vst1_u8(out.as_mut_ptr().add(k), sq8);
         vst1_u8(out.as_mut_ptr().add(L2 + k), li8);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw")]
+#[inline]
+unsafe fn activate_avx512<const SQ: i32, const LIN: i32>(h: &[i32; L2], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+    debug_assert!(out.len() >= 2 * L2);
+    let (lo, hi) = (_mm512_set1_epi32(-16384), _mm512_set1_epi32(16384));
+    let (top, zero) = (_mm512_set1_epi32(127), _mm512_setzero_si512());
+    let (sq, lin) = (_mm_cvtsi32_si128(SQ), _mm_cvtsi32_si128(LIN));
+    for k in (0..L2).step_by(16) {
+        let a = _mm512_loadu_si512(h.as_ptr().add(k) as *const _);
+        let c = _mm512_max_epi32(_mm512_min_epi32(a, hi), lo);
+        let s = _mm512_min_epi32(_mm512_sra_epi32(_mm512_mullo_epi32(c, c), sq), top);
+        let l = _mm512_max_epi32(_mm512_min_epi32(_mm512_sra_epi32(a, lin), top), zero);
+        // Both are within 0..=127, so the narrowing to bytes is exact.
+        _mm_storeu_si128(out.as_mut_ptr().add(k) as *mut __m128i, _mm512_cvtepi32_epi8(s));
+        _mm_storeu_si128(out.as_mut_ptr().add(L2 + k) as *mut __m128i, _mm512_cvtepi32_epi8(l));
     }
 }
 
@@ -2647,12 +2759,12 @@ forward_fn!(
 forward_fn!(
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
-    forward_avx512_vnni: transform_avx512, layer0_avx512_vnni, activate_scalar, layer1_avx2, dot_avx2
+    forward_avx512_vnni: transform_avx512, layer0_avx512_vnni, activate_avx512, layer1_avx512_vnni, dot_avx512_vnni
 );
 forward_fn!(
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,avx512f,avx512bw")]
-    forward_avx512: transform_avx512, layer0_avx512, activate_scalar, layer1_avx2, dot_avx2
+    forward_avx512: transform_avx512, layer0_avx512, activate_avx512, layer1_avx512, dot_avx512
 );
 forward_fn!(
     #[cfg(target_arch = "x86_64")]
@@ -2704,6 +2816,73 @@ fn layer_stack(pos: &Position) -> usize {
     let officers = |c: usize| popcount(pos.by_color[c] & !(pos.by_type[PAWN] | pos.by_type[KING]));
     let many = (officers(WHITE).max(officers(BLACK)) >= 2) as usize;
     ((band * 4 + queens) * 3 + layout) * 2 + many
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_tests {
+    use super::*;
+
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The AVX-512 dot product, second layer and activation give exactly the
+    /// portable code's results. Skipped on CPUs without AVX-512.
+    #[test]
+    fn avx512_kernels_match_scalar() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx2")) {
+            return;
+        }
+        let vnni = is_x86_feature_detected!("avx512vnni");
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut s: Box<LayerStack> = unsafe { Box::new(std::mem::zeroed()) };
+        for round in 0..200 {
+            for o in 0..L3 {
+                s.b1[o] = (rng(&mut st) % 20001) as i32 - 10000;
+                for i in 0..2 * L2 {
+                    // Round 0 uses the extreme weights and activations.
+                    s.w1[o][i] = if round == 0 { if (o + i) % 2 == 0 { -128 } else { 127 } } else { rng(&mut st) as i8 };
+                    s.w1c[i / 4][o * 4 + i % 4] = s.w1[o][i];
+                }
+            }
+            let mut act = [0u8; 2 * L2 + 2 * L3];
+            let mut w2 = [0i8; 128];
+            for i in 0..act.len() {
+                act[i] = if round == 0 { 127 } else { (rng(&mut st) % 128) as u8 };
+                w2[i] = if round == 0 { -128 } else { rng(&mut st) as i8 };
+            }
+            let mut h = [0i32; L2];
+            for v in h.iter_mut() {
+                *v = match rng(&mut st) % 4 {
+                    0 => (rng(&mut st) % 2_000_001) as i32 - 1_000_000,
+                    1 => (rng(&mut st) % 40001) as i32 - 20000,
+                    2 => rng(&mut st) as i32,
+                    _ => (rng(&mut st) % 257) as i32 - 128,
+                };
+            }
+            let first: &[u8; 2 * L2] = (&act[..2 * L2]).try_into().unwrap();
+            unsafe {
+                let want_l1 = layer1_scalar(&s, first);
+                let want_dot = dot_scalar(&act, &w2);
+                assert_eq!(layer1_avx512(&s, first), want_l1);
+                assert_eq!(dot_avx512(&act, &w2), want_dot);
+                if vnni {
+                    assert_eq!(layer1_avx512_vnni(&s, first), want_l1);
+                    assert_eq!(dot_avx512_vnni(&act, &w2), want_dot);
+                }
+                let (mut a, mut b) = ([0u8; 2 * L2], [0u8; 2 * L2]);
+                activate_scalar::<21, 7>(&h, &mut a);
+                activate_avx512::<21, 7>(&h, &mut b);
+                assert_eq!(a, b);
+                activate_scalar::<19, 6>(&h, &mut a);
+                activate_avx512::<19, 6>(&h, &mut b);
+                assert_eq!(a, b);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

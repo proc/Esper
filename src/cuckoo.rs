@@ -85,7 +85,6 @@ pub fn upcoming_repetition(pos: &Position, keys: &[u64], ply: usize) -> bool {
     if end < 3 {
         return false;
     }
-    let t = tables();
     let orig = keys[cur];
     let mut other = orig ^ keys[cur - 1] ^ ZOBRIST.side;
     let mut i = 3;
@@ -93,6 +92,8 @@ pub fn upcoming_repetition(pos: &Position, keys: &[u64], ply: usize) -> bool {
         other ^= keys[cur - i + 1] ^ keys[cur - i] ^ ZOBRIST.side;
         if other == 0 {
             let move_key = orig ^ keys[cur - i];
+            // Looked up only here: most calls never find a matching key pair.
+            let t = tables();
             let mut j = h1(move_key);
             if t.keys[j] != move_key {
                 j = h2(move_key);
