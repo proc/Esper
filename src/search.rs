@@ -82,6 +82,11 @@ const MAX_CLOCK_SHARE: f64 = 0.05;
 /// A deeper pass is started only while less than this share of the move's
 /// budget is used.
 const NEXT_PASS_ROOM: f64 = 0.62;
+/// Those limits apply in full with this much clock or less (bullet pace) and
+/// not at all from `TM_RELAXED_MS` up, where Stockfish's own limits are used;
+/// in between they are blended.
+const TM_TIGHT_MS: f64 = 60_000.0;
+const TM_RELAXED_MS: f64 = 180_000.0;
 /// Stockfish's time allocation and stopping rule (with a fixed clock reserve)
 /// instead of the snappy scheme.
 const SF_TIME_MANAGEMENT: bool = true;
@@ -319,6 +324,8 @@ pub struct Searcher {
     start: Instant,
     soft_ms: u64,
     hard_ms: u64,
+    /// 0 when the tight per-move limits apply in full, 1 when Stockfish's own do.
+    tm_relax: f64,
     pub silent: bool,
     pub show_wdl: bool,
     pub contempt: i32,
@@ -1078,6 +1085,7 @@ impl Searcher {
             start: Instant::now(),
             soft_ms: u64::MAX,
             hard_ms: u64::MAX,
+            tm_relax: 0.0,
             silent: false,
             show_wdl: false,
             contempt: 0,
@@ -1161,6 +1169,7 @@ impl Searcher {
         self.start = limits.received.unwrap_or_else(Instant::now);
         self.soft_ms = u64::MAX;
         self.hard_ms = u64::MAX;
+        self.tm_relax = 0.0;
         self.time_managed = false;
         self.soft_deadline = u64::MAX;
         self.movetime = limits.movetime.map(|mt| mt.saturating_sub(overhead).max(1));
@@ -1211,11 +1220,19 @@ impl Searcher {
                 let mut soft = (opt_scale * time_left).max(1.0);
                 let mut hard = soft.max((0.8097 * t - overhead).min(max_scale * soft));
                 // Stockfish lets one move run to almost seven times its planned
-                // time, which can be a quarter of the clock. Without a move count
-                // to reach, no single move is worth that: at most three times the
-                // plan, and never more than 5% of the clock plus the increment.
+                // time, which can be a quarter of the clock. Short of time and
+                // without a move count to reach, no single move is worth that:
+                // at most three times the plan, and never more than 5% of the
+                // clock plus the increment. With plenty of clock the long think
+                // is affordable, so the limit eases back to Stockfish's.
+                self.tm_relax = if limits.movestogo.is_none() {
+                    ((t - TM_TIGHT_MS) / (TM_RELAXED_MS - TM_TIGHT_MS)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
                 if limits.movestogo.is_none() {
-                    hard = hard.min(MAX_OVER_PLAN * soft).min((MAX_CLOCK_SHARE * t + inc).max(soft));
+                    let tight = hard.min(MAX_OVER_PLAN * soft).min((MAX_CLOCK_SHARE * t + inc).max(soft));
+                    hard = tight + self.tm_relax * (hard - tight);
                 }
                 // The engine, GUI and OS can all stall for a few milliseconds:
                 // always leave the reserve on the clock.
@@ -2959,7 +2976,7 @@ impl Searcher {
                 let elapsed = self.start.elapsed().as_millis() as f64;
                 // The next pass costs about as much as everything so far, so one
                 // begun late overruns the budget: start it only with room to finish.
-                let stop_limit = if SF_TIME_MANAGEMENT { total * NEXT_PASS_ROOM } else if self.iter_unstable { total } else { total * 0.65 };
+                let stop_limit = if SF_TIME_MANAGEMENT { total * (NEXT_PASS_ROOM + (1.0 - NEXT_PASS_ROOM) * self.tm_relax) } else if self.iter_unstable { total } else { total * 0.65 };
                 if elapsed > stop_limit.min(self.hard_ms as f64)
                     || lines[multipv - 1].score >= MATE - 3
                     || lines[0].score == -(MATE - 2)
