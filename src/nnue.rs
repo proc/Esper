@@ -577,15 +577,6 @@ fn prefetch_tile_ptr(p: *const i8, off: usize) {
 }
 
 /// The whole 512-byte tile the AVX-512 kernels read next from a weight row.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn prefetch_tile_neon(p: *const i8, off: usize) {
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p.add(off), options(nostack, preserves_flags, readonly));
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p.add(off + 64), options(nostack, preserves_flags, readonly));
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_tile512_ptr(p: *const i8, off: usize) {
@@ -1166,17 +1157,12 @@ fn apply_ptrs_neon(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const 
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [vdupq_n_s16(0); TILE / 8];
             let s = src.0.as_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = vld1q_s16(s.add(k * 8));
             }
             for &p in adds {
-                if do_pf {
-                    prefetch_tile_neon(p, next_off);
-                }
                 let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
@@ -1185,9 +1171,6 @@ fn apply_ptrs_neon(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const 
                 }
             }
             for &p in subs {
-                if do_pf {
-                    prefetch_tile_neon(p, next_off);
-                }
                 let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
@@ -1199,7 +1182,7 @@ fn apply_ptrs_neon(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const 
             for (k, r) in regs.iter().enumerate() {
                 vst1q_s16(d.add(k * 8), *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }
@@ -1343,7 +1326,9 @@ fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) 
 }
 
 /// Row addresses for an incremental step: threat rows then piece-square rows.
-/// Prefetches only tile 0 upfront; `apply_ptrs` prefetches subsequent tiles ahead.
+/// Every row is prefetched whole here (`prefetch_row`), so the NEON kernels need
+/// no per-tile prefetching of their own: on M1 Max the per-tile `prfm` calls
+/// measured ~1.5-2.5% worse in eval throughput with no cycle gain.
 #[inline(always)]
 fn row_ptrs<'a>(
     net: &Network,
@@ -1378,17 +1363,12 @@ fn refresh_rows_neon(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs:
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [vdupq_n_s16(0); TILE / 8];
             let c = cache.0.as_mut_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = vld1q_s16(c.add(k * 8));
             }
             for &p in padds {
-                if do_pf {
-                    prefetch_tile_neon(p, next_off);
-                }
                 let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
@@ -1397,9 +1377,6 @@ fn refresh_rows_neon(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs:
                 }
             }
             for &p in psubs {
-                if do_pf {
-                    prefetch_tile_neon(p, next_off);
-                }
                 let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
@@ -1413,9 +1390,6 @@ fn refresh_rows_neon(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs:
                 }
             }
             for &p in tadds {
-                if do_pf {
-                    prefetch_tile_neon(p, next_off);
-                }
                 let w = p.add(off);
                 for k in 0..TILE / 16 {
                     let v = vld1q_s8(w.add(k * 16));
@@ -1427,7 +1401,7 @@ fn refresh_rows_neon(cache: &mut Acc, out: &mut Acc, padds: &[*const i8], psubs:
             for (k, r) in regs.iter().enumerate() {
                 vst1q_s16(d.add(k * 8), *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }
