@@ -566,28 +566,6 @@ impl<const N: usize> IdxSink for IdxList16<N> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn prefetch_tile_ptr(p: *const i8, off: usize) {
-    unsafe {
-        use std::arch::x86_64::*;
-        _mm_prefetch(p.add(off), _MM_HINT_T0);
-        _mm_prefetch(p.add(off + 64), _MM_HINT_T0);
-    }
-}
-
-/// The whole 512-byte tile the AVX-512 kernels read next from a weight row.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn prefetch_tile512_ptr(p: *const i8, off: usize) {
-    unsafe {
-        use std::arch::x86_64::*;
-        for line in 0..8 {
-            _mm_prefetch(p.add(off + line * 64), _MM_HINT_T0);
-        }
-    }
-}
-
 #[inline(always)]
 fn prefetch_row(row: &[u8; L1]) {
     #[cfg(target_arch = "aarch64")]
@@ -1196,17 +1174,12 @@ unsafe fn apply_ptrs_avx2(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [_mm256_setzero_si256(); REGS];
             let s = src.0.as_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm256_loadu_si256(s.add(k * 16) as *const __m256i);
             }
             for &p in adds {
-                if do_pf {
-                    prefetch_tile_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
@@ -1214,9 +1187,6 @@ unsafe fn apply_ptrs_avx2(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[
                 }
             }
             for &p in subs {
-                if do_pf {
-                    prefetch_tile_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
@@ -1227,7 +1197,7 @@ unsafe fn apply_ptrs_avx2(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[
             for (k, r) in regs.iter().enumerate() {
                 _mm256_storeu_si256(d.add(k * 16) as *mut __m256i, *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }
@@ -1241,17 +1211,12 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [_mm512_setzero_si512(); REGS];
             let s = src.0.as_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm512_loadu_si512(s.add(k * 32) as *const _);
             }
             for &p in adds {
-                if do_pf {
-                    prefetch_tile512_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1259,9 +1224,6 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
                 }
             }
             for &p in subs {
-                if do_pf {
-                    prefetch_tile512_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1272,7 +1234,7 @@ unsafe fn apply_ptrs_avx512(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: 
             for (k, r) in regs.iter().enumerate() {
                 _mm512_storeu_si512(d.add(k * 32) as *mut _, *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }
@@ -1329,6 +1291,8 @@ fn apply_ptrs(dst: &mut Acc, src: &Acc, adds: &[*const i8], subs: &[*const i8]) 
 /// Every row is prefetched whole here (`prefetch_row`), so the NEON kernels need
 /// no per-tile prefetching of their own: on M1 Max the per-tile `prfm` calls
 /// measured ~1.5-2.5% worse in eval throughput with no cycle gain.
+/// The x86 kernels' per-tile prefetches were removed on the same reasoning
+/// (not measured on x86).
 #[inline(always)]
 fn row_ptrs<'a>(
     net: &Network,
@@ -1415,17 +1379,12 @@ unsafe fn refresh_rows_avx2(cache: &mut Acc, out: &mut Acc, padds: &[*const i8],
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [_mm256_setzero_si256(); REGS];
             let c = cache.0.as_mut_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm256_loadu_si256(c.add(k * 16) as *const __m256i);
             }
             for &p in padds {
-                if do_pf {
-                    prefetch_tile_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
@@ -1433,9 +1392,6 @@ unsafe fn refresh_rows_avx2(cache: &mut Acc, out: &mut Acc, padds: &[*const i8],
                 }
             }
             for &p in psubs {
-                if do_pf {
-                    prefetch_tile_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
@@ -1448,9 +1404,6 @@ unsafe fn refresh_rows_avx2(cache: &mut Acc, out: &mut Acc, padds: &[*const i8],
                 }
             }
             for &p in tadds {
-                if do_pf {
-                    prefetch_tile_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(k * 16) as *const __m128i));
@@ -1461,7 +1414,7 @@ unsafe fn refresh_rows_avx2(cache: &mut Acc, out: &mut Acc, padds: &[*const i8],
             for (k, r) in regs.iter().enumerate() {
                 _mm256_storeu_si256(d.add(k * 16) as *mut __m256i, *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }
@@ -1475,17 +1428,12 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
     unsafe {
         let mut off = 0;
         while off < L1 {
-            let next_off = off + TILE;
-            let do_pf = next_off < L1;
             let mut regs = [_mm512_setzero_si512(); REGS];
             let c = cache.0.as_mut_ptr().add(off);
             for (k, r) in regs.iter_mut().enumerate() {
                 *r = _mm512_loadu_si512(c.add(k * 32) as *const _);
             }
             for &p in padds {
-                if do_pf {
-                    prefetch_tile512_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1493,9 +1441,6 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
                 }
             }
             for &p in psubs {
-                if do_pf {
-                    prefetch_tile512_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1508,9 +1453,6 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
                 }
             }
             for &p in tadds {
-                if do_pf {
-                    prefetch_tile512_ptr(p, next_off);
-                }
                 let w = p.add(off);
                 for (k, r) in regs.iter_mut().enumerate() {
                     let v = _mm512_cvtepi8_epi16(_mm256_loadu_si256(w.add(k * 32) as *const __m256i));
@@ -1521,7 +1463,7 @@ unsafe fn refresh_rows_avx512(cache: &mut Acc, out: &mut Acc, padds: &[*const i8
             for (k, r) in regs.iter().enumerate() {
                 _mm512_storeu_si512(d.add(k * 32) as *mut _, *r);
             }
-            off = next_off;
+            off += TILE;
         }
     }
 }

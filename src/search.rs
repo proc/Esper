@@ -77,11 +77,12 @@ const TM_RESEARCH_FIRST: bool = true;
 const TM_SOFT_STOP: bool = true;
 /// The most one move may take, as a multiple of its planned time and as a share
 /// of the clock (sudden death and increment games).
-const MAX_OVER_PLAN: f64 = 3.0;
-const MAX_CLOCK_SHARE: f64 = 0.05;
+const MAX_OVER_PLAN: f64 = 5.0;
+const MAX_CLOCK_SHARE: f64 = 0.10;
 /// A deeper pass is started only while less than this share of the move's
-/// budget is used.
-const NEXT_PASS_ROOM: f64 = 0.62;
+/// budget is used. 1.0 is Stockfish's rule; 0.62 left a third of the thinking
+/// time unused at bullet and cost about 25 Elo against Stockfish there.
+const NEXT_PASS_ROOM: f64 = 1.0;
 /// Those limits apply in full with this much clock or less (bullet pace) and
 /// not at all from `TM_RELAXED_MS` up, where Stockfish's own limits are used;
 /// in between they are blended.
@@ -1222,7 +1223,7 @@ impl Searcher {
                 // Stockfish lets one move run to almost seven times its planned
                 // time, which can be a quarter of the clock. Short of time and
                 // without a move count to reach, no single move is worth that:
-                // at most three times the plan, and never more than 5% of the
+                // at most five times the plan, and never more than 10% of the
                 // clock plus the increment. With plenty of clock the long think
                 // is affordable, so the limit eases back to Stockfish's.
                 self.tm_relax = if limits.movestogo.is_none() {
