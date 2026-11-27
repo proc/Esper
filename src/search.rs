@@ -88,6 +88,11 @@ const NEXT_PASS_ROOM: f64 = 1.0;
 /// in between they are blended.
 const TM_TIGHT_MS: f64 = 60_000.0;
 const TM_RELAXED_MS: f64 = 180_000.0;
+/// Apply those limits at all. Off: Stockfish's own limits at every clock. The
+/// long thinks they allow come when the score is falling or the best move keeps
+/// changing, and capping them cost about 9 Elo at 5s+0.05s (676 games, together
+/// with a 25 ms instead of 10 ms move overhead).
+const TM_GUARD: bool = false;
 /// Stockfish's time allocation and stopping rule (with a fixed clock reserve)
 /// instead of the snappy scheme.
 const SF_TIME_MANAGEMENT: bool = true;
@@ -1226,7 +1231,7 @@ impl Searcher {
                 // at most five times the plan, and never more than 10% of the
                 // clock plus the increment. With plenty of clock the long think
                 // is affordable, so the limit eases back to Stockfish's.
-                self.tm_relax = if limits.movestogo.is_none() {
+                self.tm_relax = if TM_GUARD && limits.movestogo.is_none() {
                     ((t - TM_TIGHT_MS) / (TM_RELAXED_MS - TM_TIGHT_MS)).clamp(0.0, 1.0)
                 } else {
                     1.0

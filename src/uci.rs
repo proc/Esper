@@ -388,7 +388,7 @@ impl Engine {
             threads: 1,
             default_threads: 1,
             multipv: 1,
-            overhead: 25,
+            overhead: 10,
             auto_overhead: true,
             lag: Arc::new(Mutex::new(LagMeter::default())),
             show_wdl: false,
@@ -1112,7 +1112,7 @@ impl Engine {
                 println!("option name Hash type spin default 16 min 1 max 1048576");
                 println!("option name Threads type spin default {} min 1 max 512", self.default_threads);
                 println!("option name MultiPV type spin default 1 min 1 max 256");
-                println!("option name Move Overhead type spin default 25 min 0 max 5000");
+                println!("option name Move Overhead type spin default 10 min 0 max 5000");
                 println!("option name Auto Move Overhead type check default true");
                 println!("option name Ponder type check default false");
                 println!("option name UCI_ShowWDL type check default false");
