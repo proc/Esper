@@ -439,7 +439,7 @@ pub struct SharedHist {
     /// Indexed by pawn structure, piece and destination.
     pawn_hist: Box<[AtomicI16]>,
     pawn_mask: usize,
-    /// `[stm][key]`
+    /// `[any queen on the board][stm][key]`
     pawn_corr: Box<[AtomicI16]>,
     /// Correction by knight and bishop placement, `[stm][key]`.
     minor_corr: Box<[AtomicI16]>,
@@ -464,7 +464,7 @@ impl SharedHist {
             cont_sentinel: atomic_table(1024, CONT_HIST_FILL),
             pawn_hist: atomic_table(pawn_entries * 1024, PAWN_HIST_FILL),
             pawn_mask: pawn_entries - 1,
-            pawn_corr: atomic_table(2 * corr_size, CORR_FILL),
+            pawn_corr: atomic_table(4 * corr_size, CORR_FILL),
             minor_corr: atomic_table(2 * corr_size, CORR_FILL),
             nonpawn_corr: atomic_table(4 * corr_size, CORR_FILL),
             corr_size,
@@ -481,8 +481,10 @@ impl SharedHist {
     }
 
     #[inline(always)]
-    fn pawn_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
-        &self.pawn_corr[stm * self.corr_size + (key as usize & (self.corr_size - 1))]
+    fn pawn_corr(&self, queens: bool, stm: usize, key: u64) -> &AtomicI16 {
+        // Split by whether any queen is on the board (Stockfish): a pawn
+        // structure is worth something different with and without queens.
+        &self.pawn_corr[(2 * queens as usize + stm) * self.corr_size + (key as usize & (self.corr_size - 1))]
     }
     #[inline(always)]
     fn minor_corr(&self, stm: usize, key: u64) -> &AtomicI16 {
@@ -1373,7 +1375,7 @@ impl Searcher {
         let pos = &self.pos[ply];
         let stm = pos.stm;
         let h = &*self.hist;
-        let pcv = ld(h.pawn_corr(stm, pos.pawn_key));
+        let pcv = ld(h.pawn_corr(pos.by_type[QUEEN] != 0, stm, pos.pawn_key));
         let micv = ld(h.minor_corr(stm, pos.minor_key));
         let wnp = ld(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
         let bnp = ld(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
@@ -1396,7 +1398,7 @@ impl Searcher {
         let pos = self.pos_at(ply);
         let stm = pos.stm;
         let h = &*self.hist;
-        hist_update_at(h.pawn_corr(stm, pos.pawn_key), bonus, SF_CORR_LIMIT);
+        hist_update_at(h.pawn_corr(pos.by_type[QUEEN] != 0, stm, pos.pawn_key), bonus, SF_CORR_LIMIT);
         hist_update_at(h.minor_corr(stm, pos.minor_key), bonus * 150 / 128, SF_CORR_LIMIT);
         hist_update_at(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]), bonus * 186 / 128, SF_CORR_LIMIT);
         hist_update_at(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]), bonus * 186 / 128, SF_CORR_LIMIT);
@@ -1423,7 +1425,7 @@ impl Searcher {
     fn correction(&self, pos: &Position) -> i32 {
         let stm = pos.stm;
         let h = &*self.hist;
-        let p = ld(h.pawn_corr(stm, pos.pawn_key));
+        let p = ld(h.pawn_corr(pos.by_type[QUEEN] != 0, stm, pos.pawn_key));
         let w = ld(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
         let b = ld(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
         (2 * p + w + b) / 512
@@ -1439,7 +1441,7 @@ impl Searcher {
             e.store(v, Relaxed);
         };
         let h = &*self.hist;
-        upd(h.pawn_corr(stm, pos.pawn_key));
+        upd(h.pawn_corr(pos.by_type[QUEEN] != 0, stm, pos.pawn_key));
         upd(h.nonpawn_corr(WHITE, stm, pos.nonpawn_key[WHITE]));
         upd(h.nonpawn_corr(BLACK, stm, pos.nonpawn_key[BLACK]));
     }

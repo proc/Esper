@@ -5,7 +5,7 @@
 <h1 align="center">Esper</h1>
 
 Esper is a UCI chess engine written in Rust. It evaluates positions with
-Stockfish's `nn-bddd9d57eb87.nnue` network and has a Stockfish-style search with
+Stockfish's `nn-684d0e60e71d.nnue` network and has a Stockfish-style search with
 Lazy SMP, Syzygy tablebase support, and NEON, AVX2 and AVX-512 code paths.
 
 ## Quick start
@@ -27,7 +27,7 @@ UCI engine; standard chess only, Chess960 is not supported.
 | Command | Result |
 |---|---|
 | `cargo build --release` | Optimised build, network embedded; picks its SIMD path at run time |
-| `cargo build --release --no-default-features` | Network and opening book left out; the network is loaded from `nn-bddd9d57eb87.nnue` in the working directory or next to the binary |
+| `cargo build --release --no-default-features` | Network and opening book left out; the network is loaded from `nn-684d0e60e71d.nnue` in the working directory or next to the binary |
 | `cargo build --release --no-default-features --features embed` | Network embedded, opening book left out |
 | `cargo build --release --features portable` | Hand-written SIMD left unused (for checking the SIMD paths) |
 | `cargo build --release --features tune` | Search parameters exposed as `T_*` UCI options for SPSA |

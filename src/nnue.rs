@@ -34,10 +34,10 @@ const VERSION: u32 = 0x6A44_8AFA;
 const STACK_TABLE_HASH: u32 = 0x5A7A_B1E5;
 const MAX_THREATS: usize = 256;
 
-pub const DEFAULT_NET_NAME: &str = "nn-bddd9d57eb87.nnue";
+pub const DEFAULT_NET_NAME: &str = "nn-684d0e60e71d.nnue";
 
 #[cfg(feature = "embed")]
-static EMBEDDED: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/nn-bddd9d57eb87.nnue"));
+static EMBEDDED: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/nn-684d0e60e71d.nnue"));
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
